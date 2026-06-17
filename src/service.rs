@@ -198,7 +198,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn status() -> Result<()> {
+fn report_unit_status() -> Result<()> {
     let unit_path = systemd_unit_path()?;
     println!(
         "unit: {} ({})",
@@ -290,7 +290,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn status() -> Result<()> {
+fn report_unit_status() -> Result<()> {
     let plist_path = launchd_plist_path()?;
     println!(
         "agent: {} ({})",
@@ -319,7 +319,149 @@ pub fn uninstall() -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn report_unit_status() -> Result<()> {
+    println!("no supported service manager on this platform");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Detached "nohup/screen" mode: run the daemon in the background without a
+// service manager. Tracked by a pidfile; output goes to a logfile you can tail.
+// ---------------------------------------------------------------------------
+
+/// Report installed-unit state (platform-specific) plus the detached-daemon
+/// state (the `service start` background process).
 pub fn status() -> Result<()> {
+    report_detached_status();
+    report_unit_status()
+}
+
+/// Read the recorded daemon PID, if a (parseable) pidfile exists.
+fn read_pid() -> Option<i32> {
+    let path = paths::daemon_pidfile().ok()?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Whether `pid` names a live process. Always false off Unix (no detach there).
+fn pid_is_running(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        // Signal 0 performs error checking without actually sending a signal:
+        // success (or EPERM) means the process exists.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn report_detached_status() {
+    match read_pid() {
+        Some(pid) if pid_is_running(pid) => {
+            println!("detached daemon: running (pid {pid})");
+            if let Ok(log) = paths::daemon_logfile() {
+                println!("  logs: {}", log.display());
+            }
+        }
+        Some(pid) => println!("detached daemon: not running (stale pidfile, pid {pid})"),
+        None => println!("detached daemon: not running"),
+    }
+}
+
+/// Start the daemon detached in the background (nohup-style): redirect output to
+/// the logfile, detach from the controlling terminal so it survives logout, and
+/// record the PID so `service stop`/`status` can find it.
+#[cfg(unix)]
+pub fn start(config: &Config) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    if !config.service.enabled {
+        println!("service.enabled is false in config.toml; not starting");
+        println!("set `enabled = true` under [service] first");
+        return Ok(());
+    }
+    if let Some(pid) = read_pid() {
+        if pid_is_running(pid) {
+            println!("daemon already running (pid {pid}); use `ccsync service stop` first");
+            return Ok(());
+        }
+    }
+
+    let exe = std::env::current_exe().context("resolving the ccsync executable path")?;
+    let log_path = paths::daemon_logfile()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening log {}", log_path.display()))?;
+    let log_err = log.try_clone()?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    // Start a new session so the child has no controlling terminal and won't be
+    // killed by SIGHUP when the shell exits — the same effect as `nohup`.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().context("spawning the detached daemon")?;
+    let pid = child.id();
+
+    let pid_path = paths::daemon_pidfile()?;
+    std::fs::write(&pid_path, pid.to_string())
+        .with_context(|| format!("writing {}", pid_path.display()))?;
+
+    println!("started ccsync daemon detached (pid {pid})");
+    println!("  logs: {}  (tail -f to follow)", log_path.display());
+    println!("  stop: ccsync service stop");
+    Ok(())
+}
+
+/// Stop a detached daemon by sending SIGTERM to the recorded PID.
+#[cfg(unix)]
+pub fn stop() -> Result<()> {
+    let pid_path = paths::daemon_pidfile()?;
+    let Some(pid) = read_pid() else {
+        println!("no daemon pidfile at {}; nothing to stop", pid_path.display());
+        return Ok(());
+    };
+    if !pid_is_running(pid) {
+        println!("daemon (pid {pid}) is not running; clearing stale pidfile");
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(());
+    }
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(
+            "failed to signal pid {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    println!("stopped ccsync daemon (pid {pid})");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn start(_config: &Config) -> Result<()> {
+    Err(crate::error::CcError::ServiceUnsupportedPlatform.into())
+}
+
+#[cfg(not(unix))]
+pub fn stop() -> Result<()> {
     Err(crate::error::CcError::ServiceUnsupportedPlatform.into())
 }
 
@@ -398,5 +540,35 @@ mod tests {
         assert!(plist.contains("<string>/usr/local/bin/ccsync</string>"));
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("com.ccsync.daemon"));
+    }
+
+    #[test]
+    fn read_pid_roundtrips_through_pidfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_config_dir(tmp.path(), || {
+            assert_eq!(read_pid(), None);
+            let path = paths::daemon_pidfile().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "4321\n").unwrap();
+            assert_eq!(read_pid(), Some(4321));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_running_false_for_absurd_pid() {
+        // PID 0x7fff_fffe is implausibly high; kill(2) reports ESRCH.
+        assert!(!pid_is_running(2_147_483_646));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_refuses_when_disabled_and_writes_no_pidfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_config_dir(tmp.path(), || {
+            let config = Config::default(); // service.enabled == false
+            start(&config).unwrap();
+            assert!(!paths::daemon_pidfile().unwrap().exists());
+        });
     }
 }

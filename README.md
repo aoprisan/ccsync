@@ -91,7 +91,9 @@ ccsync restore
 | `ccsync backup [--remote URL] [--archive FILE]` | `snapshot` + `push`. |
 | `ccsync tui` | Launch an interactive terminal UI: review what would be backed up, browse local backups, and push/export. |
 | `ccsync daemon` | Run the background backup loop in the foreground (used by the installed service). |
-| `ccsync service install\|uninstall\|status` | Register/remove the background service (systemd user unit / launchd agent). |
+| `ccsync service install\|uninstall` | Register/remove an OS service (systemd user unit / launchd agent). |
+| `ccsync service start\|stop` | Run the daemon detached in the background (nohup-style; no service manager). |
+| `ccsync service status` | Report whether the service is installed and/or running. |
 
 ## Background service
 
@@ -119,6 +121,24 @@ ccsync service uninstall
 it; if the service manager isn't reachable it prints the manual command. The
 unit just runs `ccsync daemon`, so you can also run that directly under your own
 supervisor, cron, or Task Scheduler.
+
+### Detached mode (no service manager)
+
+If you don't want to register an OS service, run the daemon detached instead —
+the same idea as `nohup ccsync daemon &` or a `screen`/`tmux` session, but
+managed for you:
+
+```sh
+ccsync service start    # forks the daemon, detaches from the terminal (survives logout)
+ccsync service status   # is it running?
+ccsync service stop     # SIGTERM the recorded PID
+tail -f ~/.config/ccsync/daemon.log   # follow its output
+```
+
+`start` writes the PID to `~/.config/ccsync/daemon.pid` and redirects output to
+`~/.config/ccsync/daemon.log`. It refuses to start a second copy while one is
+running, and clears a stale pidfile if the recorded process is gone. (Unix
+only; on Windows use `ccsync daemon` under your own supervisor.)
 
 Each tick builds a sanitized snapshot and publishes it to `destination`:
 

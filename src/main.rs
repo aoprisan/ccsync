@@ -63,6 +63,8 @@ fn run() -> Result<()> {
         Command::Service { action } => match action {
             cli::ServiceAction::Install => service::install(&config),
             cli::ServiceAction::Uninstall => service::uninstall(),
+            cli::ServiceAction::Start => service::start(&config),
+            cli::ServiceAction::Stop => service::stop(),
             cli::ServiceAction::Status => service::status(),
         },
     }
