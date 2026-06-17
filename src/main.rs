@@ -12,6 +12,7 @@ mod config;
 mod error;
 mod git;
 mod manifest;
+mod mcp;
 mod paths;
 mod redact;
 mod remap;
@@ -85,7 +86,7 @@ fn cmd_init(config_path: &std::path::Path, mut config: Config, remote: Option<St
 fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<()> {
     let claude = paths::claude_dir()?;
     let staging = paths::staging_dir()?;
-    let opts = SnapshotOptions { dry_run, allow_secrets };
+    let opts = SnapshotOptions::new(dry_run, allow_secrets, config);
     let m = snapshot::build(&claude, &staging, config, &opts)?;
 
     let total: u64 = m.files.iter().map(|f| f.size).sum();
@@ -98,6 +99,11 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
     );
     if !m.project_roots.is_empty() {
         println!("  {} session project root(s) recorded for remapping", m.project_roots.len());
+    }
+    if let Some(claude_json) = &opts.claude_json {
+        if let Some(doc) = mcp::extract(claude_json)? {
+            println!("  {} local MCP server(s) bundled from {}", mcp::server_count(&doc), claude_json.display());
+        }
     }
     if !dry_run {
         println!("  staged at {}", staging.display());
@@ -152,6 +158,11 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
         dry_run,
         remap: !no_remap,
         merge: if overwrite { MergeMode::Overwrite } else { MergeMode::Merge },
+        claude_json: if config.include_mcp_servers {
+            paths::claude_json_file().ok()
+        } else {
+            None
+        },
     };
     let report = restore::run(&claude, &staging, config, &opts)?;
 
@@ -164,12 +175,22 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
     if let Some(backup) = &report.backup_dir {
         println!("backed up existing {} to {}", claude.display(), backup.display());
     }
+    if let Some(backup) = &report.claude_json_backup {
+        println!("backed up existing ~/.claude.json to {}", backup.display());
+    }
     println!(
         "{} {} files to {}",
         if dry_run { "would restore" } else { "restored" },
         report.files_written.len(),
         claude.display()
     );
+    if report.mcp_servers_restored > 0 {
+        println!(
+            "{} {} local MCP server(s) into ~/.claude.json",
+            if dry_run { "would merge" } else { "merged" },
+            report.mcp_servers_restored
+        );
+    }
     Ok(())
 }
 

@@ -22,12 +22,30 @@ use walkdir::WalkDir;
 use crate::config::Config;
 use crate::error::CcError;
 use crate::manifest::{FileEntry, Manifest, ProjectRoot};
+use crate::mcp;
 use crate::paths;
 use crate::redact;
 
 pub struct SnapshotOptions {
     pub dry_run: bool,
     pub allow_secrets: bool,
+    /// `~/.claude.json` to harvest MCP server definitions from, when
+    /// `config.include_mcp_servers` is set. `None` skips MCP bundling entirely.
+    pub claude_json: Option<PathBuf>,
+}
+
+impl SnapshotOptions {
+    /// Options for a real run, resolving the MCP source file from `config`
+    /// (honoring `CLAUDE_CONFIG_DIR`). MCP bundling is skipped when the config
+    /// disables it or the source file cannot be located.
+    pub fn new(dry_run: bool, allow_secrets: bool, config: &Config) -> Self {
+        let claude_json = if config.include_mcp_servers {
+            paths::claude_json_file().ok()
+        } else {
+            None
+        };
+        SnapshotOptions { dry_run, allow_secrets, claude_json }
+    }
 }
 
 /// File extensions we treat as text and therefore scan for secrets.
@@ -83,10 +101,55 @@ pub fn build(
         }
     }
 
+    // Bundle locally-configured MCP servers from `~/.claude.json` (outside the
+    // captured `~/.claude` tree) into a standalone file in the snapshot.
+    if config.include_mcp_servers {
+        if let Some(claude_json) = &opts.claude_json {
+            capture_mcp_servers(claude_json, &data_root, opts, &mut manifest)?;
+        }
+    }
+
     if !opts.dry_run {
         manifest.write_to(staging)?;
     }
     Ok(manifest)
+}
+
+/// Extract MCP server definitions from `claude_json` and stage them as
+/// `mcp-servers.json`. The serialized blob is secret-scanned like any other
+/// config (a server `env` carrying an API key aborts unless `--allow-secrets`).
+fn capture_mcp_servers(
+    claude_json: &Path,
+    data_root: &Path,
+    opts: &SnapshotOptions,
+    manifest: &mut Manifest,
+) -> Result<()> {
+    let Some(doc) = mcp::extract(claude_json)? else {
+        return Ok(());
+    };
+    let serialized = serde_json::to_string_pretty(&doc)?;
+
+    if !opts.allow_secrets {
+        if let Some(hint) = redact::scan_for_secrets(&serialized) {
+            return Err(CcError::SecretDetected { file: mcp::MCP_FILE.to_string(), hint }.into());
+        }
+    }
+
+    let bytes = serialized.into_bytes();
+    manifest.files.push(FileEntry {
+        rel_path: mcp::MCP_FILE.to_string(),
+        sha256: hex(&Sha256::digest(&bytes)),
+        size: bytes.len() as u64,
+    });
+
+    if !opts.dry_run {
+        let dest = data_root.join(mcp::MCP_FILE);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
+    }
+    Ok(())
 }
 
 /// Capture a single include entry, which may be a file or a directory tree.
@@ -206,7 +269,7 @@ mod tests {
         );
 
         let cfg = Config::default();
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: false };
+        let opts = SnapshotOptions { dry_run: false, allow_secrets: false, claude_json: None };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
         let rels: Vec<&str> = m.files.iter().map(|f| f.rel_path.as_str()).collect();
@@ -233,7 +296,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.include.push(".credentials.json".into());
         cfg.exclude.clear();
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: true };
+        let opts = SnapshotOptions { dry_run: false, allow_secrets: true, claude_json: None };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("credential"));
     }
@@ -248,12 +311,60 @@ mod tests {
             r#"{"env":{"ANTHROPIC_API_KEY":"sk-abcdefghijklmnopqrstuvwx"}}"#,
         );
         let cfg = Config::default();
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: false };
+        let opts = SnapshotOptions { dry_run: false, allow_secrets: false, claude_json: None };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("secret"));
 
         // With allow_secrets it succeeds.
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: true };
+        let opts = SnapshotOptions { dry_run: false, allow_secrets: true, claude_json: None };
         assert!(build(&claude, &staging, &cfg, &opts).is_ok());
+    }
+
+    #[test]
+    fn bundles_mcp_servers_from_claude_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        let claude_json = tmp.path().join(".claude.json");
+        write(
+            &claude_json,
+            r#"{"oauthAccount":{"accessToken":"keep-local"},"mcpServers":{"fetch":{"command":"uvx"}}}"#,
+        );
+
+        let cfg = Config::default();
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: Some(claude_json),
+        };
+        let m = build(&claude, &staging, &cfg, &opts).unwrap();
+
+        assert!(m.files.iter().any(|f| f.rel_path == crate::mcp::MCP_FILE));
+        let staged = staging.join("data").join(crate::mcp::MCP_FILE);
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&staged).unwrap()).unwrap();
+        assert_eq!(doc["mcpServers"]["fetch"]["command"], "uvx");
+        // The OAuth token from ~/.claude.json never enters the snapshot.
+        assert!(doc.get("oauthAccount").is_none());
+    }
+
+    #[test]
+    fn mcp_bundling_disabled_by_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        let claude_json = tmp.path().join(".claude.json");
+        write(&claude_json, r#"{"mcpServers":{"fetch":{"command":"uvx"}}}"#);
+
+        let cfg = Config { include_mcp_servers: false, ..Config::default() };
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: Some(claude_json),
+        };
+        let m = build(&claude, &staging, &cfg, &opts).unwrap();
+        assert!(!m.files.iter().any(|f| f.rel_path == crate::mcp::MCP_FILE));
     }
 }

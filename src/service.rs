@@ -28,10 +28,7 @@ use crate::snapshot::{self, SnapshotOptions};
 pub fn run_once(config: &Config) -> Result<String> {
     let claude = paths::claude_dir()?;
     let staging = paths::staging_dir()?;
-    let opts = SnapshotOptions {
-        dry_run: false,
-        allow_secrets: config.service.allow_secrets,
-    };
+    let opts = SnapshotOptions::new(false, config.service.allow_secrets, config);
     let manifest = snapshot::build(&claude, &staging, config, &opts)?;
     let files = manifest.files.len();
 
