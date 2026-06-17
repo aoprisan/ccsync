@@ -160,7 +160,7 @@ impl App {
     /// `backup`/`export` CLI paths so an upload always reflects current state.
     fn stage_fresh_snapshot(&self, staging: &std::path::Path) -> Result<()> {
         let claude = paths::claude_dir()?;
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: false };
+        let opts = SnapshotOptions::new(false, false, &self.config);
         snapshot::build(&claude, staging, &self.config, &opts)?;
         Ok(())
     }
@@ -177,7 +177,7 @@ fn compute_capture(config: &Config) -> CaptureSummary {
         Ok(s) => s,
         Err(e) => return CaptureSummary::Failed(format!("{e}")),
     };
-    let opts = SnapshotOptions { dry_run: true, allow_secrets: true };
+    let opts = SnapshotOptions::new(true, true, config);
     match snapshot::build(&claude, &staging, config, &opts) {
         Ok(manifest) => CaptureSummary::Ready(summarize_manifest(&manifest, &claude)),
         Err(e) => CaptureSummary::Failed(format!("{e:#}")),

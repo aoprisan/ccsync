@@ -31,6 +31,20 @@ pub fn home_dir() -> Result<PathBuf, CcError> {
     dirs::home_dir().ok_or(CcError::ClaudeDirNotFound)
 }
 
+/// Locate Claude Code's `~/.claude.json`, the file that holds MCP server
+/// definitions (among other machine-local state).
+///
+/// When `CLAUDE_CONFIG_DIR` is set, Claude Code keeps `.claude.json` inside that
+/// directory; otherwise it lives at `~/.claude.json` (a sibling of `~/.claude`).
+pub fn claude_json_file() -> Result<PathBuf, CcError> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir).join(".claude.json"));
+        }
+    }
+    Ok(home_dir()?.join(".claude.json"))
+}
+
 /// ccsync's own config file location: `~/.config/ccsync/config.toml`.
 pub fn config_file() -> Result<PathBuf, CcError> {
     let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;

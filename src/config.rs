@@ -22,6 +22,12 @@ pub struct Config {
     pub exclude: Vec<String>,
     /// Whether to capture session transcripts under `projects/`.
     pub include_sessions: bool,
+    /// Whether to bundle locally-configured MCP servers from `~/.claude.json`
+    /// (user-scope and per-project `mcpServers`). Their `~/.claude.json` host
+    /// file is otherwise never synced. Server definitions are still secret
+    /// scanned, so a server `env` holding an API key aborts the snapshot unless
+    /// `--allow-secrets` is passed.
+    pub include_mcp_servers: bool,
     /// Git remote URL used by `push --git` / `pull --git`.
     pub remote: Option<String>,
     /// Explicit path remap pairs applied on restore, in addition to the
@@ -112,6 +118,7 @@ impl Default for Config {
                 "remote-settings.json".into(),
             ],
             include_sessions: true,
+            include_mcp_servers: true,
             remote: None,
             remap: BTreeMap::new(),
             service: ServiceConfig::default(),
@@ -164,6 +171,21 @@ mod tests {
         assert!(c.is_excluded("session-env/abc/x"));
         assert!(!c.is_excluded("settings.json"));
         assert!(!c.is_excluded("projects/-home-user-x/sess.jsonl"));
+    }
+
+    #[test]
+    fn mcp_bundling_on_by_default_and_roundtrips() {
+        assert!(Config::default().include_mcp_servers);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let c = Config { include_mcp_servers: false, ..Config::default() };
+        c.save(&path).unwrap();
+        assert!(!Config::load(&path).unwrap().include_mcp_servers);
+
+        // A config written before the key existed loads with the default (on).
+        std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
+        assert!(Config::load(&path).unwrap().include_mcp_servers);
     }
 
     #[test]

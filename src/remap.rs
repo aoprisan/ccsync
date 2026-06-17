@@ -118,6 +118,13 @@ fn rewrite_file(path: &Path, mappings: &[Mapping]) -> Result<()> {
     Ok(())
 }
 
+/// Apply the first matching prefix mapping to a single path string, returning
+/// the rewritten path or `None` if no mapping applied. Used to remap the
+/// per-project keys of bundled MCP server definitions on restore.
+pub fn remap_path(s: &str, mappings: &[Mapping]) -> Option<String> {
+    remap_str(s, mappings)
+}
+
 /// Apply the first matching prefix mapping to a single path string.
 fn remap_str(s: &str, mappings: &[Mapping]) -> Option<String> {
     for m in mappings {

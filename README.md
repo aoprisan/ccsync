@@ -26,14 +26,27 @@ machine.
 **Included (sessions, with path remapping):**
 `projects/<encoded-path>/*.jsonl` transcripts and per-repo `memory/`.
 
+**Included (local MCP servers):**
+The `mcpServers` definitions configured on this machine — both **user scope**
+(the top-level `mcpServers` in `~/.claude.json`) and **local scope** (each
+project's `projects.<cwd>.mcpServers`). They are extracted into a standalone
+`mcp-servers.json` inside the snapshot; on restore they are merged back into the
+local `~/.claude.json` with project paths remapped just like session
+directories. The rest of `~/.claude.json` is never read or written. Disable with
+`include_mcp_servers = false`. Project-scope servers (a repo's own `.mcp.json`)
+are not touched — they already travel with their repository.
+
 **Never synced:**
 `.credentials.json` (hard-blocked), plus machine-local/cache state
 (`shell-snapshots/`, `session-env/`, `backups/`, `statsig/`, `launcher-settings.json`,
-`policy-limits.json`, `remote-settings.json`). `~/.claude.json` is excluded by
-default because it embeds OAuth tokens and per-project trust decisions.
+`policy-limits.json`, `remote-settings.json`). `~/.claude.json` is never synced
+wholesale because it embeds OAuth tokens and per-project trust decisions; only
+its `mcpServers` definitions are bundled (see above).
 
-Config files are scanned for secret-shaped strings (API keys, tokens) before
-inclusion; a match aborts the snapshot unless you pass `--allow-secrets`.
+Config files — including the extracted MCP server definitions — are scanned for
+secret-shaped strings (API keys, tokens) before inclusion; a match aborts the
+snapshot unless you pass `--allow-secrets`. A server `env` holding a literal API
+key will therefore abort by default.
 
 ## Install
 
@@ -193,11 +206,18 @@ transcripts verbatim on a same-path machine.
 - **`restore` is reversible** — it backs up the existing `~/.claude` to a
   timestamped `~/.claude.ccsync-backup-<ts>` directory before writing, supports
   `--dry-run`, and deep-merges `settings.json` by default (`--overwrite` to
-  replace).
+  replace). When MCP servers are bundled, `~/.claude.json` is likewise copied to
+  a timestamped `~/.claude.json.ccsync-backup-<ts>` before its `mcpServers` are
+  merged.
 
 ## Configuration
 
 `~/.config/ccsync/config.toml` (created by `ccsync init`) controls the
-`include`/`exclude` sets, `include_sessions`, the git `remote`, the `[remap]`
-table, and the `[service]` table (see [Background service](#background-service)).
-`CLAUDE_CONFIG_DIR` is honored when locating the source directory.
+`include`/`exclude` sets, `include_sessions`, `include_mcp_servers`, the git
+`remote`, the `[remap]` table, and the `[service]` table (see
+[Background service](#background-service)). `CLAUDE_CONFIG_DIR` is honored when
+locating the source directory.
+
+- **`include_mcp_servers`** (default `true`) — bundle the locally-configured MCP
+  servers from `~/.claude.json` and merge them back on restore. Set to `false`
+  to leave MCP configuration out of the snapshot entirely.
