@@ -138,6 +138,33 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recent snapshot commits in the local repo cache, newest first. Each tuple is
+/// `(short_hash, committer_date_iso8601, subject)`. Returns an empty list when
+/// the cache has no commits yet; errors only if `git log` itself fails.
+pub fn log(limit: usize) -> Result<Vec<(String, String, String)>> {
+    let cache = repo_cache()?;
+    if !cache.join(".git").exists() {
+        return Ok(Vec::new());
+    }
+    let n = limit.to_string();
+    // A repo with no commits makes `git log` exit non-zero; treat that as empty.
+    let out = match run_git(&["log", "--pretty=%h|%cI|%s", "-n", &n], Some(&cache)) {
+        Ok(out) => out,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut commits = Vec::new();
+    for line in out.lines() {
+        let mut parts = line.splitn(3, '|');
+        let hash = parts.next().unwrap_or("").to_string();
+        let date = parts.next().unwrap_or("").to_string();
+        let subject = parts.next().unwrap_or("").to_string();
+        if !hash.is_empty() {
+            commits.push((hash, date, subject));
+        }
+    }
+    Ok(commits)
+}
+
 /// Resolve the effective remote: explicit arg wins, else config.
 pub fn resolve_remote(explicit: Option<&str>, config_remote: Option<&str>) -> Result<String> {
     explicit

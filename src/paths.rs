@@ -44,6 +44,13 @@ pub fn staging_dir() -> Result<PathBuf, CcError> {
     Ok(base.join("ccsync").join("staging"))
 }
 
+/// ccsync's managed local-backups directory where the TUI writes timestamped
+/// encrypted archives so they can be listed later: `~/.config/ccsync/backups`.
+pub fn backups_dir() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("backups"))
+}
+
 /// Encode an absolute path into the dash-separated form Claude Code uses for
 /// project directory names. `/home/user/ccsync` -> `-home-user-ccsync`.
 pub fn encode_path(path: &Path) -> String {

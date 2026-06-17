@@ -93,4 +93,7 @@ pub enum Command {
         #[arg(long)]
         allow_secrets: bool,
     },
+
+    /// Launch the interactive terminal UI.
+    Tui,
 }

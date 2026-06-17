@@ -6,6 +6,7 @@
 //! followed by `restore` applies it with absolute-path remapping.
 
 mod archive;
+mod backups;
 mod cli;
 mod config;
 mod error;
@@ -16,6 +17,7 @@ mod redact;
 mod remap;
 mod restore;
 mod snapshot;
+mod tui;
 
 use anyhow::Result;
 use clap::Parser;
@@ -54,6 +56,7 @@ fn run() -> Result<()> {
             cmd_snapshot(&config, false, allow_secrets)?;
             cmd_push(&config, archive, remote)
         }
+        Command::Tui => tui::run(&config),
     }
 }
 
