@@ -117,6 +117,11 @@ pub enum ServiceAction {
     Install,
     /// Stop the service and remove its unit.
     Uninstall,
-    /// Report whether the service is installed and running.
+    /// Start the daemon detached in the background (nohup-style; no service
+    /// manager required). Survives logout; logs to ~/.config/ccsync/daemon.log.
+    Start,
+    /// Stop a detached daemon started with `service start`.
+    Stop,
+    /// Report whether the service is installed and/or running.
     Status,
 }

@@ -51,6 +51,20 @@ pub fn backups_dir() -> Result<PathBuf, CcError> {
     Ok(base.join("ccsync").join("backups"))
 }
 
+/// PID file for a detached daemon started with `ccsync service start`:
+/// `~/.config/ccsync/daemon.pid`.
+pub fn daemon_pidfile() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("daemon.pid"))
+}
+
+/// Log file a detached daemon redirects its output to (tail it like a screen
+/// session): `~/.config/ccsync/daemon.log`.
+pub fn daemon_logfile() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("daemon.log"))
+}
+
 /// Encode an absolute path into the dash-separated form Claude Code uses for
 /// project directory names. `/home/user/ccsync` -> `-home-user-ccsync`.
 pub fn encode_path(path: &Path) -> String {
