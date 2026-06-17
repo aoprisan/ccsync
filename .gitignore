@@ -1,0 +1,3 @@
+/target
+# Encrypted snapshot archives produced by `ccsync export`.
+*.tar.gz.age
