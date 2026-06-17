@@ -11,6 +11,7 @@ mod cli;
 mod config;
 mod error;
 mod git;
+mod install;
 mod manifest;
 mod mcp;
 mod paths;
@@ -59,6 +60,7 @@ fn run() -> Result<()> {
             cmd_snapshot(&config, false, allow_secrets)?;
             cmd_push(&config, archive, remote)
         }
+        Command::Install => install::install(),
         Command::Tui => tui::run(&config),
         Command::Daemon => service::run_daemon(&config),
         Command::Service { action } => match action {

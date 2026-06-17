@@ -94,6 +94,13 @@ pub enum Command {
         allow_secrets: bool,
     },
 
+    /// Copy this binary into a `bin` directory on your PATH and exit.
+    ///
+    /// Picks the first of `~/.local/bin`, `~/bin`, or `~/.cargo/bin` already on
+    /// your PATH (falling back to `~/.local/bin`) and copies — rather than
+    /// symlinks — so the install survives a `cargo clean` or moving the source.
+    Install,
+
     /// Launch the interactive terminal UI.
     Tui,
 
