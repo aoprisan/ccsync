@@ -212,11 +212,18 @@ transcripts verbatim on a same-path machine.
 
 ## Configuration
 
-`~/.config/ccsync/config.toml` (created by `ccsync init`) controls the
+`<config>/ccsync/config.toml` (created by `ccsync init`) controls the
 `include`/`exclude` sets, `include_sessions`, `include_mcp_servers`, the git
 `remote`, the `[remap]` table, and the `[service]` table (see
 [Background service](#background-service)). `CLAUDE_CONFIG_DIR` is honored when
 locating the source directory.
+
+> **Where is `<config>`?** All of ccsync's own files (config, staging,
+> backups, repo cache, daemon pid/log) live under your platform config
+> directory: `~/Library/Application Support/ccsync/` on macOS and
+> `~/.config/ccsync/` on Linux (or `$XDG_CONFIG_HOME/ccsync/` when set). The
+> `~/.config/ccsync/...` paths shown elsewhere in this README are the Linux
+> form; substitute the macOS location accordingly.
 
 - **`include_mcp_servers`** (default `true`) — bundle the locally-configured MCP
   servers from `~/.claude.json` and merge them back on restore. Set to `false`

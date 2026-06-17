@@ -194,7 +194,10 @@ mod tests {
     fn no_mappings_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
-        write(&data.join("projects/-home-x-p/s.jsonl"), "{\"cwd\":\"/home/x/p\"}\n");
+        write(
+            &data.join("projects/-home-x-p/s.jsonl"),
+            "{\"cwd\":\"/home/x/p\"}\n",
+        );
         apply(&data, &[]).unwrap();
         assert!(data.join("projects/-home-x-p/s.jsonl").exists());
     }

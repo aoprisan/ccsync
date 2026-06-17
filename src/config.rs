@@ -179,7 +179,10 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        let c = Config { include_mcp_servers: false, ..Config::default() };
+        let c = Config {
+            include_mcp_servers: false,
+            ..Config::default()
+        };
         c.save(&path).unwrap();
         assert!(!Config::load(&path).unwrap().include_mcp_servers);
 
@@ -197,8 +200,14 @@ mod tests {
         c.remap.insert("/Users/alice".into(), "/home/alice".into());
         c.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
-        assert_eq!(loaded.remote.as_deref(), Some("git@example.com:me/ccsync-data.git"));
-        assert_eq!(loaded.remap.get("/Users/alice").map(String::as_str), Some("/home/alice"));
+        assert_eq!(
+            loaded.remote.as_deref(),
+            Some("git@example.com:me/ccsync-data.git")
+        );
+        assert_eq!(
+            loaded.remap.get("/Users/alice").map(String::as_str),
+            Some("/home/alice")
+        );
     }
 
     #[test]
@@ -226,7 +235,10 @@ mod tests {
         assert!(loaded.service.enabled);
         assert_eq!(loaded.service.interval_minutes, 15);
         assert_eq!(loaded.service.destination, ServiceDestination::Archive);
-        assert_eq!(loaded.service.backup_dir, Some(PathBuf::from("/mnt/backups")));
+        assert_eq!(
+            loaded.service.backup_dir,
+            Some(PathBuf::from("/mnt/backups"))
+        );
         assert!(loaded.service.allow_secrets);
     }
 

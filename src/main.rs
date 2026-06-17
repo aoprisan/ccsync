@@ -23,14 +23,35 @@ mod snapshot;
 mod theme;
 mod tui;
 
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 
 use backups::human_size;
 use cli::{Cli, Command};
 use config::Config;
 use restore::{MergeMode, RestoreOptions};
-use snapshot::SnapshotOptions;
+use snapshot::{ProgressSink, SnapshotOptions};
+
+/// Drives an [`indicatif`] progress bar from snapshot capture callbacks.
+struct BarSink {
+    bar: ProgressBar,
+}
+
+impl ProgressSink for BarSink {
+    fn start(&self, total_files: u64, total_bytes: u64) {
+        self.bar.set_length(total_bytes);
+        self.bar.set_message(format!("{total_files} files"));
+    }
+    fn advance(&self, file_bytes: u64) {
+        self.bar.inc(file_bytes);
+    }
+    fn finish(&self) {
+        self.bar.finish_and_clear();
+    }
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -46,18 +67,29 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Init { remote } => cmd_init(&config_path, config, remote),
-        Command::Snapshot { dry_run, allow_secrets } => {
-            cmd_snapshot(&config, dry_run, allow_secrets)
-        }
+        Command::Snapshot {
+            dry_run,
+            allow_secrets,
+        } => cmd_snapshot(&config, dry_run, allow_secrets),
         Command::Status => cmd_snapshot(&config, true, true),
         Command::Push { archive, remote } => cmd_push(&config, archive, remote),
         Command::Pull { archive, remote } => cmd_pull(&config, archive, remote),
-        Command::Restore { dry_run, no_remap, overwrite } => {
-            cmd_restore(&config, dry_run, no_remap, overwrite)
-        }
-        Command::Export { file, allow_secrets } => cmd_export(&config, &file, allow_secrets),
+        Command::Restore {
+            dry_run,
+            no_remap,
+            overwrite,
+        } => cmd_restore(&config, dry_run, no_remap, overwrite),
+        Command::Export {
+            file,
+            allow_secrets,
+        } => cmd_export(&config, &file, allow_secrets),
         Command::Import { file } => cmd_import(&file),
-        Command::Backup { archive, remote, allow_secrets, dry_run } => {
+        Command::Backup {
+            archive,
+            remote,
+            allow_secrets,
+            dry_run,
+        } => {
             cmd_snapshot(&config, dry_run, allow_secrets)?;
             if dry_run {
                 // Report the transport target without touching git or writing an
@@ -91,7 +123,11 @@ fn run() -> Result<()> {
     }
 }
 
-fn cmd_init(config_path: &std::path::Path, mut config: Config, remote: Option<String>) -> Result<()> {
+fn cmd_init(
+    config_path: &std::path::Path,
+    mut config: Config,
+    remote: Option<String>,
+) -> Result<()> {
     if remote.is_some() {
         config.remote = remote;
     }
@@ -107,7 +143,23 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
     let claude = paths::claude_dir()?;
     let staging = paths::staging_dir()?;
     let opts = SnapshotOptions::new(dry_run, allow_secrets, config);
-    let m = snapshot::build(&claude, &staging, config, &opts)?;
+
+    // Show a live progress bar for real captures on an interactive terminal;
+    // dry-runs and piped output fall back to the plain summary below.
+    let m = if !dry_run && std::io::stderr().is_terminal() {
+        let bar = ProgressBar::new(0);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "  capturing {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes}",
+            )
+            .expect("valid progress template")
+            .progress_chars("=>-"),
+        );
+        let sink = BarSink { bar };
+        snapshot::build_with_progress(&claude, &staging, config, &opts, &sink)?
+    } else {
+        snapshot::build(&claude, &staging, config, &opts)?
+    };
 
     let total: u64 = m.files.iter().map(|f| f.size).sum();
     println!(
@@ -121,15 +173,27 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
     // exactly what the backup will carry before anything leaves the machine.
     if dry_run {
         for f in &m.files {
-            println!("  copy {} -> data/{} ({})", f.rel_path, f.rel_path, human_size(f.size));
+            println!(
+                "  copy {} -> data/{} ({})",
+                f.rel_path,
+                f.rel_path,
+                human_size(f.size)
+            );
         }
     }
     if !m.project_roots.is_empty() {
-        println!("  {} session project root(s) recorded for remapping", m.project_roots.len());
+        println!(
+            "  {} session project root(s) recorded for remapping",
+            m.project_roots.len()
+        );
     }
     if let Some(claude_json) = &opts.claude_json {
         if let Some(doc) = mcp::extract(claude_json)? {
-            println!("  {} local MCP server(s) bundled from {}", mcp::server_count(&doc), claude_json.display());
+            println!(
+                "  {} local MCP server(s) bundled from {}",
+                mcp::server_count(&doc),
+                claude_json.display()
+            );
         }
     }
     if !dry_run {
@@ -174,7 +238,10 @@ fn cmd_pull(
         git::pull(&remote, &staging)?;
         println!("pulled snapshot from {remote}");
     }
-    println!("  staged at {} — run `ccsync restore` to apply", staging.display());
+    println!(
+        "  staged at {} — run `ccsync restore` to apply",
+        staging.display()
+    );
     Ok(())
 }
 
@@ -184,7 +251,11 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
     let opts = RestoreOptions {
         dry_run,
         remap: !no_remap,
-        merge: if overwrite { MergeMode::Overwrite } else { MergeMode::Merge },
+        merge: if overwrite {
+            MergeMode::Overwrite
+        } else {
+            MergeMode::Merge
+        },
         claude_json: if config.include_mcp_servers {
             paths::claude_json_file().ok()
         } else {
@@ -200,7 +271,11 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
         }
     }
     if let Some(backup) = &report.backup_dir {
-        println!("backed up existing {} to {}", claude.display(), backup.display());
+        println!(
+            "backed up existing {} to {}",
+            claude.display(),
+            backup.display()
+        );
     }
     if let Some(backup) = &report.claude_json_backup {
         println!("backed up existing ~/.claude.json to {}", backup.display());
@@ -234,6 +309,9 @@ fn cmd_import(file: &std::path::Path) -> Result<()> {
     let pass = archive::passphrase_from_env()?;
     let staging = paths::staging_dir()?;
     archive::extract(file, &staging, &pass)?;
-    println!("imported snapshot to {} — run `ccsync restore` to apply", staging.display());
+    println!(
+        "imported snapshot to {} — run `ccsync restore` to apply",
+        staging.display()
+    );
     Ok(())
 }

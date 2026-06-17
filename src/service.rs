@@ -102,7 +102,10 @@ fn destination_label(dest: ServiceDestination) -> &'static str {
 
 /// Timestamped log line to stdout, captured by journald / launchd logs.
 fn log(msg: &str) {
-    println!("[ccsync {}] {msg}", Local::now().format("%Y-%m-%dT%H:%M:%S"));
+    println!(
+        "[ccsync {}] {msg}",
+        Local::now().format("%Y-%m-%dT%H:%M:%S")
+    );
 }
 
 /// Print the destination-specific reminder about secrets the service manager
@@ -167,7 +170,10 @@ pub fn install(config: &Config) -> Result<()> {
     println!("wrote systemd unit to {}", unit_path.display());
 
     let _ = run_tool("systemctl", &["--user", "daemon-reload"]);
-    match run_tool("systemctl", &["--user", "enable", "--now", "ccsync.service"]) {
+    match run_tool(
+        "systemctl",
+        &["--user", "enable", "--now", "ccsync.service"],
+    ) {
         Ok(_) => println!("enabled and started ccsync.service"),
         Err(e) => {
             println!("could not enable the service automatically ({e})");
@@ -181,7 +187,10 @@ pub fn install(config: &Config) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn uninstall() -> Result<()> {
-    let _ = run_tool("systemctl", &["--user", "disable", "--now", "ccsync.service"]);
+    let _ = run_tool(
+        "systemctl",
+        &["--user", "disable", "--now", "ccsync.service"],
+    );
     let unit_path = systemd_unit_path()?;
     if unit_path.exists() {
         std::fs::remove_file(&unit_path)
@@ -200,9 +209,16 @@ fn report_unit_status() -> Result<()> {
     println!(
         "unit: {} ({})",
         unit_path.display(),
-        if unit_path.exists() { "installed" } else { "not installed" }
+        if unit_path.exists() {
+            "installed"
+        } else {
+            "not installed"
+        }
     );
-    match run_tool("systemctl", &["--user", "--no-pager", "status", "ccsync.service"]) {
+    match run_tool(
+        "systemctl",
+        &["--user", "--no-pager", "status", "ccsync.service"],
+    ) {
         Ok(out) => print!("{out}"),
         Err(e) => println!("systemctl status unavailable ({e})"),
     }
@@ -216,7 +232,9 @@ fn report_unit_status() -> Result<()> {
 /// Render the launchd agent plist that runs `ccsync daemon`.
 #[cfg(target_os = "macos")]
 pub fn launchd_plist(exec_path: &Path) -> String {
-    let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+    let home = dirs::home_dir()
+        .map(|h| h.display().to_string())
+        .unwrap_or_default();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -292,7 +310,11 @@ fn report_unit_status() -> Result<()> {
     println!(
         "agent: {} ({})",
         plist_path.display(),
-        if plist_path.exists() { "installed" } else { "not installed" }
+        if plist_path.exists() {
+            "installed"
+        } else {
+            "not installed"
+        }
     );
     match run_tool("launchctl", &["list", "com.ccsync.daemon"]) {
         Ok(out) => print!("{out}"),
@@ -432,7 +454,10 @@ pub fn start(config: &Config) -> Result<()> {
 pub fn stop() -> Result<()> {
     let pid_path = paths::daemon_pidfile()?;
     let Some(pid) = read_pid() else {
-        println!("no daemon pidfile at {}; nothing to stop", pid_path.display());
+        println!(
+            "no daemon pidfile at {}; nothing to stop",
+            pid_path.display()
+        );
         return Ok(());
     };
     if !pid_is_running(pid) {
@@ -484,12 +509,21 @@ mod tests {
     use chrono::TimeZone;
 
     fn with_config_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        // `dirs::config_dir()` reads `$XDG_CONFIG_HOME` on Linux but
+        // `$HOME/Library/Application Support` on macOS, so redirect both —
+        // otherwise these tests write into the real user config dir on macOS.
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
         std::env::set_var("XDG_CONFIG_HOME", dir);
+        std::env::set_var("HOME", dir);
         let out = f();
-        match prev {
+        match prev_xdg {
             Some(p) => std::env::set_var("XDG_CONFIG_HOME", p),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match prev_home {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
         }
         out
     }
@@ -519,7 +553,10 @@ mod tests {
     fn archive_dir_honors_explicit_backup_dir() {
         let mut config = Config::default();
         config.service.backup_dir = Some(PathBuf::from("/mnt/ext/backups"));
-        assert_eq!(archive_dir(&config).unwrap(), PathBuf::from("/mnt/ext/backups"));
+        assert_eq!(
+            archive_dir(&config).unwrap(),
+            PathBuf::from("/mnt/ext/backups")
+        );
     }
 
     #[cfg(target_os = "linux")]

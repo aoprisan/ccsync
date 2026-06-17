@@ -7,6 +7,11 @@
 //! example `/home/user/ccsync` becomes `-home-user-ccsync`. This module owns
 //! that encoding so the snapshot and remap logic can rely on a single
 //! implementation.
+//!
+//! ccsync's own files live under a per-platform config directory, written
+//! below as `<config>/ccsync/`. `<config>` is `dirs::config_dir()`, which is
+//! `~/Library/Application Support` on macOS and `~/.config` on Linux (or
+//! `$XDG_CONFIG_HOME` when set) — *not* always `~/.config`.
 
 use std::path::{Path, PathBuf};
 
@@ -45,35 +50,35 @@ pub fn claude_json_file() -> Result<PathBuf, CcError> {
     Ok(home_dir()?.join(".claude.json"))
 }
 
-/// ccsync's own config file location: `~/.config/ccsync/config.toml`.
+/// ccsync's own config file location: `<config>/ccsync/config.toml`.
 pub fn config_file() -> Result<PathBuf, CcError> {
     let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
     Ok(base.join("ccsync").join("config.toml"))
 }
 
 /// ccsync's staging directory where a snapshot is materialized before it is
-/// pushed or after it is pulled: `~/.config/ccsync/staging`.
+/// pushed or after it is pulled: `<config>/ccsync/staging`.
 pub fn staging_dir() -> Result<PathBuf, CcError> {
     let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
     Ok(base.join("ccsync").join("staging"))
 }
 
 /// ccsync's managed local-backups directory where the TUI writes timestamped
-/// encrypted archives so they can be listed later: `~/.config/ccsync/backups`.
+/// encrypted archives so they can be listed later: `<config>/ccsync/backups`.
 pub fn backups_dir() -> Result<PathBuf, CcError> {
     let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
     Ok(base.join("ccsync").join("backups"))
 }
 
 /// PID file for a detached daemon started with `ccsync service start`:
-/// `~/.config/ccsync/daemon.pid`.
+/// `<config>/ccsync/daemon.pid`.
 pub fn daemon_pidfile() -> Result<PathBuf, CcError> {
     let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
     Ok(base.join("ccsync").join("daemon.pid"))
 }
 
 /// Log file a detached daemon redirects its output to (tail it like a screen
-/// session): `~/.config/ccsync/daemon.log`.
+/// session): `<config>/ccsync/daemon.log`.
 pub fn daemon_logfile() -> Result<PathBuf, CcError> {
     let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
     Ok(base.join("ccsync").join("daemon.log"))
@@ -108,7 +113,10 @@ mod tests {
     fn encode_roundtrip_unix() {
         let p = Path::new("/home/user/ccsync");
         assert_eq!(encode_path(p), "-home-user-ccsync");
-        assert_eq!(decode_path("-home-user-ccsync"), PathBuf::from("/home/user/ccsync"));
+        assert_eq!(
+            decode_path("-home-user-ccsync"),
+            PathBuf::from("/home/user/ccsync")
+        );
     }
 
     #[test]

@@ -72,8 +72,13 @@ pub fn run(
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| ".claude".to_string())
         ));
-        copy_dir(claude_dir, &backup)
-            .with_context(|| format!("backing up {} to {}", claude_dir.display(), backup.display()))?;
+        copy_dir(claude_dir, &backup).with_context(|| {
+            format!(
+                "backing up {} to {}",
+                claude_dir.display(),
+                backup.display()
+            )
+        })?;
         Some(backup)
     } else {
         None
@@ -115,8 +120,7 @@ pub fn run(
         if is_json_config {
             merge_json_file(entry.path(), &dest)?;
         } else {
-            fs::copy(entry.path(), &dest)
-                .with_context(|| format!("writing {}", dest.display()))?;
+            fs::copy(entry.path(), &dest).with_context(|| format!("writing {}", dest.display()))?;
         }
     }
 
@@ -127,9 +131,8 @@ pub fn run(
     let mcp_staged = data_root.join(mcp::MCP_FILE);
     if mcp_staged.exists() {
         if let Some(claude_json) = &opts.claude_json {
-            let doc: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&mcp_staged)?)
-                    .with_context(|| format!("parsing {}", mcp_staged.display()))?;
+            let doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&mcp_staged)?)
+                .with_context(|| format!("parsing {}", mcp_staged.display()))?;
             mcp_servers_restored = mcp::server_count(&doc);
             if !opts.dry_run {
                 // Back up the existing `~/.claude.json` first (it lives outside
@@ -144,13 +147,16 @@ pub fn run(
                             .unwrap_or_else(|| ".claude.json".to_string())
                     ));
                     fs::copy(claude_json, &backup).with_context(|| {
-                        format!("backing up {} to {}", claude_json.display(), backup.display())
+                        format!(
+                            "backing up {} to {}",
+                            claude_json.display(),
+                            backup.display()
+                        )
                     })?;
                     claude_json_backup = Some(backup);
                 }
                 let overwrite = opts.merge == MergeMode::Overwrite;
-                mcp_servers_restored =
-                    mcp::merge_into(claude_json, &doc, &mappings, overwrite)?;
+                mcp_servers_restored = mcp::merge_into(claude_json, &doc, &mappings, overwrite)?;
             }
         }
     }
@@ -170,8 +176,8 @@ pub fn run(
 fn merge_json_file(incoming: &Path, existing: &Path) -> Result<()> {
     let inc: serde_json::Value = serde_json::from_str(&fs::read_to_string(incoming)?)
         .with_context(|| format!("parsing {}", incoming.display()))?;
-    let mut base: serde_json::Value = serde_json::from_str(&fs::read_to_string(existing)?)
-        .unwrap_or(serde_json::Value::Null);
+    let mut base: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(existing)?).unwrap_or(serde_json::Value::Null);
     merge_value(&mut base, inc);
     fs::write(existing, serde_json::to_string_pretty(&base)?)?;
     Ok(())
@@ -234,7 +240,11 @@ mod tests {
             &src_claude,
             &staging,
             &cfg,
-            &SnapshotOptions { dry_run: false, allow_secrets: false, claude_json: None },
+            &SnapshotOptions {
+                dry_run: false,
+                allow_secrets: false,
+                claude_json: None,
+            },
         )
         .unwrap();
         manifest.source_home = "/Users/alice".to_string();
@@ -268,7 +278,10 @@ mod tests {
         let new_home_str = fake_home.to_string_lossy().to_string();
         let encoded = paths::encode_path(Path::new(&format!("{new_home_str}/proj")));
         let restored_sess = dst_claude.join("projects").join(&encoded).join("s.jsonl");
-        assert!(restored_sess.exists(), "expected remapped session dir {encoded}");
+        assert!(
+            restored_sess.exists(),
+            "expected remapped session dir {encoded}"
+        );
         let content = fs::read_to_string(restored_sess).unwrap();
         assert!(content.contains(&new_home_str));
         assert!(!content.contains("/Users/alice"));
@@ -279,19 +292,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
         let data = staging.join("data");
-        write(&data.join("settings.json"), r#"{"model":"opus","env":{"A":"1"}}"#);
+        write(
+            &data.join("settings.json"),
+            r#"{"model":"opus","env":{"A":"1"}}"#,
+        );
         // Minimal manifest so require_staged/read pass.
-        let m = Manifest::new("h".into(), paths::home_dir().unwrap().to_string_lossy().to_string());
+        let m = Manifest::new(
+            "h".into(),
+            paths::home_dir().unwrap().to_string_lossy().to_string(),
+        );
         m.write_to(&staging).unwrap();
 
         let claude = tmp.path().join("claude");
-        write(&claude.join("settings.json"), r#"{"theme":"dark","env":{"B":"2"}}"#);
+        write(
+            &claude.join("settings.json"),
+            r#"{"theme":"dark","env":{"B":"2"}}"#,
+        );
 
-        let opts = RestoreOptions { dry_run: false, remap: false, merge: MergeMode::Merge, claude_json: None };
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Merge,
+            claude_json: None,
+        };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
         let merged: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
+                .unwrap();
         assert_eq!(merged["theme"], "dark");
         assert_eq!(merged["model"], "opus");
         assert_eq!(merged["env"]["A"], "1");
@@ -309,14 +337,20 @@ mod tests {
             &data.join(crate::mcp::MCP_FILE),
             r#"{"mcpServers":{"fetch":{"command":"uvx"}}}"#,
         );
-        let m = Manifest::new("h".into(), paths::home_dir().unwrap().to_string_lossy().to_string());
+        let m = Manifest::new(
+            "h".into(),
+            paths::home_dir().unwrap().to_string_lossy().to_string(),
+        );
         m.write_to(&staging).unwrap();
 
         let claude = tmp.path().join("claude");
         write(&claude.join("settings.json"), "{}");
         // Pre-existing ~/.claude.json with a token that must survive the merge.
         let claude_json = tmp.path().join(".claude.json");
-        write(&claude_json, r#"{"oauthAccount":{"accessToken":"keep-me"}}"#);
+        write(
+            &claude_json,
+            r#"{"oauthAccount":{"accessToken":"keep-me"}}"#,
+        );
 
         let opts = RestoreOptions {
             dry_run: false,
@@ -328,7 +362,10 @@ mod tests {
 
         // The MCP file is not copied into ~/.claude.
         assert!(!claude.join(crate::mcp::MCP_FILE).exists());
-        assert!(!report.files_written.iter().any(|f| f == crate::mcp::MCP_FILE));
+        assert!(!report
+            .files_written
+            .iter()
+            .any(|f| f == crate::mcp::MCP_FILE));
         // Server merged into ~/.claude.json; the OAuth token is preserved.
         assert_eq!(report.mcp_servers_restored, 1);
         assert!(report.claude_json_backup.is_some());

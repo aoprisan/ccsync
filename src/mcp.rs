@@ -109,8 +109,7 @@ pub fn merge_into(
     let mut root: Value = if claude_json.exists() {
         let text = std::fs::read_to_string(claude_json)
             .with_context(|| format!("reading {}", claude_json.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", claude_json.display()))?
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", claude_json.display()))?
     } else {
         Value::Object(Map::new())
     };
@@ -244,17 +243,25 @@ mod tests {
         assert_eq!(doc["mcpServers"]["fetch"]["command"], "uvx");
         assert!(doc.get("oauthAccount").is_none());
         // Project with servers captured; project without is omitted.
-        assert_eq!(doc["projects"]["/home/alice/proj"]["mcpServers"]["db"]["command"], "pg-mcp");
+        assert_eq!(
+            doc["projects"]["/home/alice/proj"]["mcpServers"]["db"]["command"],
+            "pg-mcp"
+        );
         assert!(doc["projects"].get("/home/alice/other").is_none());
         // Non-mcp project keys are not carried over.
-        assert!(doc["projects"]["/home/alice/proj"].get("allowedTools").is_none());
+        assert!(doc["projects"]["/home/alice/proj"]
+            .get("allowedTools")
+            .is_none());
     }
 
     #[test]
     fn extract_returns_none_when_no_servers() {
         let tmp = tempfile::tempdir().unwrap();
         let cj = tmp.path().join(".claude.json");
-        write(&cj, &json!({ "mcpServers": {}, "projects": { "/x": { "allowedTools": [] } } }));
+        write(
+            &cj,
+            &json!({ "mcpServers": {}, "projects": { "/x": { "allowedTools": [] } } }),
+        );
         assert!(extract(&cj).unwrap().is_none());
         // Missing file is also None, not an error.
         assert!(extract(&tmp.path().join("absent.json")).unwrap().is_none());
@@ -279,7 +286,10 @@ mod tests {
                 "/home/alice/proj": { "mcpServers": { "db": { "command": "pg-mcp" } } }
             }
         });
-        let mappings = vec![Mapping { from: "/home/alice".into(), to: "/home/bob".into() }];
+        let mappings = vec![Mapping {
+            from: "/home/alice".into(),
+            to: "/home/bob".into(),
+        }];
         let merged = merge_into(&cj, &doc, &mappings, false).unwrap();
         assert_eq!(merged, 2);
 
@@ -290,7 +300,10 @@ mod tests {
         // Incoming user server added.
         assert_eq!(root["mcpServers"]["fetch"]["command"], "uvx");
         // Project path remapped /home/alice -> /home/bob.
-        assert_eq!(root["projects"]["/home/bob/proj"]["mcpServers"]["db"]["command"], "pg-mcp");
+        assert_eq!(
+            root["projects"]["/home/bob/proj"]["mcpServers"]["db"]["command"],
+            "pg-mcp"
+        );
         assert!(root["projects"].get("/home/alice/proj").is_none());
     }
 
@@ -308,7 +321,10 @@ mod tests {
     fn merge_mode_keeps_existing_overwrite_replaces() {
         let tmp = tempfile::tempdir().unwrap();
         let cj = tmp.path().join(".claude.json");
-        write(&cj, &json!({ "mcpServers": { "fetch": { "command": "old", "extra": 1 } } }));
+        write(
+            &cj,
+            &json!({ "mcpServers": { "fetch": { "command": "old", "extra": 1 } } }),
+        );
         let doc = json!({ "mcpServers": { "fetch": { "command": "new" } } });
 
         // Merge: deep-merge, incoming leaf wins but unrelated keys survive.
@@ -318,7 +334,10 @@ mod tests {
         assert_eq!(root["mcpServers"]["fetch"]["extra"], 1);
 
         // Overwrite: the whole server definition is replaced.
-        write(&cj, &json!({ "mcpServers": { "fetch": { "command": "old", "extra": 1 } } }));
+        write(
+            &cj,
+            &json!({ "mcpServers": { "fetch": { "command": "old", "extra": 1 } } }),
+        );
         merge_into(&cj, &doc, &[], true).unwrap();
         let root: Value = serde_json::from_str(&std::fs::read_to_string(&cj).unwrap()).unwrap();
         assert_eq!(root["mcpServers"]["fetch"]["command"], "new");

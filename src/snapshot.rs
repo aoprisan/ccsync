@@ -44,12 +44,35 @@ impl SnapshotOptions {
         } else {
             None
         };
-        SnapshotOptions { dry_run, allow_secrets, claude_json }
+        SnapshotOptions {
+            dry_run,
+            allow_secrets,
+            claude_json,
+        }
     }
 }
 
 /// File extensions we treat as text and therefore scan for secrets.
 const SCANNED_EXTS: &[&str] = &["json", "toml", "md", "yaml", "yml", "env"];
+
+/// Reports copy progress while a snapshot is built. Implemented by the CLI to
+/// drive a progress bar; `snapshot::build` itself stays UI-agnostic.
+pub trait ProgressSink {
+    /// Called once after the full file list is known, before any copying.
+    fn start(&self, total_files: u64, total_bytes: u64);
+    /// Called after each file is captured, with that file's byte count.
+    fn advance(&self, file_bytes: u64);
+    /// Called once when capture finishes.
+    fn finish(&self);
+}
+
+/// A file selected for capture, resolved during the planning pass so progress
+/// totals are known before any bytes are read.
+struct PlannedFile {
+    abs: PathBuf,
+    rel: String,
+    size: u64,
+}
 
 /// Build a snapshot of `claude_dir` into `staging`. Returns the manifest.
 pub fn build(
@@ -57,6 +80,27 @@ pub fn build(
     staging: &Path,
     config: &Config,
     opts: &SnapshotOptions,
+) -> Result<Manifest> {
+    build_inner(claude_dir, staging, config, opts, None)
+}
+
+/// Like [`build`], but reports per-file progress through `progress`.
+pub fn build_with_progress(
+    claude_dir: &Path,
+    staging: &Path,
+    config: &Config,
+    opts: &SnapshotOptions,
+    progress: &dyn ProgressSink,
+) -> Result<Manifest> {
+    build_inner(claude_dir, staging, config, opts, Some(progress))
+}
+
+fn build_inner(
+    claude_dir: &Path,
+    staging: &Path,
+    config: &Config,
+    opts: &SnapshotOptions,
+    progress: Option<&dyn ProgressSink>,
 ) -> Result<Manifest> {
     let host = hostname();
     let home = paths::home_dir()?.to_string_lossy().to_string();
@@ -72,7 +116,10 @@ pub fn build(
         fs::create_dir_all(&data_root)?;
     }
 
-    // Resolve which top-level include entries actually apply.
+    // Plan first: resolve the complete file list (applying include/exclude and
+    // the credential hard-block) so progress has an accurate total before any
+    // bytes are read or copied.
+    let mut planned = Vec::new();
     for entry in &config.include {
         if entry == "projects" && !config.include_sessions {
             continue;
@@ -81,7 +128,21 @@ pub fn build(
         if !src.exists() {
             continue;
         }
-        capture_path(&src, claude_dir, &data_root, config, opts, &mut manifest)?;
+        plan_path(&src, claude_dir, config, &mut planned)?;
+    }
+
+    let total_bytes: u64 = planned.iter().map(|p| p.size).sum();
+    if let Some(p) = progress {
+        p.start(planned.len() as u64, total_bytes);
+    }
+    for pf in &planned {
+        capture_file(pf, &data_root, opts, &mut manifest)?;
+        if let Some(p) = progress {
+            p.advance(pf.size);
+        }
+    }
+    if let Some(p) = progress {
+        p.finish();
     }
 
     // Record decoded project roots for remapping, even in dry-run.
@@ -131,7 +192,11 @@ fn capture_mcp_servers(
 
     if !opts.allow_secrets {
         if let Some(hint) = redact::scan_for_secrets(&serialized) {
-            return Err(CcError::SecretDetected { file: mcp::MCP_FILE.to_string(), hint }.into());
+            return Err(CcError::SecretDetected {
+                file: mcp::MCP_FILE.to_string(),
+                hint,
+            }
+            .into());
         }
     }
 
@@ -152,14 +217,14 @@ fn capture_mcp_servers(
     Ok(())
 }
 
-/// Capture a single include entry, which may be a file or a directory tree.
-fn capture_path(
+/// Walk a single include entry (file or directory tree) and append the files
+/// that survive include/exclude to `out`. The credential hard-block aborts the
+/// whole snapshot here, before any bytes are read.
+fn plan_path(
     src: &Path,
     claude_dir: &Path,
-    data_root: &Path,
     config: &Config,
-    opts: &SnapshotOptions,
-    manifest: &mut Manifest,
+    out: &mut Vec<PlannedFile>,
 ) -> Result<()> {
     for entry in WalkDir::new(src).follow_links(false) {
         let entry = entry?;
@@ -187,30 +252,53 @@ fn capture_path(
             continue;
         }
 
-        // Secret scan for text configs unless explicitly allowed.
-        if !opts.allow_secrets && is_scanned(abs) {
-            if let Ok(text) = fs::read_to_string(abs) {
-                if let Some(hint) = redact::scan_for_secrets(&text) {
-                    return Err(CcError::SecretDetected { file: rel, hint }.into());
-                }
-            }
-        }
-
-        let bytes = fs::read(abs).with_context(|| format!("reading {}", abs.display()))?;
-        let sha256 = hex(&Sha256::digest(&bytes));
-        manifest.files.push(FileEntry {
-            rel_path: rel.clone(),
-            sha256,
-            size: bytes.len() as u64,
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push(PlannedFile {
+            abs: abs.to_path_buf(),
+            rel,
+            size,
         });
+    }
+    Ok(())
+}
 
-        if !opts.dry_run {
-            let dest = data_root.join(&rel);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
+/// Scan, hash, and (unless dry-run) copy a single planned file into staging.
+fn capture_file(
+    pf: &PlannedFile,
+    data_root: &Path,
+    opts: &SnapshotOptions,
+    manifest: &mut Manifest,
+) -> Result<()> {
+    let abs = pf.abs.as_path();
+    let rel = &pf.rel;
+
+    // Secret scan for text configs unless explicitly allowed.
+    if !opts.allow_secrets && is_scanned(abs) {
+        if let Ok(text) = fs::read_to_string(abs) {
+            if let Some(hint) = redact::scan_for_secrets(&text) {
+                return Err(CcError::SecretDetected {
+                    file: rel.clone(),
+                    hint,
+                }
+                .into());
             }
-            fs::write(&dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
         }
+    }
+
+    let bytes = fs::read(abs).with_context(|| format!("reading {}", abs.display()))?;
+    let sha256 = hex(&Sha256::digest(&bytes));
+    manifest.files.push(FileEntry {
+        rel_path: rel.clone(),
+        sha256,
+        size: bytes.len() as u64,
+    });
+
+    if !opts.dry_run {
+        let dest = data_root.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
     }
     Ok(())
 }
@@ -269,7 +357,11 @@ mod tests {
         );
 
         let cfg = Config::default();
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: false, claude_json: None };
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: None,
+        };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
         let rels: Vec<&str> = m.files.iter().map(|f| f.rel_path.as_str()).collect();
@@ -296,7 +388,11 @@ mod tests {
         let mut cfg = Config::default();
         cfg.include.push(".credentials.json".into());
         cfg.exclude.clear();
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: true, claude_json: None };
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: true,
+            claude_json: None,
+        };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("credential"));
     }
@@ -311,12 +407,20 @@ mod tests {
             r#"{"env":{"ANTHROPIC_API_KEY":"sk-abcdefghijklmnopqrstuvwx"}}"#,
         );
         let cfg = Config::default();
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: false, claude_json: None };
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: None,
+        };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("secret"));
 
         // With allow_secrets it succeeds.
-        let opts = SnapshotOptions { dry_run: false, allow_secrets: true, claude_json: None };
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: true,
+            claude_json: None,
+        };
         assert!(build(&claude, &staging, &cfg, &opts).is_ok());
     }
 
@@ -350,15 +454,71 @@ mod tests {
     }
 
     #[test]
+    fn reports_progress_totals() {
+        use std::cell::Cell;
+
+        struct CountingSink {
+            files: Cell<u64>,
+            bytes: Cell<u64>,
+            advanced: Cell<u64>,
+            finished: Cell<bool>,
+        }
+        impl ProgressSink for CountingSink {
+            fn start(&self, total_files: u64, total_bytes: u64) {
+                self.files.set(total_files);
+                self.bytes.set(total_bytes);
+            }
+            fn advance(&self, file_bytes: u64) {
+                self.advanced.set(self.advanced.get() + file_bytes);
+            }
+            fn finish(&self) {
+                self.finished.set(true);
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), r#"{"theme":"dark"}"#);
+        write(&claude.join("CLAUDE.md"), "# memory");
+
+        let cfg = Config::default();
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: None,
+        };
+        let sink = CountingSink {
+            files: Cell::new(0),
+            bytes: Cell::new(0),
+            advanced: Cell::new(0),
+            finished: Cell::new(false),
+        };
+        let m = build_with_progress(&claude, &staging, &cfg, &opts, &sink).unwrap();
+
+        let total: u64 = m.files.iter().map(|f| f.size).sum();
+        assert_eq!(sink.files.get(), m.files.len() as u64);
+        assert_eq!(sink.bytes.get(), total);
+        assert_eq!(sink.advanced.get(), total);
+        assert!(sink.finished.get());
+    }
+
+    #[test]
     fn mcp_bundling_disabled_by_config() {
         let tmp = tempfile::tempdir().unwrap();
         let claude = tmp.path().join("claude");
         let staging = tmp.path().join("staging");
         write(&claude.join("settings.json"), "{}");
         let claude_json = tmp.path().join(".claude.json");
-        write(&claude_json, r#"{"mcpServers":{"fetch":{"command":"uvx"}}}"#);
+        write(
+            &claude_json,
+            r#"{"mcpServers":{"fetch":{"command":"uvx"}}}"#,
+        );
 
-        let cfg = Config { include_mcp_servers: false, ..Config::default() };
+        let cfg = Config {
+            include_mcp_servers: false,
+            ..Config::default()
+        };
         let opts = SnapshotOptions {
             dry_run: false,
             allow_secrets: false,

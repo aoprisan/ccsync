@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 
 /// Install the running executable into a user bin directory on `$PATH`.
 pub fn install() -> Result<()> {
@@ -64,7 +64,11 @@ fn copy_binary(source: &Path, dest: &Path) -> Result<()> {
 /// Pick a destination bin directory: the first conventional user bin dir that is
 /// already on `$PATH` (so the install works immediately), else `~/.local/bin`.
 fn choose_install_dir(home: &Path, path_var: &OsStr) -> PathBuf {
-    let preferred = [home.join(".local/bin"), home.join("bin"), home.join(".cargo/bin")];
+    let preferred = [
+        home.join(".local/bin"),
+        home.join("bin"),
+        home.join(".cargo/bin"),
+    ];
     for dir in &preferred {
         if path_contains(path_var, dir) {
             return dir.clone();
@@ -108,7 +112,10 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().contains("install-tmp"));
-        assert!(!leftover_tmp, "temp file should be renamed away, not left behind");
+        assert!(
+            !leftover_tmp,
+            "temp file should be renamed away, not left behind"
+        );
     }
 
     #[test]
@@ -117,13 +124,19 @@ mod tests {
         let path_var =
             env::join_paths([PathBuf::from("/usr/bin"), home.join(".cargo/bin")]).unwrap();
         // ~/.local/bin and ~/bin are absent from PATH, so ~/.cargo/bin wins.
-        assert_eq!(choose_install_dir(&home, &path_var), home.join(".cargo/bin"));
+        assert_eq!(
+            choose_install_dir(&home, &path_var),
+            home.join(".cargo/bin")
+        );
     }
 
     #[test]
     fn falls_back_to_local_bin_when_none_on_path() {
         let home = PathBuf::from("/home/dev");
         let path_var = env::join_paths([PathBuf::from("/usr/bin")]).unwrap();
-        assert_eq!(choose_install_dir(&home, &path_var), home.join(".local/bin"));
+        assert_eq!(
+            choose_install_dir(&home, &path_var),
+            home.join(".local/bin")
+        );
     }
 }

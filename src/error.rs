@@ -6,7 +6,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CcError {
-    #[error("could not locate the Claude Code directory (~/.claude); set CLAUDE_CONFIG_DIR or HOME")]
+    #[error(
+        "could not locate the Claude Code directory (~/.claude); set CLAUDE_CONFIG_DIR or HOME"
+    )]
     ClaudeDirNotFound,
 
     #[error("no snapshot found in the staging directory ({0}); run `ccsync snapshot` or `ccsync pull` first")]

@@ -15,10 +15,10 @@ use std::io::{self, Stdout};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use crossterm::execute;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 
@@ -48,6 +48,8 @@ struct App {
     backups_state: ListState,
     upload_selected: usize,
     status: String,
+    /// When set, a delete of `backups[idx]` is awaiting y/n confirmation.
+    pending_delete: Option<usize>,
     should_quit: bool,
 }
 
@@ -63,7 +65,9 @@ impl App {
             backups: Vec::new(),
             backups_state: ListState::default(),
             upload_selected: 0,
-            status: "↹ switch tabs · ↑/↓ move · r refresh · t theme · q quit".to_string(),
+            status: "↹ switch tabs · ↑/↓ move · d delete · r refresh · t theme · q quit"
+                .to_string(),
+            pending_delete: None,
             should_quit: false,
         };
         app.refresh();
@@ -118,6 +122,52 @@ impl App {
                 self.upload_selected = (cur + delta).rem_euclid(len) as usize;
             }
             _ => {}
+        }
+    }
+
+    /// Ask to delete the selected local backup, arming a y/n confirmation.
+    /// Only valid on the backups tab and only for deletable kinds.
+    fn request_delete(&mut self) {
+        if self.tab != 1 {
+            return;
+        }
+        let Some(idx) = self.backups_state.selected() else {
+            self.status = "no backup selected".to_string();
+            return;
+        };
+        let Some(b) = self.backups.get(idx) else {
+            return;
+        };
+        if !b.kind.deletable() {
+            self.status = format!("{} backups can't be deleted here", b.kind.label());
+            return;
+        }
+        self.status = format!(
+            "delete {} ?  press y to confirm, any key to cancel",
+            b.label
+        );
+        self.pending_delete = Some(idx);
+    }
+
+    /// Carry out a previously-armed delete and refresh the list.
+    fn confirm_delete(&mut self) {
+        let Some(idx) = self.pending_delete.take() else {
+            return;
+        };
+        let Some(b) = self.backups.get(idx).cloned() else {
+            return;
+        };
+        match backups::delete(&b) {
+            Ok(()) => self.status = format!("deleted {}", b.label),
+            Err(e) => self.status = format!("error: {e:#}"),
+        }
+        self.refresh();
+    }
+
+    /// Abandon an armed delete without removing anything.
+    fn cancel_delete(&mut self) {
+        if self.pending_delete.take().is_some() {
+            self.status = "delete cancelled".to_string();
         }
     }
 
@@ -201,7 +251,12 @@ fn summarize_manifest(m: &Manifest, claude: &std::path::Path) -> Vec<String> {
 
     let mut groups: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     for f in &m.files {
-        let top = f.rel_path.split('/').next().unwrap_or(&f.rel_path).to_string();
+        let top = f
+            .rel_path
+            .split('/')
+            .next()
+            .unwrap_or(&f.rel_path)
+            .to_string();
         let e = groups.entry(top).or_insert((0, 0));
         e.0 += 1;
         e.1 += f.size;
@@ -210,7 +265,10 @@ fn summarize_manifest(m: &Manifest, claude: &std::path::Path) -> Vec<String> {
         lines.push("  (nothing — ~/.claude is empty or fully excluded)".to_string());
     }
     for (name, (count, size)) in groups {
-        lines.push(format!("  {name}  —  {count} file(s), {}", backups::human_size(size)));
+        lines.push(format!(
+            "  {name}  —  {count} file(s), {}",
+            backups::human_size(size)
+        ));
     }
     lines
 }
@@ -248,6 +306,15 @@ fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // While a delete is armed, the next keypress is the answer: `y`
+            // confirms, anything else cancels.
+            if app.pending_delete.is_some() {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
+                    _ => app.cancel_delete(),
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
                 KeyCode::Tab | KeyCode::Right => app.next_tab(),
@@ -259,6 +326,7 @@ fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
                     app.status = "refreshed".to_string();
                 }
                 KeyCode::Char('t') => app.toggle_theme(),
+                KeyCode::Char('d') | KeyCode::Delete => app.request_delete(),
                 KeyCode::Enter => {
                     if app.tab == 2 {
                         app.status = "working…".to_string();
@@ -291,11 +359,16 @@ fn ui(f: &mut Frame, app: &mut App) {
     {
         let t = &app.theme;
         f.render_widget(Block::default().style(Style::default().bg(t.bg)), f.area());
-        let tabs = Tabs::new(TAB_TITLES.iter().map(|s| Line::from(*s)).collect::<Vec<_>>())
-            .block(t.panel(" ccsync "))
-            .style(t.text())
-            .select(app.tab)
-            .highlight_style(t.selection());
+        let tabs = Tabs::new(
+            TAB_TITLES
+                .iter()
+                .map(|s| Line::from(*s))
+                .collect::<Vec<_>>(),
+        )
+        .block(t.panel(" ccsync "))
+        .style(t.text())
+        .select(app.tab)
+        .highlight_style(t.selection());
         f.render_widget(tabs, chunks[0]);
     }
 
@@ -376,14 +449,21 @@ fn render_upload(f: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(UPLOAD_ACTIONS.len() as u16 + 2), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(UPLOAD_ACTIONS.len() as u16 + 2),
+            Constraint::Min(1),
+        ])
         .split(area);
 
     let items: Vec<ListItem> = UPLOAD_ACTIONS
         .iter()
         .enumerate()
         .map(|(i, label)| {
-            let marker = if i == app.upload_selected { "▌ " } else { "  " };
+            let marker = if i == app.upload_selected {
+                "▌ "
+            } else {
+                "  "
+            };
             let style = if i == app.upload_selected {
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
             } else {
@@ -402,7 +482,9 @@ fn render_upload(f: &mut Frame, area: Rect, app: &App) {
         .remote
         .clone()
         .unwrap_or_else(|| "(none — set with `ccsync init --remote …`)".to_string());
-    let pass_set = std::env::var("CCSYNC_PASSPHRASE").map(|p| !p.is_empty()).unwrap_or(false);
+    let pass_set = std::env::var("CCSYNC_PASSPHRASE")
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
     let help = format!(
         "Each action first captures a fresh snapshot of ~/.claude, then:\n\n\
          • Push to git remote → commits & pushes to the configured remote.\n    \
@@ -412,8 +494,12 @@ fn render_upload(f: &mut Frame, area: Rect, app: &App) {
          CCSYNC_PASSPHRASE: {}",
         paths::backups_dir()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "~/.config/ccsync/backups".to_string()),
-        if pass_set { "set" } else { "NOT set — export will fail" },
+            .unwrap_or_else(|_| "<config>/ccsync/backups".to_string()),
+        if pass_set {
+            "set"
+        } else {
+            "NOT set — export will fail"
+        },
     );
     let p = Paragraph::new(help)
         .style(t.text())

@@ -39,6 +39,13 @@ impl BackupKind {
             BackupKind::RestoreBackup => "restore-bak",
         }
     }
+
+    /// Whether a backup of this kind can be deleted from disk here. Git commits
+    /// are version history in the repo cache, not standalone files, so they are
+    /// not deletable through the TUI; the other kinds are plain files/dirs.
+    pub fn deletable(self) -> bool {
+        !matches!(self, BackupKind::GitCommit)
+    }
 }
 
 /// One row in the backups list.
@@ -51,11 +58,11 @@ pub struct LocalBackup {
     pub created_at: Option<String>,
     /// Free-form detail: host, file count, size, commit subject, etc.
     pub detail: String,
-    // Carried as part of the backup model for callers and future actions
-    // (e.g. open/delete a selected backup); not every field is rendered today.
+    // Carried as part of the backup model; `size` is not rendered today but is
+    // retained for callers and parity with the other fields.
     #[allow(dead_code)]
     pub size: Option<u64>,
-    #[allow(dead_code)]
+    /// Filesystem location, when the backup is a file/dir (used by [`delete`]).
     pub path: Option<PathBuf>,
 }
 
@@ -68,6 +75,26 @@ pub fn collect(_config: &Config) -> Vec<LocalBackup> {
     collect_archives(&mut out);
     collect_restore_backups(&mut out);
     out
+}
+
+/// Delete a local backup from disk. Only filesystem-backed kinds (the staged
+/// snapshot, encrypted archives, and pre-restore copies) can be removed; git
+/// commits are history in the repo cache and are rejected here. Removal is
+/// permanent — callers should confirm with the user first.
+pub fn delete(backup: &LocalBackup) -> anyhow::Result<()> {
+    if !backup.kind.deletable() {
+        anyhow::bail!("{} backups cannot be deleted here", backup.kind.label());
+    }
+    let Some(path) = backup.path.as_ref() else {
+        anyhow::bail!("backup has no filesystem path to delete");
+    };
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn collect_staged(out: &mut Vec<LocalBackup>) {
@@ -209,14 +236,21 @@ mod tests {
     use crate::manifest::FileEntry;
 
     fn with_config_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        // `paths::*_dir()` derive from the config dir, which `dirs` reads from
-        // XDG_CONFIG_HOME on Linux. Point it at a temp dir for the test.
-        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        // `paths::*_dir()` derive from `dirs::config_dir()`, which reads
+        // XDG_CONFIG_HOME on Linux but `$HOME/Library/Application Support` on
+        // macOS. Redirect both so the test never touches the real config dir.
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
         std::env::set_var("XDG_CONFIG_HOME", dir);
+        std::env::set_var("HOME", dir);
         let out = f();
-        match prev {
+        match prev_xdg {
             Some(p) => std::env::set_var("XDG_CONFIG_HOME", p),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match prev_home {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
         }
         out
     }
@@ -291,6 +325,53 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, BackupKind::RestoreBackup);
         assert_eq!(out[0].label, ".claude.ccsync-backup-20260101-101010");
+    }
+
+    #[test]
+    fn delete_removes_archive_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("claude-backup-1.tar.gz.age");
+        std::fs::write(&path, b"ciphertext").unwrap();
+        let backup = LocalBackup {
+            kind: BackupKind::Archive,
+            label: "claude-backup-1.tar.gz.age".into(),
+            created_at: None,
+            detail: String::new(),
+            size: Some(10),
+            path: Some(path.clone()),
+        };
+        delete(&backup).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_removes_restore_backup_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude.ccsync-backup-20260101-101010");
+        std::fs::create_dir_all(path.join("nested")).unwrap();
+        let backup = LocalBackup {
+            kind: BackupKind::RestoreBackup,
+            label: ".claude.ccsync-backup-20260101-101010".into(),
+            created_at: None,
+            detail: String::new(),
+            size: None,
+            path: Some(path.clone()),
+        };
+        delete(&backup).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_rejects_git_commits() {
+        let backup = LocalBackup {
+            kind: BackupKind::GitCommit,
+            label: "abc1234".into(),
+            created_at: None,
+            detail: String::new(),
+            size: None,
+            path: None,
+        };
+        assert!(delete(&backup).is_err());
     }
 
     #[test]
