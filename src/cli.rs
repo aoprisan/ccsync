@@ -96,4 +96,27 @@ pub enum Command {
 
     /// Launch the interactive terminal UI.
     Tui,
+
+    /// Run the background backup loop in the foreground.
+    ///
+    /// Snapshots ~/.claude on the configured interval and publishes each one to
+    /// the `[service]` destination. Normally started by the installed OS
+    /// service rather than invoked by hand.
+    Daemon,
+
+    /// Manage the OS background service (systemd user unit / launchd agent).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServiceAction {
+    /// Generate the service unit, register it, and start it.
+    Install,
+    /// Stop the service and remove its unit.
+    Uninstall,
+    /// Report whether the service is installed and running.
+    Status,
 }

@@ -16,6 +16,7 @@ mod paths;
 mod redact;
 mod remap;
 mod restore;
+mod service;
 mod snapshot;
 mod theme;
 mod tui;
@@ -58,6 +59,12 @@ fn run() -> Result<()> {
             cmd_push(&config, archive, remote)
         }
         Command::Tui => tui::run(&config),
+        Command::Daemon => service::run_daemon(&config),
+        Command::Service { action } => match action {
+            cli::ServiceAction::Install => service::install(&config),
+            cli::ServiceAction::Uninstall => service::uninstall(),
+            cli::ServiceAction::Status => service::status(),
+        },
     }
 }
 

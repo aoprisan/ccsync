@@ -7,7 +7,7 @@
 //! agents, and session transcripts are included.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,51 @@ pub struct Config {
     /// automatic `source_home -> local_home` mapping. Keys are source prefixes,
     /// values are target prefixes.
     pub remap: BTreeMap<String, String>,
+    /// Settings for the background service (`ccsync daemon` / `ccsync service`).
+    pub service: ServiceConfig,
+}
+
+/// Where the background service publishes each automatic backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceDestination {
+    /// Push to the configured git `remote` (same path as `ccsync push`).
+    Git,
+    /// Write a timestamped encrypted archive into `service.backup_dir`.
+    Archive,
+}
+
+/// Configuration for the background backup service. Materialized from the
+/// `[service]` table in `config.toml`; absent keys fall back to these defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceConfig {
+    /// Master switch. When false, `ccsync daemon` exits immediately so that
+    /// simply upgrading and re-saving the config never starts pushing.
+    pub enabled: bool,
+    /// Minutes to wait between automatic snapshot+publish ticks.
+    pub interval_minutes: u64,
+    /// Whether each tick pushes to the git remote or writes an encrypted
+    /// archive.
+    pub destination: ServiceDestination,
+    /// Directory for timestamped archives when `destination = "archive"`.
+    /// `None` means ccsync's managed backups dir (`~/.config/ccsync/backups`).
+    pub backup_dir: Option<PathBuf>,
+    /// Pass `--allow-secrets` to the unattended snapshot. Default false so the
+    /// daemon fails closed if a config file looks like it contains a secret.
+    pub allow_secrets: bool,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        ServiceConfig {
+            enabled: false,
+            interval_minutes: 60,
+            destination: ServiceDestination::Git,
+            backup_dir: None,
+            allow_secrets: false,
+        }
+    }
 }
 
 /// File names that are credentials and must never be captured, regardless of
@@ -69,6 +114,7 @@ impl Default for Config {
             include_sessions: true,
             remote: None,
             remap: BTreeMap::new(),
+            service: ServiceConfig::default(),
         }
     }
 }
@@ -131,5 +177,45 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.remote.as_deref(), Some("git@example.com:me/ccsync-data.git"));
         assert_eq!(loaded.remap.get("/Users/alice").map(String::as_str), Some("/home/alice"));
+    }
+
+    #[test]
+    fn service_defaults_are_conservative() {
+        let s = ServiceConfig::default();
+        assert!(!s.enabled);
+        assert_eq!(s.interval_minutes, 60);
+        assert_eq!(s.destination, ServiceDestination::Git);
+        assert!(s.backup_dir.is_none());
+        assert!(!s.allow_secrets);
+    }
+
+    #[test]
+    fn config_with_service_roundtrips_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut c = Config::default();
+        c.service.enabled = true;
+        c.service.interval_minutes = 15;
+        c.service.destination = ServiceDestination::Archive;
+        c.service.backup_dir = Some(PathBuf::from("/mnt/backups"));
+        c.service.allow_secrets = true;
+        c.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.service.enabled);
+        assert_eq!(loaded.service.interval_minutes, 15);
+        assert_eq!(loaded.service.destination, ServiceDestination::Archive);
+        assert_eq!(loaded.service.backup_dir, Some(PathBuf::from("/mnt/backups")));
+        assert!(loaded.service.allow_secrets);
+    }
+
+    #[test]
+    fn config_without_service_table_loads_defaults() {
+        // A config file written before `[service]` existed must still load.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(!loaded.service.enabled);
+        assert_eq!(loaded.service.destination, ServiceDestination::Git);
     }
 }

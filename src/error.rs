@@ -23,4 +23,10 @@ pub enum CcError {
 
     #[error("no remote configured; set `remote` in the config or pass --archive")]
     NoRemote,
+
+    // Only constructed on platforms without a supported service manager
+    // (i.e. not Linux/macOS), but compiled on all targets.
+    #[allow(dead_code)]
+    #[error("the background service is not supported on this platform; `ccsync daemon` still runs in the foreground")]
+    ServiceUnsupportedPlatform,
 }
