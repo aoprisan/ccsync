@@ -17,6 +17,7 @@ mod redact;
 mod remap;
 mod restore;
 mod snapshot;
+mod theme;
 mod tui;
 
 use anyhow::Result;

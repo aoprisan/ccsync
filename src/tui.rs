@@ -20,12 +20,13 @@ use crossterm::terminal::{
 };
 use crossterm::execute;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 
 use crate::backups::{self, BackupKind, LocalBackup};
 use crate::config::Config;
 use crate::manifest::Manifest;
 use crate::snapshot::{self, SnapshotOptions};
+use crate::theme::Theme;
 use crate::{archive, git, paths};
 
 const TAB_TITLES: [&str; 3] = ["What's backed up", "Local backups", "Upload"];
@@ -39,6 +40,7 @@ enum CaptureSummary {
 
 struct App {
     config: Config,
+    theme: Theme,
     tab: usize,
     capture: CaptureSummary,
     backups: Vec<LocalBackup>,
@@ -52,6 +54,7 @@ impl App {
     fn new(config: Config) -> Self {
         let mut app = App {
             config,
+            theme: Theme::solarized_dark(),
             tab: 0,
             capture: CaptureSummary::Failed(String::new()),
             backups: Vec::new(),
@@ -271,11 +274,19 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    let tabs = Tabs::new(TAB_TITLES.iter().map(|t| Line::from(*t)).collect::<Vec<_>>())
-        .block(Block::default().borders(Borders::ALL).title(" ccsync "))
-        .select(app.tab)
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
-    f.render_widget(tabs, chunks[0]);
+    // Paint the whole screen with the theme background first, then the tabs.
+    // These borrows of `app.theme` are kept short so the body render below can
+    // take `app` mutably.
+    {
+        let t = &app.theme;
+        f.render_widget(Block::default().style(Style::default().bg(t.bg)), f.area());
+        let tabs = Tabs::new(TAB_TITLES.iter().map(|s| Line::from(*s)).collect::<Vec<_>>())
+            .block(t.panel(" ccsync "))
+            .style(t.text())
+            .select(app.tab)
+            .highlight_style(t.selection());
+        f.render_widget(tabs, chunks[0]);
+    }
 
     match app.tab {
         0 => render_capture(f, chunks[1], app),
@@ -283,35 +294,36 @@ fn ui(f: &mut Frame, app: &mut App) {
         _ => render_upload(f, chunks[1], app),
     }
 
+    let t = &app.theme;
     let status = Paragraph::new(app.status.clone())
-        .block(Block::default().borders(Borders::ALL).title(" status "))
+        .style(t.text())
+        .block(t.panel(" status "))
         .wrap(Wrap { trim: true });
     f.render_widget(status, chunks[2]);
 }
 
 fn render_capture(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let (text, style) = match &app.capture {
-        CaptureSummary::Ready(lines) => (lines.join("\n"), Style::default()),
+        CaptureSummary::Ready(lines) => (lines.join("\n"), t.text()),
         CaptureSummary::Failed(e) => (
             format!("snapshot would abort:\n\n{e}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(t.error).bg(t.bg),
         ),
     };
     let p = Paragraph::new(text)
         .style(style)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" what would be backed up "),
-        )
+        .block(t.panel(" what would be backed up "))
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 
 fn render_backups(f: &mut Frame, area: Rect, app: &mut App) {
+    let t = &app.theme;
     if app.backups.is_empty() {
         let p = Paragraph::new("No local backups found yet.\n\nUse the Upload tab to push to git or write an encrypted archive.")
-            .block(Block::default().borders(Borders::ALL).title(" local backups "))
+            .style(t.text())
+            .block(t.panel(" local backups "))
             .wrap(Wrap { trim: true });
         f.render_widget(p, area);
         return;
@@ -320,38 +332,37 @@ fn render_backups(f: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .backups
         .iter()
-        .map(|b| ListItem::new(backup_lines(b)))
+        .map(|b| ListItem::new(backup_lines(b, t)))
         .collect();
+    let title = format!(" local backups ({}) ", app.backups.len());
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" local backups ({}) ", app.backups.len())),
-        )
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .style(t.text())
+        .block(t.panel(&title))
+        .highlight_style(t.selection())
         .highlight_symbol("▌ ");
     f.render_stateful_widget(list, area, &mut app.backups_state);
 }
 
-fn backup_lines(b: &LocalBackup) -> Vec<Line<'static>> {
+fn backup_lines(b: &LocalBackup, t: &Theme) -> Vec<Line<'static>> {
     let when = b.created_at.clone().unwrap_or_else(|| "—".to_string());
     let header = format!("[{:<11}] {}", b.kind.label(), b.label);
     let color = match b.kind {
-        BackupKind::Staged => Color::Yellow,
-        BackupKind::GitCommit => Color::Green,
-        BackupKind::Archive => Color::Magenta,
-        BackupKind::RestoreBackup => Color::Blue,
+        BackupKind::Staged => t.staged,
+        BackupKind::GitCommit => t.git,
+        BackupKind::Archive => t.archive,
+        BackupKind::RestoreBackup => t.restore,
     };
     vec![
         Line::from(Span::styled(header, Style::default().fg(color))),
         Line::from(Span::styled(
             format!("    {when}  ·  {}", b.detail),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.dim),
         )),
     ]
 }
 
 fn render_upload(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(UPLOAD_ACTIONS.len() as u16 + 2), Constraint::Min(1)])
@@ -363,18 +374,16 @@ fn render_upload(f: &mut Frame, area: Rect, app: &App) {
         .map(|(i, label)| {
             let marker = if i == app.upload_selected { "▌ " } else { "  " };
             let style = if i == app.upload_selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(t.fg)
             };
             ListItem::new(Line::from(Span::styled(format!("{marker}{label}"), style)))
         })
         .collect();
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" upload (Enter to run) "),
-    );
+    let list = List::new(items)
+        .style(t.text())
+        .block(t.panel(" upload (Enter to run) "));
     f.render_widget(list, chunks[0]);
 
     let remote = app
@@ -396,7 +405,8 @@ fn render_upload(f: &mut Frame, area: Rect, app: &App) {
         if pass_set { "set" } else { "NOT set — export will fail" },
     );
     let p = Paragraph::new(help)
-        .block(Block::default().borders(Borders::ALL).title(" details "))
+        .style(t.text())
+        .block(t.panel(" details "))
         .wrap(Wrap { trim: false });
     f.render_widget(p, chunks[1]);
 }
