@@ -89,6 +89,7 @@ ccsync restore
 | `ccsync export FILE` | One-shot snapshot → encrypted archive. |
 | `ccsync import FILE` | Encrypted archive → staging. |
 | `ccsync backup [--remote URL] [--archive FILE]` | `snapshot` + `push`. |
+| `ccsync tui` | Launch an interactive terminal UI: review what would be backed up, browse local backups, and push/export. |
 
 ## How path remapping works
 
