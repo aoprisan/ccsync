@@ -90,6 +90,58 @@ ccsync restore
 | `ccsync import FILE` | Encrypted archive → staging. |
 | `ccsync backup [--remote URL] [--archive FILE]` | `snapshot` + `push`. |
 | `ccsync tui` | Launch an interactive terminal UI: review what would be backed up, browse local backups, and push/export. |
+| `ccsync daemon` | Run the background backup loop in the foreground (used by the installed service). |
+| `ccsync service install\|uninstall\|status` | Register/remove the background service (systemd user unit / launchd agent). |
+
+## Background service
+
+Instead of running `ccsync backup` by hand, you can have ccsync back up
+automatically on a fixed interval. Configure the `[service]` table, then install
+the OS service:
+
+```toml
+[service]
+enabled = true
+interval_minutes = 60
+destination = "git"        # or "archive"
+# backup_dir = "/home/you/.config/ccsync/backups"  # archive destination only
+allow_secrets = false
+```
+
+```sh
+ccsync service install     # writes + enables a systemd user unit (Linux) or launchd agent (macOS)
+ccsync service status
+ccsync service uninstall
+```
+
+`install` writes the unit (`~/.config/systemd/user/ccsync.service` on Linux,
+`~/Library/LaunchAgents/com.ccsync.daemon.plist` on macOS) and tries to enable
+it; if the service manager isn't reachable it prints the manual command. The
+unit just runs `ccsync daemon`, so you can also run that directly under your own
+supervisor, cron, or Task Scheduler.
+
+Each tick builds a sanitized snapshot and publishes it to `destination`:
+
+- **`git`** — pushes to the configured `remote`, exactly like `ccsync push`.
+- **`archive`** — writes a timestamped `claude-backup-<ts>.tar.gz.age` into
+  `backup_dir` (default `~/.config/ccsync/backups`). These appear in `ccsync tui`.
+
+**Things to know:**
+
+- **Secrets aren't inherited by the service.** A systemd user unit / launchd
+  agent does not see your shell environment, so the `archive` destination needs
+  `CCSYNC_PASSPHRASE` added to the unit, and the `git` destination needs SSH
+  keys / a credential helper the agent can reach (an HTTPS remote with a stored
+  credential is simplest). `install` prints a reminder; it never writes your
+  secret into the generated unit.
+- **`allow_secrets = false` (default) makes a tick fail closed** — if a config
+  file looks like it contains a secret the snapshot aborts and the error is
+  logged; the daemon keeps running and retries next interval.
+- **The `archive` destination accumulates files** — one per tick, with no
+  automatic pruning. Point `backup_dir` somewhere you can manage, or prefer the
+  `git` destination (which is a cheap no-op when nothing changed).
+- On Linux, `systemctl --user` needs a user session bus; on a headless box you
+  may need `loginctl enable-linger $USER` first.
 
 ## How path remapping works
 
@@ -126,6 +178,6 @@ transcripts verbatim on a same-path machine.
 ## Configuration
 
 `~/.config/ccsync/config.toml` (created by `ccsync init`) controls the
-`include`/`exclude` sets, `include_sessions`, the git `remote`, and the
-`[remap]` table. `CLAUDE_CONFIG_DIR` is honored when locating the source
-directory.
+`include`/`exclude` sets, `include_sessions`, the git `remote`, the `[remap]`
+table, and the `[service]` table (see [Background service](#background-service)).
+`CLAUDE_CONFIG_DIR` is honored when locating the source directory.
