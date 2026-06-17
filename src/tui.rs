@@ -26,7 +26,7 @@ use crate::backups::{self, BackupKind, LocalBackup};
 use crate::config::Config;
 use crate::manifest::Manifest;
 use crate::snapshot::{self, SnapshotOptions};
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeVariant};
 use crate::{archive, git, paths};
 
 const TAB_TITLES: [&str; 3] = ["What's backed up", "Local backups", "Upload"];
@@ -40,6 +40,7 @@ enum CaptureSummary {
 
 struct App {
     config: Config,
+    theme_variant: ThemeVariant,
     theme: Theme,
     tab: usize,
     capture: CaptureSummary,
@@ -52,15 +53,17 @@ struct App {
 
 impl App {
     fn new(config: Config) -> Self {
+        let variant = ThemeVariant::SolarizedDark;
         let mut app = App {
             config,
-            theme: Theme::solarized_dark(),
+            theme_variant: variant,
+            theme: variant.theme(),
             tab: 0,
             capture: CaptureSummary::Failed(String::new()),
             backups: Vec::new(),
             backups_state: ListState::default(),
             upload_selected: 0,
-            status: "↹ switch tabs · ↑/↓ move · r refresh · q quit".to_string(),
+            status: "↹ switch tabs · ↑/↓ move · r refresh · t theme · q quit".to_string(),
             should_quit: false,
         };
         app.refresh();
@@ -81,6 +84,13 @@ impl App {
                 .min(self.backups.len() - 1);
             self.backups_state.select(Some(idx));
         }
+    }
+
+    /// Cycle to the next color theme.
+    fn toggle_theme(&mut self) {
+        self.theme_variant = self.theme_variant.next();
+        self.theme = self.theme_variant.theme();
+        self.status = format!("theme: {}", self.theme.name);
     }
 
     fn next_tab(&mut self) {
@@ -248,6 +258,7 @@ fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
                     app.refresh();
                     app.status = "refreshed".to_string();
                 }
+                KeyCode::Char('t') => app.toggle_theme(),
                 KeyCode::Enter => {
                     if app.tab == 2 {
                         app.status = "working…".to_string();
@@ -416,15 +427,20 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
-    /// Each tab renders without panicking against an off-screen backend.
+    /// Each tab renders without panicking against an off-screen backend, under
+    /// both color themes.
     #[test]
     fn renders_every_tab() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new(Config::default());
-        for tab in 0..TAB_TITLES.len() {
-            app.tab = tab;
-            terminal.draw(|f| ui(f, &mut app)).unwrap();
+        // Both Solarized variants.
+        for _ in 0..2 {
+            for tab in 0..TAB_TITLES.len() {
+                app.tab = tab;
+                terminal.draw(|f| ui(f, &mut app)).unwrap();
+            }
+            app.toggle_theme();
         }
     }
 }

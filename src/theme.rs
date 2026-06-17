@@ -5,8 +5,35 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders};
 
+/// Which palette is active. Cycled at runtime with the `t` key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ThemeVariant {
+    SolarizedDark,
+    SolarizedLight,
+}
+
+impl ThemeVariant {
+    /// Materialize the palette for this variant.
+    pub fn theme(self) -> Theme {
+        match self {
+            ThemeVariant::SolarizedDark => Theme::solarized_dark(),
+            ThemeVariant::SolarizedLight => Theme::solarized_light(),
+        }
+    }
+
+    /// The next variant in the cycle.
+    pub fn next(self) -> Self {
+        match self {
+            ThemeVariant::SolarizedDark => ThemeVariant::SolarizedLight,
+            ThemeVariant::SolarizedLight => ThemeVariant::SolarizedDark,
+        }
+    }
+}
+
 /// Semantic colors used across the TUI, decoupled from any specific palette.
 pub struct Theme {
+    /// Human-readable palette name, shown in the status line.
+    pub name: &'static str,
     /// Window background.
     pub bg: Color,
     /// Default body text.
@@ -49,6 +76,7 @@ impl Theme {
         let green = Color::Rgb(0x85, 0x99, 0x00);
 
         Theme {
+            name: "Solarized Dark",
             bg: base03,
             fg: base0,
             dim: base01,
@@ -57,6 +85,39 @@ impl Theme {
             accent: cyan,
             error: red,
             sel_fg: base03,
+            sel_bg: cyan,
+            staged: yellow,
+            git: green,
+            archive: magenta,
+            restore: blue,
+        }
+    }
+
+    /// Solarized Light — same accent hues as Dark over the light base tones.
+    pub fn solarized_light() -> Self {
+        // Base tones (light background → dark content).
+        let base3 = Color::Rgb(0xfd, 0xf6, 0xe3);
+        let base1 = Color::Rgb(0x93, 0xa1, 0xa1);
+        let base00 = Color::Rgb(0x65, 0x7b, 0x83);
+        let base01 = Color::Rgb(0x58, 0x6e, 0x75);
+        // Accent tones (identical to Dark).
+        let yellow = Color::Rgb(0xb5, 0x89, 0x00);
+        let red = Color::Rgb(0xdc, 0x32, 0x2f);
+        let magenta = Color::Rgb(0xd3, 0x36, 0x82);
+        let blue = Color::Rgb(0x26, 0x8b, 0xd2);
+        let cyan = Color::Rgb(0x2a, 0xa1, 0x98);
+        let green = Color::Rgb(0x85, 0x99, 0x00);
+
+        Theme {
+            name: "Solarized Light",
+            bg: base3,
+            fg: base00,
+            dim: base1,
+            border: base1,
+            title: base01,
+            accent: cyan,
+            error: red,
+            sel_fg: base3,
             sel_bg: cyan,
             staged: yellow,
             git: green,
