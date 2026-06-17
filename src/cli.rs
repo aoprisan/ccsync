@@ -92,6 +92,10 @@ pub enum Command {
         remote: Option<String>,
         #[arg(long)]
         allow_secrets: bool,
+        /// List every file that would be backed up and the push target, then
+        /// stop without snapshotting or pushing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Copy this binary into a `bin` directory on your PATH and exit.

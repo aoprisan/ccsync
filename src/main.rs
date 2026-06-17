@@ -26,6 +26,7 @@ mod tui;
 use anyhow::Result;
 use clap::Parser;
 
+use backups::human_size;
 use cli::{Cli, Command};
 use config::Config;
 use restore::{MergeMode, RestoreOptions};
@@ -56,9 +57,26 @@ fn run() -> Result<()> {
         }
         Command::Export { file, allow_secrets } => cmd_export(&config, &file, allow_secrets),
         Command::Import { file } => cmd_import(&file),
-        Command::Backup { archive, remote, allow_secrets } => {
-            cmd_snapshot(&config, false, allow_secrets)?;
-            cmd_push(&config, archive, remote)
+        Command::Backup { archive, remote, allow_secrets, dry_run } => {
+            cmd_snapshot(&config, dry_run, allow_secrets)?;
+            if dry_run {
+                // Report the transport target without touching git or writing an
+                // archive — the snapshot above already listed the files.
+                if let Some(out) = archive {
+                    println!("would write encrypted archive to {}", out.display());
+                } else {
+                    match git::resolve_remote(remote.as_deref(), config.remote.as_deref()) {
+                        Ok(remote) => println!("would push snapshot to {remote}"),
+                        // A missing remote is a real blocker, but in a preview we
+                        // report it rather than aborting — the file list above is
+                        // still useful.
+                        Err(e) => println!("would push to a git remote, but {e}"),
+                    }
+                }
+                Ok(())
+            } else {
+                cmd_push(&config, archive, remote)
+            }
         }
         Command::Install => install::install(),
         Command::Tui => tui::run(&config),
@@ -93,12 +111,19 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
 
     let total: u64 = m.files.iter().map(|f| f.size).sum();
     println!(
-        "{} {} files ({:.1} KiB) from {}",
+        "{} {} files ({}) from {}",
         if dry_run { "would capture" } else { "captured" },
         m.files.len(),
-        total as f64 / 1024.0,
+        human_size(total),
         claude.display()
     );
+    // In dry-run, enumerate each file and the copy it implies so you can see
+    // exactly what the backup will carry before anything leaves the machine.
+    if dry_run {
+        for f in &m.files {
+            println!("  copy {} -> data/{} ({})", f.rel_path, f.rel_path, human_size(f.size));
+        }
+    }
     if !m.project_roots.is_empty() {
         println!("  {} session project root(s) recorded for remapping", m.project_roots.len());
     }
