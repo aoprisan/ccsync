@@ -12,6 +12,8 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Stdout};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -25,7 +27,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use crate::backups::{self, BackupKind, LocalBackup};
 use crate::config::Config;
 use crate::manifest::Manifest;
-use crate::snapshot::{self, SnapshotOptions};
+use crate::snapshot::{self, ProgressSink, SnapshotOptions};
 use crate::theme::{Theme, ThemeVariant};
 use crate::{archive, git, paths};
 
@@ -34,8 +36,50 @@ const UPLOAD_ACTIONS: [&str; 2] = ["Push to git remote", "Export encrypted archi
 
 /// Cached result of the dry-run snapshot used by the first tab.
 enum CaptureSummary {
+    /// The background scan is still walking `~/.claude`; `progress` carries the
+    /// live file/byte counts shown while it runs.
+    Loading,
     Ready(Vec<String>),
     Failed(String),
+}
+
+/// Live progress of the background scan, updated as the worker thread reports.
+#[derive(Clone, Default)]
+struct ScanProgress {
+    files_done: u64,
+    files_total: u64,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+
+/// Messages sent from the background load thread to the UI loop.
+enum LoadMsg {
+    /// Total file/byte counts are known; copying/scanning is about to begin.
+    Start { files: u64, bytes: u64 },
+    /// One more file was scanned, contributing `bytes`.
+    Advance { bytes: u64 },
+    /// The capture summary (or failure) is final.
+    Capture(CaptureSummary),
+    /// The local backups list finished enumerating.
+    Backups(Vec<LocalBackup>),
+}
+
+/// A [`ProgressSink`] that forwards snapshot progress over a channel to the UI.
+struct ChannelSink {
+    tx: Sender<LoadMsg>,
+}
+
+impl ProgressSink for ChannelSink {
+    fn start(&self, total_files: u64, total_bytes: u64) {
+        let _ = self.tx.send(LoadMsg::Start {
+            files: total_files,
+            bytes: total_bytes,
+        });
+    }
+    fn advance(&self, file_bytes: u64) {
+        let _ = self.tx.send(LoadMsg::Advance { bytes: file_bytes });
+    }
+    fn finish(&self) {}
 }
 
 struct App {
@@ -44,8 +88,14 @@ struct App {
     theme: Theme,
     tab: usize,
     capture: CaptureSummary,
+    /// Live counts for the in-flight scan, rendered while `capture` is `Loading`.
+    progress: ScanProgress,
     backups: Vec<LocalBackup>,
+    /// True while the background thread is still enumerating local backups.
+    backups_loading: bool,
     backups_state: ListState,
+    /// Receiver for the active background load, or `None` once it completes.
+    load_rx: Option<Receiver<LoadMsg>>,
     upload_selected: usize,
     status: String,
     /// When set, a delete of `backups[idx]` is awaiting y/n confirmation.
@@ -61,9 +111,12 @@ impl App {
             theme_variant: variant,
             theme: variant.theme(),
             tab: 0,
-            capture: CaptureSummary::Failed(String::new()),
+            capture: CaptureSummary::Loading,
+            progress: ScanProgress::default(),
             backups: Vec::new(),
+            backups_loading: true,
             backups_state: ListState::default(),
+            load_rx: None,
             upload_selected: 0,
             status: "↹ switch tabs · ↑/↓ move · d delete · r refresh · t theme · q quit"
                 .to_string(),
@@ -74,10 +127,75 @@ impl App {
         app
     }
 
-    /// Recompute the capture summary and re-enumerate local backups.
+    /// Kick off a background scan + backup enumeration. Returns immediately so
+    /// the first frame paints without waiting on the (potentially slow) walk of
+    /// `~/.claude` or the `git log` shell-out; results stream in via [`Self::poll_load`].
     fn refresh(&mut self) {
-        self.capture = compute_capture(&self.config);
-        self.backups = backups::collect(&self.config);
+        self.capture = CaptureSummary::Loading;
+        self.progress = ScanProgress::default();
+        self.backups_loading = true;
+        let (tx, rx) = mpsc::channel();
+        let config = self.config.clone();
+        std::thread::spawn(move || run_load(config, tx));
+        self.load_rx = Some(rx);
+    }
+
+    /// Whether a background load is still in flight.
+    fn is_loading(&self) -> bool {
+        self.load_rx.is_some()
+    }
+
+    /// Drain any pending messages from the background load thread, updating
+    /// progress and results. Returns `true` if anything changed (so the caller
+    /// knows to redraw).
+    fn poll_load(&mut self) -> bool {
+        // Take the receiver out so the drain loop can borrow `self` mutably; it
+        // is restored below unless the channel has closed.
+        let Some(rx) = self.load_rx.take() else {
+            return false;
+        };
+        let mut changed = false;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(LoadMsg::Start { files, bytes }) => {
+                    self.progress.files_total = files;
+                    self.progress.bytes_total = bytes;
+                    self.progress.files_done = 0;
+                    self.progress.bytes_done = 0;
+                    changed = true;
+                }
+                Ok(LoadMsg::Advance { bytes }) => {
+                    self.progress.files_done += 1;
+                    self.progress.bytes_done += bytes;
+                    changed = true;
+                }
+                Ok(LoadMsg::Capture(summary)) => {
+                    self.capture = summary;
+                    changed = true;
+                }
+                Ok(LoadMsg::Backups(backups)) => {
+                    self.set_backups(backups);
+                    self.backups_loading = false;
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        // Keep listening unless the worker finished and closed the channel.
+        if !disconnected {
+            self.load_rx = Some(rx);
+        }
+        changed
+    }
+
+    /// Replace the backups list, preserving a valid selection.
+    fn set_backups(&mut self, backups: Vec<LocalBackup>) {
+        self.backups = backups;
         if self.backups.is_empty() {
             self.backups_state.select(None);
         } else {
@@ -216,9 +334,22 @@ impl App {
     }
 }
 
+/// Background worker: run the dry-run scan (reporting progress) and enumerate
+/// local backups, sending each result over `tx`. Runs on a spawned thread so the
+/// UI stays responsive and can paint progress while this works. The channel
+/// closes when this returns, which the UI reads as "load complete".
+fn run_load(config: Config, tx: Sender<LoadMsg>) {
+    let capture = compute_capture(&config, &tx);
+    let _ = tx.send(LoadMsg::Capture(capture));
+    // The git log shell-out and filesystem scans here are why this is off-thread.
+    let backups = backups::collect(&config);
+    let _ = tx.send(LoadMsg::Backups(backups));
+}
+
 /// Run a dry-run snapshot and format it into display lines, or capture the
 /// error (e.g. a detected secret) so the user sees why a backup would abort.
-fn compute_capture(config: &Config) -> CaptureSummary {
+/// Per-file progress is streamed through `tx` so the UI can show a scan bar.
+fn compute_capture(config: &Config, tx: &Sender<LoadMsg>) -> CaptureSummary {
     let claude = match paths::claude_dir() {
         Ok(c) => c,
         Err(e) => return CaptureSummary::Failed(format!("{e}")),
@@ -228,7 +359,8 @@ fn compute_capture(config: &Config) -> CaptureSummary {
         Err(e) => return CaptureSummary::Failed(format!("{e}")),
     };
     let opts = SnapshotOptions::new(true, true, config);
-    match snapshot::build(&claude, &staging, config, &opts) {
+    let sink = ChannelSink { tx: tx.clone() };
+    match snapshot::build_with_progress(&claude, &staging, config, &opts, &sink) {
         Ok(manifest) => CaptureSummary::Ready(summarize_manifest(&manifest, &claude)),
         Err(e) => CaptureSummary::Failed(format!("{e:#}")),
     }
@@ -300,47 +432,70 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 }
 
 fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
+    let mut dirty = true;
     loop {
-        terminal.draw(|f| ui(f, &mut app))?;
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            // While a delete is armed, the next keypress is the answer: `y`
-            // confirms, anything else cancels.
-            if app.pending_delete.is_some() {
-                match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
-                    _ => app.cancel_delete(),
+        if dirty {
+            terminal.draw(|f| ui(f, &mut app))?;
+            dirty = false;
+        }
+        // Poll frequently while a load is in flight so progress animates; once
+        // idle, a long timeout keeps the loop quiet but still key-responsive
+        // (poll returns the instant a key arrives).
+        let timeout = if app.is_loading() {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_secs(1)
+        };
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    handle_key(terminal, &mut app, key.code)?;
+                    dirty = true;
                 }
-                continue;
             }
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                KeyCode::Tab | KeyCode::Right => app.next_tab(),
-                KeyCode::BackTab | KeyCode::Left => app.prev_tab(),
-                KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
-                KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
-                KeyCode::Char('r') => {
-                    app.refresh();
-                    app.status = "refreshed".to_string();
-                }
-                KeyCode::Char('t') => app.toggle_theme(),
-                KeyCode::Char('d') | KeyCode::Delete => app.request_delete(),
-                KeyCode::Enter => {
-                    if app.tab == 2 {
-                        app.status = "working…".to_string();
-                        terminal.draw(|f| ui(f, &mut app))?;
-                        app.run_upload();
-                    }
-                }
-                _ => {}
-            }
+        }
+        // Fold in any progress/results the background thread has produced.
+        if app.poll_load() {
+            dirty = true;
         }
         if app.should_quit {
             return Ok(());
         }
     }
+}
+
+/// Handle a single keypress. Split out of [`run_loop`] so the loop stays a thin
+/// poll/draw cycle.
+fn handle_key(terminal: &mut Tui, app: &mut App, code: KeyCode) -> Result<()> {
+    // While a delete is armed, the next keypress is the answer: `y` confirms,
+    // anything else cancels.
+    if app.pending_delete.is_some() {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
+            _ => app.cancel_delete(),
+        }
+        return Ok(());
+    }
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Tab | KeyCode::Right => app.next_tab(),
+        KeyCode::BackTab | KeyCode::Left => app.prev_tab(),
+        KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
+        KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+        KeyCode::Char('r') => {
+            app.refresh();
+            app.status = "refreshing…".to_string();
+        }
+        KeyCode::Char('t') => app.toggle_theme(),
+        KeyCode::Char('d') | KeyCode::Delete => app.request_delete(),
+        KeyCode::Enter if app.tab == 2 => {
+            app.status = "working…".to_string();
+            terminal.draw(|f| ui(f, app))?;
+            app.run_upload();
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -386,9 +541,35 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(status, chunks[2]);
 }
 
+/// Render the live scan state into display text: a spinner-free progress bar
+/// plus file and byte counts. Before totals are known (the planning walk is
+/// still running) it just reports that the index is building.
+fn scan_progress_text(p: &ScanProgress) -> String {
+    if p.files_total == 0 {
+        return "Indexing ~/.claude …\n\n  walking files & scanning for secrets".to_string();
+    }
+    let pct = (p.files_done as f64 / p.files_total as f64 * 100.0).clamp(0.0, 100.0);
+    format!(
+        "Indexing ~/.claude … (scanning for secrets)\n\n{}  {pct:.0}%\n\n{} / {} files  ·  {} / {}",
+        progress_bar(pct, 32),
+        p.files_done,
+        p.files_total,
+        backups::human_size(p.bytes_done),
+        backups::human_size(p.bytes_total),
+    )
+}
+
+/// A fixed-width text progress bar for `pct` (0–100) filling `width` cells.
+fn progress_bar(pct: f64, width: usize) -> String {
+    let filled = ((pct / 100.0) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+}
+
 fn render_capture(f: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let (text, style) = match &app.capture {
+        CaptureSummary::Loading => (scan_progress_text(&app.progress), t.text()),
         CaptureSummary::Ready(lines) => (lines.join("\n"), t.text()),
         CaptureSummary::Failed(e) => (
             format!("snapshot would abort:\n\n{e}"),
@@ -405,7 +586,12 @@ fn render_capture(f: &mut Frame, area: Rect, app: &App) {
 fn render_backups(f: &mut Frame, area: Rect, app: &mut App) {
     let t = &app.theme;
     if app.backups.is_empty() {
-        let p = Paragraph::new("No local backups found yet.\n\nUse the Upload tab to push to git or write an encrypted archive.")
+        let msg = if app.backups_loading {
+            "Loading local backups …\n\n(enumerating staging, git history, and archives)"
+        } else {
+            "No local backups found yet.\n\nUse the Upload tab to push to git or write an encrypted archive."
+        };
+        let p = Paragraph::new(msg)
             .style(t.text())
             .block(t.panel(" local backups "))
             .wrap(Wrap { trim: true });
@@ -528,5 +714,45 @@ mod tests {
             }
             app.toggle_theme();
         }
+    }
+
+    /// A freshly-constructed app starts in the loading state so the first frame
+    /// paints immediately instead of blocking on the scan.
+    #[test]
+    fn starts_loading_without_blocking() {
+        let app = App::new(Config::default());
+        assert!(app.is_loading());
+        assert!(matches!(app.capture, CaptureSummary::Loading));
+        assert!(app.backups_loading);
+    }
+
+    /// The loading tab renders the scan progress without panicking, both before
+    /// totals are known and mid-scan.
+    #[test]
+    fn renders_scan_progress() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(Config::default());
+        app.capture = CaptureSummary::Loading;
+        app.tab = 0;
+        // Before any totals arrive.
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        // Mid-scan.
+        app.progress = ScanProgress {
+            files_done: 3,
+            files_total: 10,
+            bytes_done: 1024,
+            bytes_total: 4096,
+        };
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn progress_bar_fills_proportionally() {
+        assert_eq!(progress_bar(0.0, 4), "[░░░░]");
+        assert_eq!(progress_bar(100.0, 4), "[████]");
+        assert_eq!(progress_bar(50.0, 4), "[██░░]");
+        // Out-of-range input is clamped rather than panicking on repeat count.
+        assert_eq!(progress_bar(150.0, 4), "[████]");
     }
 }
