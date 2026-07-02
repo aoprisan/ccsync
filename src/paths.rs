@@ -77,6 +77,14 @@ pub fn profiles_dir() -> Result<PathBuf, CcError> {
     Ok(base.join("ccsync").join("profiles"))
 }
 
+/// Environment file the installed service sources for secrets the service
+/// manager does not inherit (notably `CCSYNC_PASSPHRASE`):
+/// `<config>/ccsync/service.env`. Created by the user, never by ccsync.
+pub fn service_env_file() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("service.env"))
+}
+
 /// PID file for a detached daemon started with `ccsync service start`:
 /// `<config>/ccsync/daemon.pid`.
 pub fn daemon_pidfile() -> Result<PathBuf, CcError> {
