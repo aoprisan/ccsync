@@ -6,9 +6,9 @@
 //! 3. **Upload** — run a git push or write an encrypted archive.
 //!
 //! The TUI is purely a presentation + orchestration layer: every action calls
-//! into the same `snapshot`/`git`/`archive` code the CLI uses. Long actions run
-//! synchronously and report through a status line; errors are caught and shown
-//! rather than tearing down the terminal.
+//! into the same `snapshot`/`git`/`archive` code the CLI uses. Long actions
+//! (the scan and uploads) run on worker threads and report through a status
+//! line; errors are caught and shown rather than tearing down the terminal.
 
 use std::collections::BTreeMap;
 use std::io::{self, Stdout};
@@ -97,9 +97,14 @@ struct App {
     /// Receiver for the active background load, or `None` once it completes.
     load_rx: Option<Receiver<LoadMsg>>,
     upload_selected: usize,
+    /// Receiver for an in-flight upload (push/export), which runs on its own
+    /// worker thread so the UI keeps painting and responding.
+    upload_rx: Option<Receiver<Result<String, String>>>,
     status: String,
-    /// When set, a delete of `backups[idx]` is awaiting y/n confirmation.
-    pending_delete: Option<usize>,
+    /// When set, deleting this backup is awaiting y/n confirmation. The value
+    /// (not a list index) is stored because a background refresh can reorder
+    /// `backups` between arming and confirming.
+    pending_delete: Option<LocalBackup>,
     should_quit: bool,
 }
 
@@ -118,6 +123,7 @@ impl App {
             backups_state: ListState::default(),
             load_rx: None,
             upload_selected: 0,
+            upload_rx: None,
             status: "↹ switch tabs · ↑/↓ move · d delete · r refresh · t theme · q quit"
                 .to_string(),
             pending_delete: None,
@@ -142,7 +148,7 @@ impl App {
 
     /// Whether a background load is still in flight.
     fn is_loading(&self) -> bool {
-        self.load_rx.is_some()
+        self.load_rx.is_some() || self.upload_rx.is_some()
     }
 
     /// Drain any pending messages from the background load thread, updating
@@ -264,15 +270,12 @@ impl App {
             "delete {} ?  press y to confirm, any key to cancel",
             b.label
         );
-        self.pending_delete = Some(idx);
+        self.pending_delete = Some(b.clone());
     }
 
     /// Carry out a previously-armed delete and refresh the list.
     fn confirm_delete(&mut self) {
-        let Some(idx) = self.pending_delete.take() else {
-            return;
-        };
-        let Some(b) = self.backups.get(idx).cloned() else {
+        let Some(b) = self.pending_delete.take() else {
             return;
         };
         match backups::delete(&b) {
@@ -289,49 +292,85 @@ impl App {
         }
     }
 
-    /// Run the currently-selected upload action.
-    fn run_upload(&mut self) {
-        let result = match self.upload_selected {
-            0 => self.push_to_git(),
-            1 => self.export_archive(),
-            _ => Ok("nothing to do".to_string()),
-        };
-        match result {
-            Ok(msg) => self.status = msg,
-            Err(e) => self.status = format!("error: {e:#}"),
+    /// Kick off the currently-selected upload action on a worker thread. The
+    /// snapshot walk + git push / age encryption can take a long time; running
+    /// them on the UI thread would freeze the app.
+    fn start_upload(&mut self) {
+        if self.upload_rx.is_some() {
+            self.status = "an upload is already running…".to_string();
+            return;
         }
-        // An upload may have changed what local backups exist.
-        self.refresh();
+        let action = self.upload_selected;
+        let config = self.config.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_upload_action(action, &config).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.upload_rx = Some(rx);
+        self.status = "working…".to_string();
     }
 
-    fn push_to_git(&mut self) -> Result<String> {
-        let staging = paths::staging_dir()?;
-        self.stage_fresh_snapshot(&staging)?;
-        let remote = git::resolve_remote(None, self.config.remote.as_deref())?;
-        git::push(&remote, &staging)?;
-        Ok(format!("pushed snapshot to {remote}"))
+    /// Fold in a finished upload, if any. Returns `true` when state changed.
+    fn poll_upload(&mut self) -> bool {
+        let Some(rx) = self.upload_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(msg)) => {
+                self.status = msg;
+                // The upload may have changed what local backups exist.
+                self.refresh();
+                true
+            }
+            Ok(Err(e)) => {
+                self.status = format!("error: {e}");
+                true
+            }
+            Err(TryRecvError::Empty) => {
+                self.upload_rx = Some(rx);
+                false
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.status = "error: upload worker died".to_string();
+                true
+            }
+        }
     }
+}
 
-    fn export_archive(&mut self) -> Result<String> {
-        let pass = archive::passphrase_from_env()?;
-        let staging = paths::staging_dir()?;
-        self.stage_fresh_snapshot(&staging)?;
-        let dir = paths::backups_dir()?;
-        std::fs::create_dir_all(&dir)?;
-        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let out = dir.join(format!("claude-backup-{ts}.tar.gz.age"));
-        archive::create(&staging, &out, &pass)?;
-        Ok(format!("wrote encrypted archive to {}", out.display()))
+/// The actual upload work, run on a worker thread: capture a fresh snapshot,
+/// then push it to git or export an encrypted archive.
+fn run_upload_action(action: usize, config: &Config) -> Result<String> {
+    let staging = paths::staging_dir()?;
+    match action {
+        0 => {
+            stage_fresh_snapshot(config, &staging)?;
+            let remote = git::resolve_remote(None, config.remote.as_deref())?;
+            git::push(&remote, &staging)?;
+            Ok(format!("pushed snapshot to {remote}"))
+        }
+        1 => {
+            let pass = archive::passphrase_from_env()?;
+            stage_fresh_snapshot(config, &staging)?;
+            let dir = paths::backups_dir()?;
+            std::fs::create_dir_all(&dir)?;
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let out = dir.join(format!("claude-backup-{ts}.tar.gz.age"));
+            archive::create(&staging, &out, &pass)?;
+            Ok(format!("wrote encrypted archive to {}", out.display()))
+        }
+        _ => Ok("nothing to do".to_string()),
     }
+}
 
-    /// Build a fresh (non-dry-run) snapshot into `staging`, mirroring the
-    /// `backup`/`export` CLI paths so an upload always reflects current state.
-    fn stage_fresh_snapshot(&self, staging: &std::path::Path) -> Result<()> {
-        let claude = paths::claude_dir()?;
-        let opts = SnapshotOptions::new(false, false, &self.config);
-        snapshot::build(&claude, staging, &self.config, &opts)?;
-        Ok(())
-    }
+/// Build a fresh (non-dry-run) snapshot into `staging`, mirroring the
+/// `backup`/`export` CLI paths so an upload always reflects current state.
+fn stage_fresh_snapshot(config: &Config, staging: &std::path::Path) -> Result<()> {
+    let claude = paths::claude_dir()?;
+    let opts = SnapshotOptions::new(false, false, config);
+    snapshot::build(&claude, staging, config, &opts)?;
+    Ok(())
 }
 
 /// Background worker: run the dry-run scan (reporting progress) and enumerate
@@ -449,13 +488,16 @@ fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    handle_key(terminal, &mut app, key.code)?;
+                    handle_key(&mut app, key.code);
                     dirty = true;
                 }
             }
         }
-        // Fold in any progress/results the background thread has produced.
+        // Fold in any progress/results the background threads have produced.
         if app.poll_load() {
+            dirty = true;
+        }
+        if app.poll_upload() {
             dirty = true;
         }
         if app.should_quit {
@@ -466,7 +508,7 @@ fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
 
 /// Handle a single keypress. Split out of [`run_loop`] so the loop stays a thin
 /// poll/draw cycle.
-fn handle_key(terminal: &mut Tui, app: &mut App, code: KeyCode) -> Result<()> {
+fn handle_key(app: &mut App, code: KeyCode) {
     // While a delete is armed, the next keypress is the answer: `y` confirms,
     // anything else cancels.
     if app.pending_delete.is_some() {
@@ -474,7 +516,7 @@ fn handle_key(terminal: &mut Tui, app: &mut App, code: KeyCode) -> Result<()> {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
             _ => app.cancel_delete(),
         }
-        return Ok(());
+        return;
     }
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
@@ -488,14 +530,9 @@ fn handle_key(terminal: &mut Tui, app: &mut App, code: KeyCode) -> Result<()> {
         }
         KeyCode::Char('t') => app.toggle_theme(),
         KeyCode::Char('d') | KeyCode::Delete => app.request_delete(),
-        KeyCode::Enter if app.tab == 2 => {
-            app.status = "working…".to_string();
-            terminal.draw(|f| ui(f, app))?;
-            app.run_upload();
-        }
+        KeyCode::Enter if app.tab == 2 => app.start_upload(),
         _ => {}
     }
-    Ok(())
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -745,6 +782,80 @@ mod tests {
             bytes_total: 4096,
         };
         terminal.draw(|f| ui(f, &mut app)).unwrap();
+    }
+
+    /// An armed delete targets the backup *value*, so a background refresh
+    /// reordering the list between arming and confirming cannot redirect the
+    /// delete onto a different entry.
+    #[test]
+    fn armed_delete_survives_list_reorder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doomed = tmp.path().join("doomed.tar.gz.age");
+        let innocent = tmp.path().join("innocent.tar.gz.age");
+        std::fs::write(&doomed, "x").unwrap();
+        std::fs::write(&innocent, "y").unwrap();
+        let mk = |label: &str, path: &std::path::Path| LocalBackup {
+            kind: BackupKind::Archive,
+            label: label.into(),
+            created_at: None,
+            detail: String::new(),
+            size: None,
+            path: Some(path.to_path_buf()),
+        };
+
+        let mut app = App::new(Config::default());
+        app.tab = 1;
+        app.set_backups(vec![mk("doomed", &doomed), mk("innocent", &innocent)]);
+        app.backups_state.select(Some(0));
+        app.request_delete();
+        assert_eq!(app.pending_delete.as_ref().unwrap().label, "doomed");
+
+        // A refresh completes and reorders the list under the armed delete.
+        app.set_backups(vec![mk("innocent", &innocent), mk("doomed", &doomed)]);
+        app.confirm_delete();
+
+        assert!(!doomed.exists(), "armed backup should be deleted");
+        assert!(innocent.exists(), "reordered neighbor must survive");
+    }
+
+    /// Enter on the upload tab hands the work to a thread instead of blocking
+    /// the key handler; a second Enter while it runs is refused.
+    #[test]
+    fn upload_runs_in_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Point HOME/XDG at a sandbox so the worker's snapshot walk cannot
+        // touch real state (see CLAUDE.md on env-mutating tests).
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        std::env::set_var("HOME", tmp.path());
+
+        let mut app = App::new(Config::default());
+        app.tab = 2;
+        app.upload_selected = 1; // export path fails fast: no CCSYNC_PASSPHRASE
+        std::env::remove_var("CCSYNC_PASSPHRASE");
+        handle_key(&mut app, KeyCode::Enter);
+        assert!(app.upload_rx.is_some(), "upload should be in flight");
+        handle_key(&mut app, KeyCode::Enter);
+        assert!(app.status.contains("already running"));
+
+        // The worker finishes (with the passphrase error) without the UI thread
+        // ever having blocked on it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.upload_rx.is_some() && std::time::Instant::now() < deadline {
+            app.poll_upload();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.status.contains("CCSYNC_PASSPHRASE"), "{}", app.status);
+
+        match prev_xdg {
+            Some(p) => std::env::set_var("XDG_CONFIG_HOME", p),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match prev_home {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
