@@ -21,10 +21,13 @@ machine.
 **Included (portable):**
 `settings.json`, `CLAUDE.md`, `keybindings.json`, and the `rules/`, `skills/`,
 `commands/`, `agents/`, `agent-memory/`, `output-styles/`, `workflows/`,
-`themes/` directories.
+`themes/` directories, plus `plugins/` configuration (the re-fetchable plugin
+checkouts under `plugins/repos`, `plugins/cache`, and `plugins/marketplaces`
+are excluded).
 
 **Included (sessions, with path remapping):**
-`projects/<encoded-path>/*.jsonl` transcripts and per-repo `memory/`.
+`projects/<encoded-path>/*.jsonl` transcripts, per-repo `memory/`, and the
+per-session `todos/` state (both gated by `include_sessions`).
 
 **Included (local MCP servers):**
 The `mcpServers` definitions configured on this machine — both **user scope**
@@ -38,15 +41,28 @@ are not touched — they already travel with their repository.
 
 **Never synced:**
 `.credentials.json` (hard-blocked), plus machine-local/cache state
-(`shell-snapshots/`, `session-env/`, `backups/`, `statsig/`, `launcher-settings.json`,
-`policy-limits.json`, `remote-settings.json`). `~/.claude.json` is never synced
+(`shell-snapshots/`, `session-env/`, `backups/`, `statsig/`, `ide/`,
+`settings.local.json`, `launcher-settings.json`, `policy-limits.json`,
+`remote-settings.json`, plugin checkouts). `~/.claude.json` is never synced
 wholesale because it embeds OAuth tokens and per-project trust decisions; only
 its `mcpServers` definitions are bundled (see above).
+
+Anything under `~/.claude` that appears in **neither** list is not captured;
+`ccsync status` prints a warning naming such entries so new Claude Code state
+is surfaced instead of silently dropped — add them to `include` or `exclude`
+to classify them.
 
 Config files — including the extracted MCP server definitions — are scanned for
 secret-shaped strings (API keys, tokens) before inclusion; a match aborts the
 snapshot unless you pass `--allow-secrets`. A server `env` holding a literal API
 key will therefore abort by default.
+
+Session transcripts get a separate policy (`transcript_secrets`), because
+conversations legitimately discuss secrets: by default each secret-shaped span
+is rewritten to `[REDACTED:ccsync]` **in the staged copy only** — the files in
+`~/.claude` are never modified. Set `transcript_secrets = "abort"` for the
+config-file behavior or `"ignore"` to capture transcripts verbatim. The
+scanner is best-effort pattern matching, not a guarantee.
 
 ## Install
 
@@ -98,15 +114,63 @@ ccsync restore
 | `ccsync status` | Show what a snapshot would capture (dry run). |
 | `ccsync push [--remote URL] [--archive FILE]` | Publish the staged snapshot (git by default). |
 | `ccsync pull [--remote URL] [--archive FILE]` | Fetch a snapshot into staging. |
-| `ccsync restore [--dry-run] [--no-remap] [--overwrite]` | Apply the staged snapshot to `~/.claude`. |
+| `ccsync restore [--dry-run] [--no-remap] [--overwrite] [--only COMPONENTS] [--yes]` | Apply the staged snapshot to `~/.claude` (optionally only named components). |
+| `ccsync diff` | Show how local `~/.claude` differs from the staged snapshot. |
 | `ccsync export FILE` | One-shot snapshot → encrypted archive. |
 | `ccsync import FILE` | Encrypted archive → staging. |
 | `ccsync backup [--remote URL] [--archive FILE]` | `snapshot` + `push`. |
+| `ccsync profile list\|create\|switch\|show\|diff\|delete\|rollback` | Manage named profiles (see [Profiles](#profiles)). |
 | `ccsync tui` | Launch an interactive terminal UI: review what would be backed up, browse local backups, and push/export. |
 | `ccsync daemon` | Run the background backup loop in the foreground (used by the installed service). |
 | `ccsync service install\|uninstall` | Register/remove an OS service (systemd user unit / launchd agent). |
 | `ccsync service start\|stop` | Run the daemon detached in the background (nohup-style; no service manager). |
 | `ccsync service status` | Report whether the service is installed and/or running. |
+
+## Profiles
+
+Profiles turn ccsync into an environment manager for Claude Code: named
+overlays (work, personal, client-X) over the shared base state.
+
+A profile **owns** a component set — by default `settings.json`, `CLAUDE.md`,
+`agents/`, `skills/`, `commands/`, `output-styles/`, plus the **user-scope**
+`mcpServers` of `~/.claude.json`. Everything else (sessions, agent memory,
+keybindings, todos) is shared and untouched by switching. Per-project MCP
+servers are tied to directories, not environments, and are never touched.
+
+```sh
+ccsync profile create work --from-current   # seed a profile from what you have now
+ccsync profile create personal              # start another one empty
+ccsync profile switch personal              # swap owned components + user MCP servers
+# ...configure Claude Code as "personal"...
+ccsync profile switch work                  # personal's edits are captured back, work returns
+ccsync profile diff work                    # what changed live vs. work's store?
+ccsync profile rollback                     # undo the last switch
+```
+
+How a switch works:
+
+1. the currently-active profile's live components are **captured back** into
+   its store, so edits made while it was active are never lost;
+2. if the target profile's `settings.json` would install hook commands you
+   don't already have, they are printed and must be confirmed (hooks are
+   arbitrary shell commands — `--yes` to skip);
+3. the affected live components are backed up to a timestamped
+   `~/.claude.ccsync-profile-backup-<ts>` directory;
+4. the target profile's components are swapped in wholesale and its user-scope
+   MCP servers replace the current set (other `~/.claude.json` keys are
+   preserved). A failure mid-apply automatically restores the backup.
+
+Profile stores live under `<config>/ccsync/profiles/<name>/` and — with the
+default `sync = true` — ride along inside snapshots, so `backup` on one
+machine and `pull` + `restore` on another moves your profiles too (the
+active-profile pointer stays machine-local).
+
+```toml
+[profiles]
+components = ["settings.json", "CLAUDE.md", "agents", "skills", "commands", "output-styles"]
+include_user_mcp = true
+sync = true
+```
 
 ## Background service
 
@@ -200,23 +264,37 @@ transcripts verbatim on a same-path machine.
 ## Safety
 
 - **Credentials never leave the machine** — `.credentials.json` is hard-blocked
-  in the capture path regardless of configuration.
+  in the capture path regardless of configuration (including profile stores).
+- **Snapshots are integrity-checked** — every captured file's SHA-256 is
+  recorded in the manifest, and `restore` verifies the staged data against it
+  (both directions, plus path-safety checks) before touching anything. Archive
+  extraction refuses absolute paths, `..`, and link entries.
+- **Incoming hooks require confirmation** — a restored or profile-switched
+  `settings.json` can carry `hooks`, which are arbitrary shell commands Claude
+  Code will execute on this machine. New or changed hook commands are printed
+  and must be confirmed; non-interactive runs fail closed (`--yes` to accept,
+  `confirm_hooks = false` to disable the check).
 - **Archives are always encrypted** with [age](https://age-encryption.org/)
   using `CCSYNC_PASSPHRASE`; there is no plaintext mode.
 - **`restore` is reversible** — it backs up the existing `~/.claude` to a
   timestamped `~/.claude.ccsync-backup-<ts>` directory before writing, supports
   `--dry-run`, and deep-merges `settings.json` by default (`--overwrite` to
-  replace). When MCP servers are bundled, `~/.claude.json` is likewise copied to
-  a timestamped `~/.claude.json.ccsync-backup-<ts>` before its `mcpServers` are
-  merged.
+  replace; scalar arrays like `permissions.allow` are unioned so locally-added
+  entries survive). When MCP servers are bundled, `~/.claude.json` is likewise
+  copied to a timestamped `~/.claude.json.ccsync-backup-<ts>` before its
+  `mcpServers` are merged.
+- **Git remotes are restricted to real transports** (ssh/https/http/file) —
+  exotic schemes like `ext::` that execute commands are refused.
 
 ## Configuration
 
 `<config>/ccsync/config.toml` (created by `ccsync init`) controls the
-`include`/`exclude` sets, `include_sessions`, `include_mcp_servers`, the git
-`remote`, the `[remap]` table, and the `[service]` table (see
-[Background service](#background-service)). `CLAUDE_CONFIG_DIR` is honored when
-locating the source directory.
+`include`/`exclude` sets, `include_sessions`, `include_mcp_servers`,
+`transcript_secrets` (`"redact"` default / `"abort"` / `"ignore"`),
+`confirm_hooks`, the git `remote`, the `[remap]` table, the `[service]` table
+(see [Background service](#background-service)), and the `[profiles]` table
+(see [Profiles](#profiles)). `CLAUDE_CONFIG_DIR` is honored when locating the
+source directory.
 
 > **Where is `<config>`?** All of ccsync's own files (config, staging,
 > backups, repo cache, daemon pid/log) live under your platform config
