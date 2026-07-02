@@ -24,6 +24,11 @@ pub fn repo_cache() -> Result<PathBuf> {
 
 fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut cmd = Command::new("git");
+    // The remote URL is user- or config-supplied: restrict git to real
+    // transports so exotic schemes like `ext::sh -c ...` can never execute
+    // commands, whatever the URL says.
+    cmd.env("GIT_ALLOW_PROTOCOL", "ssh:https:http:file");
+    cmd.args(["-c", "protocol.ext.allow=never"]);
     cmd.args(args);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -38,29 +43,40 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Ensure the local cache is a clone of `remote`, pulling latest if it already
-/// exists.
+/// Ensure the local cache is a clone of `remote`, aligned with the remote tip
+/// if it already exists.
 fn ensure_clone(remote: &str, cache: &Path) -> Result<()> {
     if cache.join(".git").exists() {
-        // Best-effort fast-forward; a brand-new remote may have no commits yet.
-        let _ = run_git(&["fetch", "origin"], Some(cache));
-        let _ = run_git(&["pull", "--ff-only"], Some(cache));
+        align_with_remote(cache);
     } else {
         if let Some(parent) = cache.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        run_git(&["clone", remote, &cache.to_string_lossy()], None)?;
+        run_git(&["clone", "--", remote, &cache.to_string_lossy()], None)?;
     }
     Ok(())
 }
 
-/// Push the staged snapshot to the configured git `remote`.
-pub fn push(remote: &str, staging: &Path) -> Result<()> {
-    let cache = repo_cache()?;
-    ensure_clone(remote, &cache)?;
+/// Best-effort: move the cache's branch to the remote tip. Snapshots replace
+/// the whole repo state on every push (last writer wins), so the cache's own
+/// history is disposable — `reset --hard` instead of merge/ff means a cache
+/// that diverged from the remote (two machines pushing) can always recover.
+/// Errors are ignored: a brand-new remote has no commits yet, and offline
+/// operation should still be able to stage local commits.
+fn align_with_remote(cache: &Path) {
+    let _ = run_git(&["fetch", "origin"], Some(cache));
+    if let Ok(branch) = run_git(&["symbolic-ref", "--short", "HEAD"], Some(cache)) {
+        let remote_ref = format!("origin/{}", branch.trim());
+        if run_git(&["rev-parse", "--verify", &remote_ref], Some(cache)).is_ok() {
+            let _ = run_git(&["reset", "--hard", &remote_ref], Some(cache));
+        }
+    }
+}
 
-    // Replace the repo's manifest + data with the staged snapshot so deletions
-    // propagate.
+/// Replace the cache's manifest + data with the staged snapshot (so deletions
+/// propagate) and commit. Returns false when the snapshot is identical to what
+/// the cache already holds (nothing to commit).
+fn overlay_and_commit(staging: &Path, cache: &Path) -> Result<bool> {
     let _ = std::fs::remove_file(cache.join(MANIFEST_NAME));
     let _ = std::fs::remove_dir_all(cache.join("data"));
     copy_tree(&staging.join(MANIFEST_NAME), &cache.join(MANIFEST_NAME))?;
@@ -69,11 +85,10 @@ pub fn push(remote: &str, staging: &Path) -> Result<()> {
         copy_tree(&staged_data, &cache.join("data"))?;
     }
 
-    run_git(&["add", "-A"], Some(&cache))?;
-    // Nothing to commit is not an error.
-    let status = run_git(&["status", "--porcelain"], Some(&cache))?;
+    run_git(&["add", "-A"], Some(cache))?;
+    let status = run_git(&["status", "--porcelain"], Some(cache))?;
     if status.trim().is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let msg = format!("ccsync snapshot {}", chrono::Utc::now().to_rfc3339());
     // Provide a committer identity inline so backups work even on machines
@@ -88,16 +103,42 @@ pub fn push(remote: &str, staging: &Path) -> Result<()> {
             "-m",
             &msg,
         ],
-        Some(&cache),
+        Some(cache),
     )?;
-    run_git(&["push", "-u", "origin", "HEAD"], Some(&cache))?;
+    Ok(true)
+}
+
+/// Push the staged snapshot to the configured git `remote`.
+pub fn push(remote: &str, staging: &Path) -> Result<()> {
+    let cache = repo_cache()?;
+    push_with_cache(remote, staging, &cache)
+}
+
+pub(crate) fn push_with_cache(remote: &str, staging: &Path, cache: &Path) -> Result<()> {
+    ensure_clone(remote, cache)?;
+    if !overlay_and_commit(staging, cache)? {
+        return Ok(());
+    }
+    if run_git(&["push", "-u", "origin", "HEAD"], Some(cache)).is_ok() {
+        return Ok(());
+    }
+    // Rejected — another machine pushed between our fetch and push. Re-align
+    // to the new remote tip, re-overlay the snapshot, and retry exactly once;
+    // a second rejection is surfaced to the caller.
+    align_with_remote(cache);
+    overlay_and_commit(staging, cache)?;
+    run_git(&["push", "-u", "origin", "HEAD"], Some(cache))?;
     Ok(())
 }
 
 /// Pull the latest snapshot from `remote` into the `staging` directory.
 pub fn pull(remote: &str, staging: &Path) -> Result<()> {
     let cache = repo_cache()?;
-    ensure_clone(remote, &cache)?;
+    pull_with_cache(remote, staging, &cache)
+}
+
+pub(crate) fn pull_with_cache(remote: &str, staging: &Path, cache: &Path) -> Result<()> {
+    ensure_clone(remote, cache)?;
 
     if !cache.join(MANIFEST_NAME).exists() {
         return Err(CcError::NoStagedSnapshot(remote.to_string()).into());
@@ -179,4 +220,84 @@ pub fn resolve_remote(explicit: Option<&str>, config_remote: Option<&str>) -> Re
         .or(config_remote)
         .map(|s| s.to_string())
         .ok_or_else(|| CcError::NoRemote.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A local bare repo standing in for the remote.
+    fn init_bare(dir: &Path) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        run_git(&["init", "--bare", &dir.to_string_lossy()], None).unwrap();
+        dir.to_string_lossy().to_string()
+    }
+
+    fn write_staging(staging: &Path, content: &str) {
+        std::fs::create_dir_all(staging.join("data")).unwrap();
+        std::fs::write(staging.join(MANIFEST_NAME), r#"{"v":1}"#).unwrap();
+        std::fs::write(staging.join("data/settings.json"), content).unwrap();
+    }
+
+    #[test]
+    fn push_pull_roundtrip_via_bare_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&tmp.path().join("remote.git"));
+
+        let staging = tmp.path().join("staging");
+        write_staging(&staging, r#"{"theme":"dark"}"#);
+        push_with_cache(&remote, &staging, &tmp.path().join("cache-a")).unwrap();
+
+        // Pull through a different cache, as a second machine would.
+        let pulled = tmp.path().join("pulled");
+        pull_with_cache(&remote, &pulled, &tmp.path().join("cache-b")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pulled.join("data/settings.json")).unwrap(),
+            r#"{"theme":"dark"}"#
+        );
+
+        // Pushing the identical snapshot again is a no-op, not an error.
+        push_with_cache(&remote, &staging, &tmp.path().join("cache-a")).unwrap();
+    }
+
+    #[test]
+    fn push_recovers_after_remote_diverged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&tmp.path().join("remote.git"));
+        let cache_a = tmp.path().join("cache-a");
+        let cache_b = tmp.path().join("cache-b");
+
+        // Machine A pushes v1; machine B pushes v2 on top.
+        let staging_a = tmp.path().join("staging-a");
+        write_staging(&staging_a, "v1");
+        push_with_cache(&remote, &staging_a, &cache_a).unwrap();
+        let staging_b = tmp.path().join("staging-b");
+        write_staging(&staging_b, "v2");
+        push_with_cache(&remote, &staging_b, &cache_b).unwrap();
+
+        // A's cache is now behind a remote whose history it does not contain.
+        // With ff-only pulling this wedged permanently; reset-based alignment
+        // must recover and land v3.
+        write_staging(&staging_a, "v3");
+        push_with_cache(&remote, &staging_a, &cache_a).unwrap();
+
+        let pulled = tmp.path().join("pulled");
+        pull_with_cache(&remote, &pulled, &tmp.path().join("cache-c")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pulled.join("data/settings.json")).unwrap(),
+            "v3"
+        );
+    }
+
+    #[test]
+    fn refuses_ext_protocol_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write_staging(&staging, "{}");
+        let marker = tmp.path().join("pwned");
+        let remote = format!("ext::sh -c 'touch {}'", marker.display());
+        let err = push_with_cache(&remote, &staging, &tmp.path().join("cache")).unwrap_err();
+        assert!(err.to_string().contains("git"), "got: {err:#}");
+        assert!(!marker.exists(), "ext:: remote executed a command");
+    }
 }
