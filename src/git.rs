@@ -47,6 +47,10 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
 /// if it already exists.
 fn ensure_clone(remote: &str, cache: &Path) -> Result<()> {
     if cache.join(".git").exists() {
+        // The cache may have been cloned from a different remote; keep origin
+        // pointed at what the caller asked for so a --remote override is
+        // honored instead of silently syncing with the old URL.
+        run_git(&["remote", "set-url", "origin", remote], Some(cache))?;
         align_with_remote(cache);
     } else {
         if let Some(parent) = cache.parent() {
@@ -74,9 +78,11 @@ fn align_with_remote(cache: &Path) {
 }
 
 /// Replace the cache's manifest + data with the staged snapshot (so deletions
-/// propagate) and commit. Returns false when the snapshot is identical to what
-/// the cache already holds (nothing to commit).
-fn overlay_and_commit(staging: &Path, cache: &Path) -> Result<bool> {
+/// propagate) and commit if anything changed. A snapshot identical to what the
+/// cache already holds commits nothing; the follow-up push is then a cheap
+/// no-op against an up-to-date remote, or publishes the existing history to a
+/// remote that does not have it yet.
+fn overlay_and_commit(staging: &Path, cache: &Path) -> Result<()> {
     let _ = std::fs::remove_file(cache.join(MANIFEST_NAME));
     let _ = std::fs::remove_dir_all(cache.join("data"));
     copy_tree(&staging.join(MANIFEST_NAME), &cache.join(MANIFEST_NAME))?;
@@ -88,7 +94,7 @@ fn overlay_and_commit(staging: &Path, cache: &Path) -> Result<bool> {
     run_git(&["add", "-A"], Some(cache))?;
     let status = run_git(&["status", "--porcelain"], Some(cache))?;
     if status.trim().is_empty() {
-        return Ok(false);
+        return Ok(());
     }
     let msg = format!("ccsync snapshot {}", chrono::Utc::now().to_rfc3339());
     // Provide a committer identity inline so backups work even on machines
@@ -105,7 +111,7 @@ fn overlay_and_commit(staging: &Path, cache: &Path) -> Result<bool> {
         ],
         Some(cache),
     )?;
-    Ok(true)
+    Ok(())
 }
 
 /// Push the staged snapshot to the configured git `remote`.
@@ -116,9 +122,7 @@ pub fn push(remote: &str, staging: &Path) -> Result<()> {
 
 pub(crate) fn push_with_cache(remote: &str, staging: &Path, cache: &Path) -> Result<()> {
     ensure_clone(remote, cache)?;
-    if !overlay_and_commit(staging, cache)? {
-        return Ok(());
-    }
+    overlay_and_commit(staging, cache)?;
     if run_git(&["push", "-u", "origin", "HEAD"], Some(cache)).is_ok() {
         return Ok(());
     }
@@ -299,5 +303,27 @@ mod tests {
         let err = push_with_cache(&remote, &staging, &tmp.path().join("cache")).unwrap_err();
         assert!(err.to_string().contains("git"), "got: {err:#}");
         assert!(!marker.exists(), "ext:: remote executed a command");
+    }
+
+    #[test]
+    fn remote_override_repoints_existing_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote_a = init_bare(&tmp.path().join("a.git"));
+        let remote_b = init_bare(&tmp.path().join("b.git"));
+        let cache = tmp.path().join("cache");
+
+        let staging = tmp.path().join("staging");
+        write_staging(&staging, "for-a");
+        push_with_cache(&remote_a, &staging, &cache).unwrap();
+
+        // Same cache, different --remote: must land on B, not silently on A.
+        write_staging(&staging, "for-b");
+        push_with_cache(&remote_b, &staging, &cache).unwrap();
+        let pulled = tmp.path().join("pulled");
+        pull_with_cache(&remote_b, &pulled, &tmp.path().join("cache-2")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pulled.join("data/settings.json")).unwrap(),
+            "for-b"
+        );
     }
 }
