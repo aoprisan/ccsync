@@ -43,6 +43,9 @@ pub struct RestoreOptions {
     /// (e.g. `skills`, `settings.json`, `mcp-servers.json`). `None` restores
     /// everything.
     pub components: Option<Vec<String>>,
+    /// Local profile store to route the snapshot's bundled `ccsync-profiles/`
+    /// tree into. `None` drops bundled profiles instead of restoring them.
+    pub profiles_root: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -139,6 +142,7 @@ pub fn run(
             dry_run: opts.dry_run,
             merge: opts.merge,
             components,
+            profiles_root: opts.profiles_root.as_deref(),
         },
     )?;
 
@@ -196,6 +200,9 @@ pub struct ApplyOptions<'a> {
     /// Restrict application to these top-level components (file or directory
     /// names) of the source tree. `None` applies everything.
     pub components: Option<&'a [String]>,
+    /// Where the reserved `ccsync-profiles/` component is routed (the local
+    /// profile store, not `~/.claude`). `None` skips it.
+    pub profiles_root: Option<&'a Path>,
 }
 
 /// True when `name` (a top-level component) is selected by `components`.
@@ -230,7 +237,19 @@ pub fn apply_tree(src_root: &Path, dest_dir: &Path, opts: &ApplyOptions) -> Resu
             continue;
         }
 
-        let dest = dest_dir.join(rel);
+        // The bundled profile store is routed into the local store, not
+        // `~/.claude`, and always replaces (stores are swapped, not merged).
+        let (dest, force_overwrite) = if top == crate::profile::PROFILES_COMPONENT {
+            let Some(profiles_root) = opts.profiles_root else {
+                continue;
+            };
+            let inner = rel
+                .strip_prefix(crate::profile::PROFILES_COMPONENT)
+                .expect("rel starts with the profiles component");
+            (profiles_root.join(inner), true)
+        } else {
+            (dest_dir.join(rel), false)
+        };
         files_written.push(rel_str.clone());
 
         if opts.dry_run {
@@ -239,8 +258,10 @@ pub fn apply_tree(src_root: &Path, dest_dir: &Path, opts: &ApplyOptions) -> Resu
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        let is_json_config =
-            opts.merge == MergeMode::Merge && rel_str.ends_with(".json") && dest.exists();
+        let is_json_config = !force_overwrite
+            && opts.merge == MergeMode::Merge
+            && rel_str.ends_with(".json")
+            && dest.exists();
         if is_json_config {
             merge_json_file(entry.path(), &dest)?;
         } else {
@@ -267,7 +288,7 @@ fn incoming_new_hooks(
 
 /// Every string under a `command` key inside the `hooks` value of a
 /// settings.json, or empty when the file/key is absent or unparseable.
-fn hook_commands_in(settings: &Path) -> Result<std::collections::BTreeSet<String>> {
+pub(crate) fn hook_commands_in(settings: &Path) -> Result<std::collections::BTreeSet<String>> {
     let mut out = std::collections::BTreeSet::new();
     if !settings.exists() {
         return Ok(out);
@@ -302,7 +323,7 @@ fn collect_hook_commands(v: &serde_json::Value, out: &mut std::collections::BTre
 
 /// Ask the user to approve installing `new_hooks`; fail closed when there is
 /// no terminal to ask on.
-fn confirm_hook_install(new_hooks: &std::collections::BTreeSet<String>) -> Result<()> {
+pub(crate) fn confirm_hook_install(new_hooks: &std::collections::BTreeSet<String>) -> Result<()> {
     use std::io::{BufRead, IsTerminal, Write};
 
     eprintln!("the incoming settings.json adds hook commands that will run on this machine:");
@@ -491,6 +512,7 @@ mod tests {
                 dry_run: false,
                 allow_secrets: false,
                 claude_json: None,
+                profiles_root: None,
             },
         )
         .unwrap();
@@ -513,6 +535,7 @@ mod tests {
             claude_json: None,
             confirm_hooks: false,
             components: None,
+            profiles_root: None,
         };
         let report = run(&dst_claude, &staging, &cfg, &opts).unwrap();
 
@@ -564,6 +587,7 @@ mod tests {
             claude_json: None,
             confirm_hooks: false,
             components: None,
+            profiles_root: None,
         };
         let dst1 = tmp.path().join("claude-1");
         run(&dst1, &staging, &Config::default(), &opts).unwrap();
@@ -619,6 +643,7 @@ mod tests {
             claude_json: None,
             confirm_hooks: false,
             components: None,
+            profiles_root: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -650,6 +675,7 @@ mod tests {
             claude_json: None,
             confirm_hooks: false,
             components: None,
+            profiles_root: None,
         };
         let claude = tmp.path().join("claude");
 
@@ -670,6 +696,71 @@ mod tests {
         write(&staging.join("data/other.json"), "{}");
         let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
         assert!(err.to_string().contains("integrity"), "got: {err:#}");
+    }
+
+    #[test]
+    fn profile_store_round_trips_through_snapshot_and_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Machine A: a claude dir and a profile store with one profile.
+        let claude_a = tmp.path().join("claude-a");
+        write(&claude_a.join("settings.json"), "{}");
+        let profiles_a = tmp.path().join("profiles-a");
+        write(
+            &profiles_a.join("work/data/settings.json"),
+            r#"{"theme":"work"}"#,
+        );
+        write(
+            &profiles_a.join("work/profile.toml"),
+            "description = \"d\"\n",
+        );
+        // Machine-local pointer must not travel.
+        write(&profiles_a.join("active.json"), r#"{"name":"work"}"#);
+
+        let staging = tmp.path().join("staging");
+        let cfg = Config::default();
+        let m = snapshot::build(
+            &claude_a,
+            &staging,
+            &cfg,
+            &crate::snapshot::SnapshotOptions {
+                dry_run: false,
+                allow_secrets: false,
+                claude_json: None,
+                profiles_root: Some(profiles_a),
+            },
+        )
+        .unwrap();
+        assert!(m
+            .files
+            .iter()
+            .any(|f| f.rel_path == "ccsync-profiles/work/data/settings.json"));
+        assert!(!m
+            .files
+            .iter()
+            .any(|f| f.rel_path == "ccsync-profiles/active.json"));
+
+        // Machine B: restore routes the store into its local profiles dir,
+        // not into ~/.claude.
+        let claude_b = tmp.path().join("claude-b");
+        let profiles_b = tmp.path().join("profiles-b");
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Merge,
+            claude_json: None,
+            confirm_hooks: false,
+            components: None,
+            profiles_root: Some(profiles_b.clone()),
+        };
+        run(&claude_b, &staging, &cfg, &opts).unwrap();
+        assert!(claude_b.join("settings.json").exists());
+        assert!(!claude_b.join("ccsync-profiles").exists());
+        assert_eq!(
+            fs::read_to_string(profiles_b.join("work/data/settings.json")).unwrap(),
+            r#"{"theme":"work"}"#
+        );
+        assert!(profiles_b.join("work/profile.toml").exists());
+        assert!(!profiles_b.join("active.json").exists());
     }
 
     #[test]
@@ -702,6 +793,7 @@ mod tests {
             claude_json: Some(claude_json.clone()),
             confirm_hooks: false,
             components: Some(vec!["skills".into()]),
+            profiles_root: None,
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -727,6 +819,7 @@ mod tests {
             claude_json: Some(claude_json.clone()),
             confirm_hooks: false,
             components: Some(vec![crate::mcp::MCP_FILE.into()]),
+            profiles_root: None,
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
         assert_eq!(report.mcp_servers_restored, 1);
@@ -759,6 +852,7 @@ mod tests {
             claude_json: None,
             confirm_hooks: true,
             components: None,
+            profiles_root: None,
         };
         let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
         assert!(err.to_string().contains("hooks"), "got: {err:#}");
@@ -776,6 +870,7 @@ mod tests {
             claude_json: None,
             confirm_hooks: false,
             components: None,
+            profiles_root: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
         let local: serde_json::Value =
@@ -792,6 +887,7 @@ mod tests {
             claude_json: None,
             confirm_hooks: true,
             components: None,
+            profiles_root: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
     }
@@ -824,6 +920,7 @@ mod tests {
             claude_json: None,
             confirm_hooks: false,
             components: None,
+            profiles_root: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -873,6 +970,7 @@ mod tests {
             claude_json: Some(claude_json.clone()),
             confirm_hooks: false,
             components: None,
+            profiles_root: None,
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
 

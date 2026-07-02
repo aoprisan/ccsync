@@ -130,6 +130,45 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// Manage named profiles: overlays of settings, memory, agents, skills,
+    /// commands, and user-scope MCP servers over the shared base state.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProfileAction {
+    /// List profiles (the active one is marked).
+    List,
+    /// Create a new profile.
+    Create {
+        name: String,
+        /// Capture the current ~/.claude components into the new profile.
+        #[arg(long)]
+        from_current: bool,
+        /// Free-form description shown by `profile list`/`show`.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Capture the active profile's live edits, then swap in this profile's
+    /// components (previous state is backed up; use rollback to revert).
+    Switch {
+        name: String,
+        /// Accept the profile's settings.json hook commands without confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show a profile's description, components, and stored MCP servers.
+    Show { name: String },
+    /// Show how live ~/.claude components differ from a profile's store.
+    Diff { name: String },
+    /// Delete a profile's store (refused while it is active).
+    Delete { name: String },
+    /// Revert the last switch.
+    Rollback,
 }
 
 #[derive(Subcommand)]

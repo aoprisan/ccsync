@@ -46,6 +46,43 @@ pub struct Config {
     pub remap: BTreeMap<String, String>,
     /// Settings for the background service (`ccsync daemon` / `ccsync service`).
     pub service: ServiceConfig,
+    /// Settings for named profiles (`ccsync profile ...`).
+    pub profiles: ProfilesConfig,
+}
+
+/// Configuration for named profiles: which parts of `~/.claude` a profile
+/// owns, and whether the profile store rides along inside snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfilesConfig {
+    /// Top-level components of `~/.claude` a profile owns. Everything else
+    /// (sessions, agent memory, keybindings, ...) is shared base state that
+    /// survives a switch untouched.
+    pub components: Vec<String>,
+    /// Whether a profile also owns the user-scope `mcpServers` of
+    /// `~/.claude.json` (per-project servers are tied to directories, not
+    /// environments, and are never touched).
+    pub include_user_mcp: bool,
+    /// Bundle the profile store into snapshots so profiles sync across
+    /// machines with the normal push/pull/export flow.
+    pub sync: bool,
+}
+
+impl Default for ProfilesConfig {
+    fn default() -> Self {
+        ProfilesConfig {
+            components: vec![
+                "settings.json".into(),
+                "CLAUDE.md".into(),
+                "agents".into(),
+                "skills".into(),
+                "commands".into(),
+                "output-styles".into(),
+            ],
+            include_user_mcp: true,
+            sync: true,
+        }
+    }
 }
 
 /// Policy for secret-shaped strings inside session transcripts.
@@ -158,6 +195,7 @@ impl Default for Config {
             remote: None,
             remap: BTreeMap::new(),
             service: ServiceConfig::default(),
+            profiles: ProfilesConfig::default(),
         }
     }
 }

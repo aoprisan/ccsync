@@ -70,6 +70,13 @@ pub fn backups_dir() -> Result<PathBuf, CcError> {
     Ok(base.join("ccsync").join("backups"))
 }
 
+/// ccsync's profile store: `<config>/ccsync/profiles/<name>/{profile.toml,
+/// data/,mcp-servers.json}` plus `active.json` marking the active profile.
+pub fn profiles_dir() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("profiles"))
+}
+
 /// PID file for a detached daemon started with `ccsync service start`:
 /// `<config>/ccsync/daemon.pid`.
 pub fn daemon_pidfile() -> Result<PathBuf, CcError> {

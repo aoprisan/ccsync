@@ -152,6 +152,42 @@ pub fn merge_into(
     Ok(merged)
 }
 
+/// Replace the user-scope `mcpServers` object of `claude_json` wholesale,
+/// preserving every other key. `None` (or a non-object) clears it — a profile
+/// with no user-scope servers means exactly that. Returns the number of
+/// servers installed. Used by profile switching, where the active profile
+/// *owns* the user scope rather than merging into it.
+pub fn replace_user_scope(claude_json: &Path, servers: Option<&Value>) -> Result<usize> {
+    let mut root: Value = if claude_json.exists() {
+        let text = std::fs::read_to_string(claude_json)
+            .with_context(|| format!("reading {}", claude_json.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", claude_json.display()))?
+    } else {
+        Value::Object(Map::new())
+    };
+    if !root.is_object() {
+        root = Value::Object(Map::new());
+    }
+    let root_obj = root.as_object_mut().expect("root is an object");
+
+    let incoming = match servers {
+        Some(Value::Object(m)) => m.clone(),
+        _ => Map::new(),
+    };
+    let count = incoming.len();
+    if incoming.is_empty() {
+        root_obj.remove("mcpServers");
+    } else {
+        root_obj.insert("mcpServers".into(), Value::Object(incoming));
+    }
+
+    let serialized =
+        serde_json::to_string_pretty(&root).context("serializing merged ~/.claude.json")?;
+    std::fs::write(claude_json, serialized)
+        .with_context(|| format!("writing {}", claude_json.display()))?;
+    Ok(count)
+}
+
 /// Insert one server definition, either replacing or deep-merging.
 fn insert_server(target: &mut Map<String, Value>, name: &str, def: &Value, overwrite: bool) {
     if overwrite {

@@ -32,6 +32,9 @@ pub struct SnapshotOptions {
     /// `~/.claude.json` to harvest MCP server definitions from, when
     /// `config.include_mcp_servers` is set. `None` skips MCP bundling entirely.
     pub claude_json: Option<PathBuf>,
+    /// Profile store to bundle under `ccsync-profiles/` in the snapshot, when
+    /// `config.profiles.sync` is set. `None` skips profile bundling.
+    pub profiles_root: Option<PathBuf>,
 }
 
 impl SnapshotOptions {
@@ -44,10 +47,16 @@ impl SnapshotOptions {
         } else {
             None
         };
+        let profiles_root = if config.profiles.sync {
+            paths::profiles_dir().ok()
+        } else {
+            None
+        };
         SnapshotOptions {
             dry_run,
             allow_secrets,
             claude_json,
+            profiles_root,
         }
     }
 }
@@ -129,7 +138,26 @@ fn build_inner(
         if !src.exists() {
             continue;
         }
-        plan_path(&src, claude_dir, config, &mut planned)?;
+        plan_path(&src, claude_dir, "", config, &mut planned)?;
+    }
+
+    // Bundle the profile store under the reserved `ccsync-profiles/` name so
+    // profiles ride along in snapshots; restore routes it back into the local
+    // store. The machine-local `active.json` pointer never travels.
+    if config.profiles.sync {
+        if let Some(profiles_root) = opts.profiles_root.as_deref() {
+            if profiles_root.is_dir() {
+                plan_path(
+                    profiles_root,
+                    profiles_root,
+                    crate::profile::PROFILES_COMPONENT,
+                    config,
+                    &mut planned,
+                )?;
+                let active = format!("{}/active.json", crate::profile::PROFILES_COMPONENT);
+                planned.retain(|p| p.rel != active);
+            }
+        }
     }
 
     let total_bytes: u64 = planned.iter().map(|p| p.size).sum();
@@ -256,11 +284,14 @@ fn capture_mcp_servers(
 }
 
 /// Walk a single include entry (file or directory tree) and append the files
-/// that survive include/exclude to `out`. The credential hard-block aborts the
-/// whole snapshot here, before any bytes are read.
+/// that survive include/exclude to `out`, with rel paths computed against
+/// `base` and prefixed by `rel_prefix` (empty for the `~/.claude` walk;
+/// `ccsync-profiles` for the bundled profile store). The credential
+/// hard-block aborts the whole snapshot here, before any bytes are read.
 fn plan_path(
     src: &Path,
-    claude_dir: &Path,
+    base: &Path,
+    rel_prefix: &str,
     config: &Config,
     out: &mut Vec<PlannedFile>,
 ) -> Result<()> {
@@ -270,11 +301,14 @@ fn plan_path(
             continue;
         }
         let abs = entry.path();
-        let rel = abs
-            .strip_prefix(claude_dir)
-            .expect("walked path is under claude_dir")
+        let mut rel = abs
+            .strip_prefix(base)
+            .expect("walked path is under its base")
             .to_string_lossy()
             .replace('\\', "/");
+        if !rel_prefix.is_empty() {
+            rel = format!("{rel_prefix}/{rel}");
+        }
 
         let file_name = abs
             .file_name()
@@ -458,6 +492,7 @@ mod tests {
             dry_run: false,
             allow_secrets: false,
             claude_json: None,
+            profiles_root: None,
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -489,6 +524,7 @@ mod tests {
             dry_run: false,
             allow_secrets: true,
             claude_json: None,
+            profiles_root: None,
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("credential"));
@@ -508,6 +544,7 @@ mod tests {
             dry_run: false,
             allow_secrets: false,
             claude_json: None,
+            profiles_root: None,
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("secret"));
@@ -517,6 +554,7 @@ mod tests {
             dry_run: false,
             allow_secrets: true,
             claude_json: None,
+            profiles_root: None,
         };
         assert!(build(&claude, &staging, &cfg, &opts).is_ok());
     }
@@ -535,6 +573,7 @@ mod tests {
             dry_run: false,
             allow_secrets: false,
             claude_json: None,
+            profiles_root: None,
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -591,6 +630,7 @@ mod tests {
             dry_run: false,
             allow_secrets: false,
             claude_json: None,
+            profiles_root: None,
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("secret"), "got: {err:#}");
@@ -626,6 +666,7 @@ mod tests {
             dry_run: false,
             allow_secrets: false,
             claude_json: Some(claude_json),
+            profiles_root: None,
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -672,6 +713,7 @@ mod tests {
             dry_run: false,
             allow_secrets: false,
             claude_json: None,
+            profiles_root: None,
         };
         let sink = CountingSink {
             files: Cell::new(0),
@@ -708,6 +750,7 @@ mod tests {
             dry_run: false,
             allow_secrets: false,
             claude_json: Some(claude_json),
+            profiles_root: None,
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
         assert!(!m.files.iter().any(|f| f.rel_path == crate::mcp::MCP_FILE));

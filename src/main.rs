@@ -16,6 +16,7 @@ mod install;
 mod manifest;
 mod mcp;
 mod paths;
+mod profile;
 mod redact;
 mod remap;
 mod restore;
@@ -126,6 +127,151 @@ fn run() -> Result<()> {
             cli::ServiceAction::Stop => service::stop(),
             cli::ServiceAction::Status => service::status(),
         },
+        Command::Profile { action } => cmd_profile(&config, action),
+    }
+}
+
+fn cmd_profile(config: &Config, action: cli::ProfileAction) -> Result<()> {
+    use cli::ProfileAction;
+
+    let root = paths::profiles_dir()?;
+    let claude = paths::claude_dir()?;
+    let claude_json = if config.profiles.include_user_mcp {
+        paths::claude_json_file().ok()
+    } else {
+        None
+    };
+    let live = profile::LiveState {
+        claude_dir: &claude,
+        claude_json: claude_json.as_deref(),
+    };
+
+    match action {
+        ProfileAction::List => {
+            let names = profile::list(&root)?;
+            if names.is_empty() {
+                println!("no profiles yet; `ccsync profile create <name> --from-current`");
+                return Ok(());
+            }
+            let active = profile::active(&root)?.map(|a| a.name);
+            for name in names {
+                let marker = if active.as_deref() == Some(&name) {
+                    "* "
+                } else {
+                    "  "
+                };
+                let desc = profile::read_meta(&root, &name)?.description;
+                if desc.is_empty() {
+                    println!("{marker}{name}");
+                } else {
+                    println!("{marker}{name} — {desc}");
+                }
+            }
+            Ok(())
+        }
+        ProfileAction::Create {
+            name,
+            from_current,
+            description,
+        } => {
+            let captured = profile::create(
+                &root,
+                &name,
+                description,
+                config,
+                from_current.then_some(&live),
+            )?;
+            if from_current {
+                println!("created profile {name:?} with {captured} file(s) from current state");
+            } else {
+                println!("created empty profile {name:?}");
+            }
+            Ok(())
+        }
+        ProfileAction::Switch { name, yes } => {
+            let report =
+                profile::switch(&root, &name, &live, config, config.confirm_hooks && !yes)?;
+            if let Some(from) = &report.from {
+                if from == &report.to {
+                    println!(
+                        "already on {:?}; captured {} live file(s) into its store",
+                        report.to, report.captured_files
+                    );
+                    return Ok(());
+                }
+                println!(
+                    "captured {} file(s) back into {:?}",
+                    report.captured_files, from
+                );
+            }
+            if let Some(backup) = &report.backup_dir {
+                println!("backed up previous state to {}", backup.display());
+            }
+            println!(
+                "switched to {:?}: {} file(s) applied, {} user-scope MCP server(s)",
+                report.to, report.applied_files, report.mcp_servers
+            );
+            Ok(())
+        }
+        ProfileAction::Show { name } => {
+            if !profile::exists(&root, &name) {
+                anyhow::bail!("profile {name:?} does not exist");
+            }
+            let meta = profile::read_meta(&root, &name)?;
+            let active = profile::active(&root)?.map(|a| a.name);
+            println!(
+                "{name}{}",
+                if active.as_deref() == Some(&name) {
+                    " (active)"
+                } else {
+                    ""
+                }
+            );
+            if !meta.description.is_empty() {
+                println!("  {}", meta.description);
+            }
+            let comps = profile::components(&root, &name, config)?;
+            let data = profile::profile_dir(&root, &name).join("data");
+            for comp in comps {
+                let present = data.join(&comp).exists();
+                println!("  {} {comp}", if present { "+" } else { "-" });
+            }
+            let mcp_count = profile::stored_mcp_count(&root, &name);
+            if mcp_count > 0 {
+                println!("  + {mcp_count} user-scope MCP server(s)");
+            }
+            Ok(())
+        }
+        ProfileAction::Diff { name } => {
+            let entries = profile::diff_live(&root, &name, &live, config)?;
+            if entries.is_empty() {
+                println!("live state matches profile {name:?}");
+                return Ok(());
+            }
+            for e in &entries {
+                let tag = match e.state {
+                    diff::DiffState::LocalOnly => "live only   ",
+                    diff::DiffState::OtherOnly => "profile only",
+                    diff::DiffState::Changed => "differs     ",
+                };
+                println!("  {tag} {}", e.rel);
+            }
+            println!(
+                "{} difference(s); `ccsync profile switch {name}` captures live state back when {name:?} is active",
+                entries.len()
+            );
+            Ok(())
+        }
+        ProfileAction::Delete { name } => {
+            profile::delete(&root, &name)?;
+            println!("deleted profile {name:?}");
+            Ok(())
+        }
+        ProfileAction::Rollback => {
+            let msg = profile::rollback(&root, &live, config)?;
+            println!("{msg}");
+            Ok(())
+        }
     }
 }
 
@@ -290,6 +436,11 @@ fn cmd_restore(
         },
         confirm_hooks: config.confirm_hooks && !yes,
         components: if only.is_empty() { None } else { Some(only) },
+        profiles_root: if config.profiles.sync {
+            paths::profiles_dir().ok()
+        } else {
+            None
+        },
     };
     let report = restore::run(&claude, &staging, config, &opts)?;
 
