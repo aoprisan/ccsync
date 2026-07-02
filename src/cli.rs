@@ -77,6 +77,9 @@ pub enum Command {
         only: Vec<String>,
     },
 
+    /// Show how local ~/.claude differs from the staged snapshot.
+    Diff,
+
     /// One-shot: snapshot ~/.claude and write an encrypted archive.
     Export {
         /// Output archive path (e.g. claude-backup.tar.gz.age).

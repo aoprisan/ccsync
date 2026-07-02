@@ -9,6 +9,7 @@ mod archive;
 mod backups;
 mod cli;
 mod config;
+mod diff;
 mod error;
 mod git;
 mod install;
@@ -83,6 +84,7 @@ fn run() -> Result<()> {
             yes,
             only,
         } => cmd_restore(&config, dry_run, no_remap, overwrite, yes, only),
+        Command::Diff => cmd_diff(&config),
         Command::Export {
             file,
             allow_secrets,
@@ -320,6 +322,36 @@ fn cmd_restore(
             report.mcp_servers_restored
         );
     }
+    Ok(())
+}
+
+fn cmd_diff(config: &Config) -> Result<()> {
+    let claude = paths::claude_dir()?;
+    let staging = paths::staging_dir()?;
+    snapshot::require_staged(&staging)?;
+
+    let claude_json = if config.include_mcp_servers {
+        paths::claude_json_file().ok()
+    } else {
+        None
+    };
+    let entries = diff::against_staged(&claude, &staging, config, claude_json)?;
+    if entries.is_empty() {
+        println!("local {} matches the staged snapshot", claude.display());
+        return Ok(());
+    }
+    for e in &entries {
+        let tag = match e.state {
+            diff::DiffState::LocalOnly => "local only   ",
+            diff::DiffState::OtherOnly => "snapshot only",
+            diff::DiffState::Changed => "differs      ",
+        };
+        println!("  {tag} {}", e.rel);
+    }
+    println!(
+        "{} difference(s); `ccsync snapshot` to refresh staging, `ccsync restore` to apply it",
+        entries.len()
+    );
     Ok(())
 }
 
