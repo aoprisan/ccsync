@@ -28,6 +28,14 @@ fn secret_patterns() -> &'static [Regex] {
             r"gh[pousr]_[A-Za-z0-9]{20,}",
             // AWS access key id.
             r"AKIA[0-9A-Z]{16}",
+            // Slack tokens.
+            r"xox[baprs]-[A-Za-z0-9-]{10,}",
+            // Google API keys.
+            r"AIza[0-9A-Za-z_-]{35}",
+            // PEM private key headers.
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+            // JWTs (three dot-separated base64url segments starting with eyJ).
+            r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
             // Generic "token"/"secret"/"password" assigned a long value.
             r#"(?i)(api[_-]?key|secret|token|password)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+\-]{24,}"#,
         ]
@@ -95,6 +103,14 @@ mod tests {
         assert!(scan_for_secrets("sk-abcdefghijklmnopqrstuvwx").is_some());
         assert!(scan_for_secrets("ghp_0123456789abcdefghij0123").is_some());
         assert!(scan_for_secrets(r#"{"api_key": "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"}"#).is_some());
+        assert!(scan_for_secrets("xoxb-123456789012-abcdefghij").is_some());
+        assert!(scan_for_secrets("AIzaSyA1234567890abcdefghijklmnopqrstuv").is_some());
+        assert!(scan_for_secrets("-----BEGIN RSA PRIVATE KEY-----").is_some());
+        assert!(scan_for_secrets("-----BEGIN PRIVATE KEY-----").is_some());
+        assert!(scan_for_secrets(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpM"
+        )
+        .is_some());
     }
 
     #[test]

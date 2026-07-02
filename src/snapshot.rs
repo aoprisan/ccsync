@@ -450,7 +450,24 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
+    // $HOSTNAME is a non-exported shell variable on most Linux systems, so
+    // env vars alone usually yield nothing; ask the OS directly first.
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: buf is a valid, writable buffer of the stated length;
+        // gethostname NUL-terminates on success.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if end > 0 {
+                if let Ok(name) = std::str::from_utf8(&buf[..end]) {
+                    return name.to_string();
+                }
+            }
+        }
+    }
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "unknown".to_string())
