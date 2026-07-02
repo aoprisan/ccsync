@@ -81,7 +81,8 @@ fn run() -> Result<()> {
             no_remap,
             overwrite,
             yes,
-        } => cmd_restore(&config, dry_run, no_remap, overwrite, yes),
+            only,
+        } => cmd_restore(&config, dry_run, no_remap, overwrite, yes, only),
         Command::Export {
             file,
             allow_secrets,
@@ -268,6 +269,7 @@ fn cmd_restore(
     no_remap: bool,
     overwrite: bool,
     yes: bool,
+    only: Vec<String>,
 ) -> Result<()> {
     let claude = paths::claude_dir()?;
     let staging = paths::staging_dir()?;
@@ -285,6 +287,7 @@ fn cmd_restore(
             None
         },
         confirm_hooks: config.confirm_hooks && !yes,
+        components: if only.is_empty() { None } else { Some(only) },
     };
     let report = restore::run(&claude, &staging, config, &opts)?;
 

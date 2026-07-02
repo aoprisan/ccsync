@@ -39,6 +39,10 @@ pub struct RestoreOptions {
     /// carrying them over is remote code execution by config. Interactive runs
     /// prompt; non-interactive runs fail closed (`--yes` disables the check).
     pub confirm_hooks: bool,
+    /// Restrict the restore to these top-level components of the snapshot
+    /// (e.g. `skills`, `settings.json`, `mcp-servers.json`). `None` restores
+    /// everything.
+    pub components: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -73,8 +77,11 @@ pub fn run(
         Vec::new()
     };
 
-    // Surface incoming hook commands before anything is written.
-    if !opts.dry_run && opts.confirm_hooks {
+    let components = opts.components.as_deref();
+
+    // Surface incoming hook commands before anything is written (only when
+    // settings.json is actually in scope).
+    if !opts.dry_run && opts.confirm_hooks && in_scope(components, "settings.json") {
         let new_hooks = incoming_new_hooks(&data_root, claude_dir)?;
         if !new_hooks.is_empty() {
             confirm_hook_install(&new_hooks)?;
@@ -125,45 +132,22 @@ pub fn run(
     };
 
     // Copy staged files into the claude dir.
-    let mut files_written = Vec::new();
-    for entry in WalkDir::new(&apply_root) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(&apply_root).unwrap();
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-
-        // The bundled MCP servers file is not a `~/.claude` file; it is merged
-        // into `~/.claude.json` separately below, not copied into the dir.
-        if rel_str == mcp::MCP_FILE {
-            continue;
-        }
-
-        let dest = claude_dir.join(rel);
-        files_written.push(rel_str.clone());
-
-        if opts.dry_run {
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let is_json_config =
-            opts.merge == MergeMode::Merge && rel_str.ends_with(".json") && dest.exists();
-        if is_json_config {
-            merge_json_file(entry.path(), &dest)?;
-        } else {
-            fs::copy(entry.path(), &dest).with_context(|| format!("writing {}", dest.display()))?;
-        }
-    }
+    let files_written = apply_tree(
+        &apply_root,
+        claude_dir,
+        &ApplyOptions {
+            dry_run: opts.dry_run,
+            merge: opts.merge,
+            components,
+        },
+    )?;
 
     // Merge bundled MCP servers into the local `~/.claude.json`, remapping
     // per-project paths exactly as session directories were remapped above.
     let mut mcp_servers_restored = 0;
     let mut claude_json_backup = None;
     let mcp_staged = data_root.join(mcp::MCP_FILE);
-    if mcp_staged.exists() {
+    if mcp_staged.exists() && in_scope(components, mcp::MCP_FILE) {
         if let Some(claude_json) = &opts.claude_json {
             let doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&mcp_staged)?)
                 .with_context(|| format!("parsing {}", mcp_staged.display()))?;
@@ -202,6 +186,68 @@ pub fn run(
         mcp_servers_restored,
         claude_json_backup,
     })
+}
+
+/// Options for [`apply_tree`], the component-aware copy core shared by full
+/// restores, `restore --only`, and profile switching.
+pub struct ApplyOptions<'a> {
+    pub dry_run: bool,
+    pub merge: MergeMode,
+    /// Restrict application to these top-level components (file or directory
+    /// names) of the source tree. `None` applies everything.
+    pub components: Option<&'a [String]>,
+}
+
+/// True when `name` (a top-level component) is selected by `components`.
+pub fn in_scope(components: Option<&[String]>, name: &str) -> bool {
+    match components {
+        None => true,
+        Some(list) => list.iter().any(|c| c.trim_end_matches('/') == name),
+    }
+}
+
+/// Copy every file of `src_root` into `dest_dir`, deep-merging JSON files in
+/// [`MergeMode::Merge`]. The bundled MCP servers file is skipped (it belongs
+/// in `~/.claude.json`, not `~/.claude`). Returns the relative paths applied,
+/// which in dry-run mode is the list that *would* be written.
+pub fn apply_tree(src_root: &Path, dest_dir: &Path, opts: &ApplyOptions) -> Result<Vec<String>> {
+    let mut files_written = Vec::new();
+    for entry in WalkDir::new(src_root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(src_root).unwrap();
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+        // The bundled MCP servers file is not a `~/.claude` file; it is merged
+        // into `~/.claude.json` separately, not copied into the dir.
+        if rel_str == mcp::MCP_FILE {
+            continue;
+        }
+        let top = rel_str.split('/').next().unwrap_or(&rel_str);
+        if !in_scope(opts.components, top) {
+            continue;
+        }
+
+        let dest = dest_dir.join(rel);
+        files_written.push(rel_str.clone());
+
+        if opts.dry_run {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let is_json_config =
+            opts.merge == MergeMode::Merge && rel_str.ends_with(".json") && dest.exists();
+        if is_json_config {
+            merge_json_file(entry.path(), &dest)?;
+        } else {
+            fs::copy(entry.path(), &dest).with_context(|| format!("writing {}", dest.display()))?;
+        }
+    }
+    Ok(files_written)
 }
 
 /// Hook command strings in the staged settings.json that are not present in
@@ -466,6 +512,7 @@ mod tests {
             merge: MergeMode::Overwrite,
             claude_json: None,
             confirm_hooks: false,
+            components: None,
         };
         let report = run(&dst_claude, &staging, &cfg, &opts).unwrap();
 
@@ -516,6 +563,7 @@ mod tests {
             merge: MergeMode::Overwrite,
             claude_json: None,
             confirm_hooks: false,
+            components: None,
         };
         let dst1 = tmp.path().join("claude-1");
         run(&dst1, &staging, &Config::default(), &opts).unwrap();
@@ -570,6 +618,7 @@ mod tests {
             merge: MergeMode::Merge,
             claude_json: None,
             confirm_hooks: false,
+            components: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -600,6 +649,7 @@ mod tests {
             merge: MergeMode::Overwrite,
             claude_json: None,
             confirm_hooks: false,
+            components: None,
         };
         let claude = tmp.path().join("claude");
 
@@ -620,6 +670,67 @@ mod tests {
         write(&staging.join("data/other.json"), "{}");
         let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
         assert!(err.to_string().contains("integrity"), "got: {err:#}");
+    }
+
+    #[test]
+    fn selective_restore_applies_only_named_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write(&staging.join("data/settings.json"), r#"{"theme":"light"}"#);
+        write(&staging.join("data/skills/review/SKILL.md"), "# skill");
+        write(&staging.join("data/commands/x.md"), "# cmd");
+        write(
+            &staging.join(format!("data/{}", crate::mcp::MCP_FILE)),
+            r#"{"mcpServers":{"fetch":{"command":"uvx"}}}"#,
+        );
+        let mut m = Manifest::new(
+            "h".into(),
+            paths::home_dir().unwrap().to_string_lossy().to_string(),
+        );
+        record_files(&mut m, &staging);
+        m.write_to(&staging).unwrap();
+
+        let claude = tmp.path().join("claude");
+        write(&claude.join("settings.json"), r#"{"theme":"dark"}"#);
+        let claude_json = tmp.path().join(".claude.json");
+        write(&claude_json, "{}");
+
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Merge,
+            claude_json: Some(claude_json.clone()),
+            confirm_hooks: false,
+            components: Some(vec!["skills".into()]),
+        };
+        let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
+
+        // Only the skills component landed.
+        assert!(claude.join("skills/review/SKILL.md").exists());
+        assert!(!claude.join("commands/x.md").exists());
+        assert_eq!(report.files_written, vec!["skills/review/SKILL.md"]);
+        // settings.json untouched, MCP servers not merged.
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(report.mcp_servers_restored, 0);
+        let cj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert!(cj.get("mcpServers").is_none());
+
+        // Selecting the MCP pseudo-component merges servers.
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Merge,
+            claude_json: Some(claude_json.clone()),
+            confirm_hooks: false,
+            components: Some(vec![crate::mcp::MCP_FILE.into()]),
+        };
+        let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
+        assert_eq!(report.mcp_servers_restored, 1);
+        assert!(report.files_written.is_empty());
     }
 
     #[test]
@@ -647,6 +758,7 @@ mod tests {
             merge: MergeMode::Merge,
             claude_json: None,
             confirm_hooks: true,
+            components: None,
         };
         let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
         assert!(err.to_string().contains("hooks"), "got: {err:#}");
@@ -663,6 +775,7 @@ mod tests {
             merge: MergeMode::Merge,
             claude_json: None,
             confirm_hooks: false,
+            components: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
         let local: serde_json::Value =
@@ -678,6 +791,7 @@ mod tests {
             merge: MergeMode::Merge,
             claude_json: None,
             confirm_hooks: true,
+            components: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
     }
@@ -709,6 +823,7 @@ mod tests {
             merge: MergeMode::Merge,
             claude_json: None,
             confirm_hooks: false,
+            components: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -757,6 +872,7 @@ mod tests {
             merge: MergeMode::Merge,
             claude_json: Some(claude_json.clone()),
             confirm_hooks: false,
+            components: None,
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
 

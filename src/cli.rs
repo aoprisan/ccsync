@@ -71,6 +71,10 @@ pub enum Command {
         /// Accept incoming settings.json hook commands without confirmation.
         #[arg(long)]
         yes: bool,
+        /// Restore only these top-level components (comma-separated), e.g.
+        /// `--only skills,commands` or `--only settings.json`.
+        #[arg(long, value_delimiter = ',', value_name = "COMPONENTS")]
+        only: Vec<String>,
     },
 
     /// One-shot: snapshot ~/.claude and write an encrypted archive.
