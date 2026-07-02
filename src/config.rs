@@ -28,6 +28,16 @@ pub struct Config {
     /// scanned, so a server `env` holding an API key aborts the snapshot unless
     /// `--allow-secrets` is passed.
     pub include_mcp_servers: bool,
+    /// How to handle secret-shaped strings found in session transcripts
+    /// (`projects/**/*.jsonl`). Transcripts legitimately discuss secrets, so
+    /// aborting like config files do would make snapshots unusable; the
+    /// default rewrites each matched span to `[REDACTED:ccsync]` in the
+    /// *staged copy only* — source files are never touched.
+    pub transcript_secrets: TranscriptSecrets,
+    /// Require confirmation before a restore installs new hook commands from
+    /// an incoming settings.json. Hooks are arbitrary shell commands that will
+    /// run in Claude Code sessions on this machine.
+    pub confirm_hooks: bool,
     /// Git remote URL used by `push --git` / `pull --git`.
     pub remote: Option<String>,
     /// Explicit path remap pairs applied on restore, in addition to the
@@ -36,6 +46,19 @@ pub struct Config {
     pub remap: BTreeMap<String, String>,
     /// Settings for the background service (`ccsync daemon` / `ccsync service`).
     pub service: ServiceConfig,
+}
+
+/// Policy for secret-shaped strings inside session transcripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptSecrets {
+    /// Replace each match with `[REDACTED:ccsync]` in the staged copy.
+    #[default]
+    Redact,
+    /// Abort the snapshot, exactly like a secret in a config file.
+    Abort,
+    /// Capture transcripts verbatim.
+    Ignore,
 }
 
 /// Where the background service publishes each automatic backup.
@@ -100,9 +123,14 @@ impl Default for Config {
                 "output-styles".into(),
                 "workflows".into(),
                 "themes".into(),
+                // Plugin configuration (the re-fetchable clones under it are
+                // excluded below).
+                "plugins".into(),
                 // Session transcripts + per-repo auto memory. Gated additionally
                 // by `include_sessions`.
                 "projects".into(),
+                // Per-session todo state; travels with the sessions.
+                "todos".into(),
             ],
             exclude: vec![
                 // Sensitive: never sync.
@@ -116,9 +144,17 @@ impl Default for Config {
                 "launcher-settings.json".into(),
                 "policy-limits.json".into(),
                 "remote-settings.json".into(),
+                "settings.local.json".into(),
+                "ide".into(),
+                // Plugin checkouts/caches are large and re-fetchable.
+                "plugins/repos".into(),
+                "plugins/cache".into(),
+                "plugins/marketplaces".into(),
             ],
             include_sessions: true,
             include_mcp_servers: true,
+            transcript_secrets: TranscriptSecrets::default(),
+            confirm_hooks: true,
             remote: None,
             remap: BTreeMap::new(),
             service: ServiceConfig::default(),
@@ -195,8 +231,10 @@ mod tests {
     fn config_roundtrips_toml() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        let mut c = Config::default();
-        c.remote = Some("git@example.com:me/ccsync-data.git".into());
+        let mut c = Config {
+            remote: Some("git@example.com:me/ccsync-data.git".into()),
+            ..Config::default()
+        };
         c.remap.insert("/Users/alice".into(), "/home/alice".into());
         c.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
@@ -240,6 +278,46 @@ mod tests {
             Some(PathBuf::from("/mnt/backups"))
         );
         assert!(loaded.service.allow_secrets);
+    }
+
+    #[test]
+    fn defaults_classify_plugins_todos_and_local_state() {
+        let c = Config::default();
+        // Newly-classified entries: plugin config travels, its checkouts don't.
+        assert!(c.include.iter().any(|i| i == "plugins"));
+        assert!(c.include.iter().any(|i| i == "todos"));
+        assert!(!c.is_excluded("plugins/config.json"));
+        assert!(c.is_excluded("plugins/repos/org/repo/index.js"));
+        assert!(c.is_excluded("plugins/cache/x"));
+        // Machine-local by convention.
+        assert!(c.is_excluded("settings.local.json"));
+        assert!(c.is_excluded("ide/lock"));
+    }
+
+    #[test]
+    fn secret_policy_defaults_and_back_compat() {
+        let c = Config::default();
+        assert_eq!(c.transcript_secrets, TranscriptSecrets::Redact);
+        assert!(c.confirm_hooks);
+
+        // A config written before these fields existed loads the defaults.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.transcript_secrets, TranscriptSecrets::Redact);
+        assert!(loaded.confirm_hooks);
+
+        // And the policy round-trips.
+        let c = Config {
+            transcript_secrets: TranscriptSecrets::Abort,
+            confirm_hooks: false,
+            ..Config::default()
+        };
+        c.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.transcript_secrets, TranscriptSecrets::Abort);
+        assert!(!loaded.confirm_hooks);
     }
 
     #[test]

@@ -68,6 +68,9 @@ pub enum Command {
         /// Replace config files wholesale instead of deep-merging JSON.
         #[arg(long)]
         overwrite: bool,
+        /// Accept incoming settings.json hook commands without confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// One-shot: snapshot ~/.claude and write an encrypted archive.

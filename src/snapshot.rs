@@ -121,7 +121,8 @@ fn build_inner(
     // bytes are read or copied.
     let mut planned = Vec::new();
     for entry in &config.include {
-        if entry == "projects" && !config.include_sessions {
+        // `todos` is per-session state, gated together with the sessions.
+        if (entry == "projects" || entry == "todos") && !config.include_sessions {
             continue;
         }
         let src = claude_dir.join(entry);
@@ -136,7 +137,7 @@ fn build_inner(
         p.start(planned.len() as u64, total_bytes);
     }
     for pf in &planned {
-        capture_file(pf, &data_root, opts, &mut manifest)?;
+        capture_file(pf, &data_root, config, opts, &mut manifest)?;
         if let Some(p) = progress {
             p.advance(pf.size);
         }
@@ -303,16 +304,44 @@ fn plan_path(
 fn capture_file(
     pf: &PlannedFile,
     data_root: &Path,
+    config: &Config,
     opts: &SnapshotOptions,
     manifest: &mut Manifest,
 ) -> Result<()> {
+    use crate::config::TranscriptSecrets;
+
     let abs = pf.abs.as_path();
     let rel = &pf.rel;
 
-    // Secret scan for text configs unless explicitly allowed.
-    if !opts.allow_secrets && is_scanned(abs) {
-        if let Ok(text) = fs::read_to_string(abs) {
-            if let Some(hint) = redact::scan_for_secrets(&text) {
+    let mut bytes = fs::read(abs).with_context(|| format!("reading {}", abs.display()))?;
+
+    // Secret handling unless explicitly allowed. Scanning goes through
+    // `from_utf8_lossy` so a stray invalid byte cannot smuggle an otherwise
+    // ASCII secret past the scan.
+    if !opts.allow_secrets {
+        if is_transcript(abs) {
+            match config.transcript_secrets {
+                TranscriptSecrets::Ignore => {}
+                TranscriptSecrets::Redact => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    if let Some((redacted, n)) = redact::redact_secrets(&text) {
+                        manifest.redacted_spans += n as u64;
+                        // Only the staged copy is rewritten; `abs` is untouched.
+                        bytes = redacted.into_bytes();
+                    }
+                }
+                TranscriptSecrets::Abort => {
+                    if let Some(hint) = redact::scan_for_secrets(&String::from_utf8_lossy(&bytes)) {
+                        return Err(CcError::SecretDetected {
+                            file: rel.clone(),
+                            hint,
+                        }
+                        .into());
+                    }
+                }
+            }
+        } else if is_scanned(abs) {
+            if let Some(hint) = redact::scan_for_secrets(&String::from_utf8_lossy(&bytes)) {
                 return Err(CcError::SecretDetected {
                     file: rel.clone(),
                     hint,
@@ -322,7 +351,8 @@ fn capture_file(
         }
     }
 
-    let bytes = fs::read(abs).with_context(|| format!("reading {}", abs.display()))?;
+    // Hash the (possibly redacted) bytes that actually land in staging, so
+    // restore's integrity check matches.
     let sha256 = hex(&Sha256::digest(&bytes));
     manifest.files.push(FileEntry {
         rel_path: rel.clone(),
@@ -345,6 +375,36 @@ fn is_scanned(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| SCANNED_EXTS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Session transcripts get the redact-don't-abort policy.
+fn is_transcript(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("jsonl"))
+        .unwrap_or(false)
+}
+
+/// Top-level entries of `~/.claude` matched by neither `include` nor
+/// `exclude`. These are silently dropped from snapshots — surfacing them lets
+/// the user classify new Claude Code state instead of losing it unnoticed.
+pub fn unclassified_top_level(claude_dir: &Path, config: &Config) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(claude_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| {
+            !config
+                .include
+                .iter()
+                .any(|i| i.trim_end_matches('/') == name)
+                && !config.is_excluded(name)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -459,6 +519,94 @@ mod tests {
             claude_json: None,
         };
         assert!(build(&claude, &staging, &cfg, &opts).is_ok());
+    }
+
+    #[test]
+    fn redacts_transcript_secrets_in_staged_copy_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        let source = claude.join("projects/-home-a-p/sess.jsonl");
+        let original = "{\"cwd\":\"/home/a/p\",\"paste\":\"sk-abcdefghijklmnopqrstuvwx\"}\n";
+        write(&source, original);
+
+        let cfg = Config::default();
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: None,
+        };
+        let m = build(&claude, &staging, &cfg, &opts).unwrap();
+
+        assert_eq!(m.redacted_spans, 1);
+        let staged =
+            fs::read_to_string(staging.join("data/projects/-home-a-p/sess.jsonl")).unwrap();
+        assert!(!staged.contains("sk-abcdefghijklmnopqrstuvwx"));
+        assert!(staged.contains(crate::redact::REDACTION_MARKER));
+        // The source transcript is untouched.
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
+        // The manifest hash matches the redacted bytes that were staged.
+        let entry = m
+            .files
+            .iter()
+            .find(|f| f.rel_path.ends_with("sess.jsonl"))
+            .unwrap();
+        use sha2::Digest;
+        assert_eq!(entry.sha256, hex(&Sha256::digest(staged.as_bytes())));
+
+        // Abort policy behaves like config files do.
+        let cfg = Config {
+            transcript_secrets: crate::config::TranscriptSecrets::Abort,
+            ..Config::default()
+        };
+        let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
+        assert!(err.to_string().contains("secret"));
+
+        // Ignore policy captures verbatim.
+        let cfg = Config {
+            transcript_secrets: crate::config::TranscriptSecrets::Ignore,
+            ..Config::default()
+        };
+        let m = build(&claude, &staging, &cfg, &opts).unwrap();
+        assert_eq!(m.redacted_spans, 0);
+        let staged =
+            fs::read_to_string(staging.join("data/projects/-home-a-p/sess.jsonl")).unwrap();
+        assert!(staged.contains("sk-abcdefghijklmnopqrstuvwx"));
+    }
+
+    #[test]
+    fn scans_non_utf8_files_via_lossy_decode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        // One invalid byte used to skip the scan entirely; the embedded ASCII
+        // key must still abort the snapshot.
+        let mut bytes = b"{\"k\":\"sk-abcdefghijklmnopqrstuvwx\"}".to_vec();
+        bytes.push(0xFF);
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("settings.json"), &bytes).unwrap();
+
+        let cfg = Config::default();
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: None,
+        };
+        let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
+        assert!(err.to_string().contains("secret"), "got: {err:#}");
+    }
+
+    #[test]
+    fn reports_unclassified_top_level_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        write(&claude.join("settings.json"), "{}");
+        write(&claude.join("statsig/x"), "cache");
+        write(&claude.join("some-new-state/data.json"), "{}");
+
+        let cfg = Config::default();
+        let unclassified = unclassified_top_level(&claude, &cfg);
+        assert_eq!(unclassified, vec!["some-new-state".to_string()]);
     }
 
     #[test]

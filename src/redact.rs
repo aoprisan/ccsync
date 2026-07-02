@@ -51,6 +51,41 @@ pub fn scan_for_secrets(content: &str) -> Option<String> {
     None
 }
 
+/// Marker written in place of a redacted secret.
+pub const REDACTION_MARKER: &str = "[REDACTED:ccsync]";
+
+/// Replace every secret-shaped span in `content` with [`REDACTION_MARKER`].
+/// Returns the rewritten text and the number of spans replaced, or `None`
+/// when nothing matched. Used for session transcripts, where aborting on a
+/// discussed secret would make snapshots unusable.
+pub fn redact_secrets(content: &str) -> Option<(String, usize)> {
+    let mut spans: Vec<std::ops::Range<usize>> = secret_patterns()
+        .iter()
+        .flat_map(|re| re.find_iter(content).map(|m| m.range()))
+        .collect();
+    if spans.is_empty() {
+        return None;
+    }
+    spans.sort_by_key(|r| (r.start, r.end));
+    // Merge overlapping matches from different patterns.
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match merged.last_mut() {
+            Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+            _ => merged.push(span),
+        }
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for span in &merged {
+        out.push_str(&content[cursor..span.start]);
+        out.push_str(REDACTION_MARKER);
+        cursor = span.end;
+    }
+    out.push_str(&content[cursor..]);
+    Some((out, merged.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +101,27 @@ mod tests {
     fn passes_clean_settings() {
         let clean = r#"{"model": "claude-opus-4-8", "theme": "dark"}"#;
         assert!(scan_for_secrets(clean).is_none());
+    }
+
+    #[test]
+    fn redacts_secrets_in_place() {
+        let text = r#"{"cwd":"/home/x","paste":"sk-abcdefghijklmnopqrstuvwx","ok":"clean"}"#;
+        let (out, n) = redact_secrets(text).expect("one span");
+        assert_eq!(n, 1);
+        assert!(!out.contains("sk-abcdefghijklmnopqrstuvwx"));
+        assert!(out.contains(REDACTION_MARKER));
+        // Untouched content survives byte-for-byte.
+        assert!(out.contains(r#""cwd":"/home/x""#));
+        assert!(out.contains(r#""ok":"clean""#));
+
+        // Clean text returns None.
+        assert!(redact_secrets(r#"{"theme":"dark"}"#).is_none());
+
+        // Overlapping matches (generic assignment + key pattern) collapse to
+        // one marker instead of corrupting the text.
+        let overlap = r#"api_key = "sk-abcdefghijklmnopqrstuvwx""#;
+        let (out, _) = redact_secrets(overlap).expect("redacted");
+        assert!(!out.contains("sk-abcdef"));
     }
 
     #[test]

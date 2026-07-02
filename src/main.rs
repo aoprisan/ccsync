@@ -71,14 +71,17 @@ fn run() -> Result<()> {
             dry_run,
             allow_secrets,
         } => cmd_snapshot(&config, dry_run, allow_secrets),
-        Command::Status => cmd_snapshot(&config, true, true),
+        // A true alias for `snapshot --dry-run`: secrets are scanned so status
+        // reports exactly what a real snapshot would do.
+        Command::Status => cmd_snapshot(&config, true, false),
         Command::Push { archive, remote } => cmd_push(&config, archive, remote),
         Command::Pull { archive, remote } => cmd_pull(&config, archive, remote),
         Command::Restore {
             dry_run,
             no_remap,
             overwrite,
-        } => cmd_restore(&config, dry_run, no_remap, overwrite),
+            yes,
+        } => cmd_restore(&config, dry_run, no_remap, overwrite, yes),
         Command::Export {
             file,
             allow_secrets,
@@ -181,11 +184,25 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
             );
         }
     }
+    if m.redacted_spans > 0 {
+        println!(
+            "  {} secret-shaped span(s) redacted from transcripts in the staged copy",
+            m.redacted_spans
+        );
+    }
     if !m.project_roots.is_empty() {
         println!(
             "  {} session project root(s) recorded for remapping",
             m.project_roots.len()
         );
+    }
+    let unclassified = snapshot::unclassified_top_level(&claude, config);
+    if !unclassified.is_empty() {
+        println!(
+            "  warning: not classified by include/exclude (never synced): {}",
+            unclassified.join(", ")
+        );
+        println!("    add them to `include` or `exclude` in the config to silence this");
     }
     if let Some(claude_json) = &opts.claude_json {
         if let Some(doc) = mcp::extract(claude_json)? {
@@ -245,7 +262,13 @@ fn cmd_pull(
     Ok(())
 }
 
-fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) -> Result<()> {
+fn cmd_restore(
+    config: &Config,
+    dry_run: bool,
+    no_remap: bool,
+    overwrite: bool,
+    yes: bool,
+) -> Result<()> {
     let claude = paths::claude_dir()?;
     let staging = paths::staging_dir()?;
     let opts = RestoreOptions {
@@ -261,6 +284,7 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
         } else {
             None
         },
+        confirm_hooks: config.confirm_hooks && !yes,
     };
     let report = restore::run(&claude, &staging, config, &opts)?;
 
