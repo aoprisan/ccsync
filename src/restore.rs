@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
 use crate::config::Config;
+use crate::error::CcError;
 use crate::manifest::Manifest;
 use crate::mcp;
 use crate::paths;
@@ -34,6 +35,7 @@ pub struct RestoreOptions {
     pub claude_json: Option<PathBuf>,
 }
 
+#[derive(Debug)]
 pub struct RestoreReport {
     pub backup_dir: Option<PathBuf>,
     pub files_written: Vec<String>,
@@ -53,6 +55,9 @@ pub fn run(
 ) -> Result<RestoreReport> {
     let data_root = snapshot::require_staged(staging)?;
     let manifest = Manifest::read_from(staging)?;
+
+    // Refuse corrupt/tampered snapshots before anything destructive happens.
+    verify_integrity(&data_root, &manifest)?;
 
     // Compute path mappings.
     let local_home = paths::home_dir()?.to_string_lossy().to_string();
@@ -185,9 +190,61 @@ pub fn run(
     })
 }
 
+/// Verify the staged `data/` tree against the manifest before restore touches
+/// anything: every staged file must appear in the manifest with a matching
+/// SHA-256, every manifest entry must be present, and no path may contain
+/// non-normal components. The remap apply-set is copied from this verified
+/// tree (renames only re-encode dir names), so verifying here covers the copy
+/// loop too.
+fn verify_integrity(data_root: &Path, manifest: &Manifest) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let mut expected: std::collections::BTreeMap<&str, &str> = manifest
+        .files
+        .iter()
+        .map(|f| (f.rel_path.as_str(), f.sha256.as_str()))
+        .collect();
+    for entry in WalkDir::new(data_root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(data_root).unwrap();
+        if !rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(
+                CcError::SnapshotIntegrity(format!("unsafe path {}", rel.display())).into(),
+            );
+        }
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let Some(want) = expected.remove(rel_str.as_str()) else {
+            return Err(CcError::SnapshotIntegrity(format!(
+                "{rel_str} is not listed in the manifest"
+            ))
+            .into());
+        };
+        let bytes = fs::read(entry.path())?;
+        if snapshot::hex(&Sha256::digest(&bytes)) != want {
+            return Err(CcError::SnapshotIntegrity(format!(
+                "{rel_str} does not match its recorded sha256"
+            ))
+            .into());
+        }
+    }
+    if let Some((rel, _)) = expected.into_iter().next() {
+        return Err(CcError::SnapshotIntegrity(format!(
+            "{rel} is listed in the manifest but missing from data/"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Deep-merge the JSON in `incoming` into the JSON at `existing`, writing the
-/// merged result back to `existing`. Objects merge key-by-key; arrays and
-/// scalars from `incoming` win.
+/// merged result back to `existing`. Objects merge key-by-key, scalar arrays
+/// union, everything else from `incoming` wins.
 fn merge_json_file(incoming: &Path, existing: &Path) -> Result<()> {
     let inc: serde_json::Value = serde_json::from_str(&fs::read_to_string(incoming)?)
         .with_context(|| format!("parsing {}", incoming.display()))?;
@@ -199,14 +256,31 @@ fn merge_json_file(incoming: &Path, existing: &Path) -> Result<()> {
 }
 
 fn merge_value(base: &mut serde_json::Value, incoming: serde_json::Value) {
+    use serde_json::Value;
     match (base, incoming) {
-        (serde_json::Value::Object(b), serde_json::Value::Object(i)) => {
+        (Value::Object(b), Value::Object(i)) => {
             for (k, v) in i {
-                merge_value(b.entry(k).or_insert(serde_json::Value::Null), v);
+                merge_value(b.entry(k).or_insert(Value::Null), v);
+            }
+        }
+        // Scalar arrays (e.g. `permissions.allow`) union so locally-added
+        // entries survive a merge; arrays of objects have no identity key to
+        // merge on and are replaced wholesale.
+        (Value::Array(b), Value::Array(i))
+            if b.iter().all(is_scalar) && i.iter().all(is_scalar) =>
+        {
+            for v in i {
+                if !b.contains(&v) {
+                    b.push(v);
+                }
             }
         }
         (b, i) => *b = i,
     }
+}
+
+fn is_scalar(v: &serde_json::Value) -> bool {
+    !v.is_object() && !v.is_array()
 }
 
 /// Recursively copy a directory tree.
@@ -235,6 +309,30 @@ mod tests {
     fn write(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    /// Fill `m.files` with entries for everything under `<staging>/data`, as a
+    /// real snapshot would, so hand-built staging trees pass integrity checks.
+    fn record_files(m: &mut Manifest, staging: &Path) {
+        use sha2::{Digest, Sha256};
+        let data = staging.join("data");
+        for entry in WalkDir::new(&data) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() {
+                let rel = entry
+                    .path()
+                    .strip_prefix(&data)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let bytes = fs::read(entry.path()).unwrap();
+                m.files.push(crate::manifest::FileEntry {
+                    rel_path: rel,
+                    sha256: snapshot::hex(&Sha256::digest(&bytes)),
+                    size: bytes.len() as u64,
+                });
+            }
+        }
     }
 
     #[test]
@@ -316,6 +414,7 @@ mod tests {
             encoded: "-Users-alice-proj".into(),
             decoded_path: "/Users/alice/proj".into(),
         });
+        record_files(&mut m, &staging);
         m.write_to(&staging).unwrap();
 
         let fake_home = tmp.path().join("home-bob");
@@ -362,10 +461,11 @@ mod tests {
             r#"{"model":"opus","env":{"A":"1"}}"#,
         );
         // Minimal manifest so require_staged/read pass.
-        let m = Manifest::new(
+        let mut m = Manifest::new(
             "h".into(),
             paths::home_dir().unwrap().to_string_lossy().to_string(),
         );
+        record_files(&mut m, &staging);
         m.write_to(&staging).unwrap();
 
         let claude = tmp.path().join("claude");
@@ -392,6 +492,86 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tampered_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write(&staging.join("data/settings.json"), r#"{"theme":"dark"}"#);
+        let mut m = Manifest::new(
+            "h".into(),
+            paths::home_dir().unwrap().to_string_lossy().to_string(),
+        );
+        record_files(&mut m, &staging);
+        m.write_to(&staging).unwrap();
+
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Overwrite,
+            claude_json: None,
+        };
+        let claude = tmp.path().join("claude");
+
+        // Content changed after the manifest was written -> hash mismatch.
+        write(&staging.join("data/settings.json"), r#"{"theme":"evil"}"#);
+        let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
+        assert!(err.to_string().contains("integrity"), "got: {err:#}");
+
+        // A file smuggled in without a manifest entry is also refused.
+        write(&staging.join("data/settings.json"), r#"{"theme":"dark"}"#);
+        write(&staging.join("data/extra.json"), "{}");
+        let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
+        assert!(err.to_string().contains("integrity"), "got: {err:#}");
+
+        // A manifest entry with no backing file is refused too.
+        fs::remove_file(staging.join("data/extra.json")).unwrap();
+        fs::remove_file(staging.join("data/settings.json")).unwrap();
+        write(&staging.join("data/other.json"), "{}");
+        let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
+        assert!(err.to_string().contains("integrity"), "got: {err:#}");
+    }
+
+    #[test]
+    fn merge_unions_scalar_arrays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write(
+            &staging.join("data/settings.json"),
+            r#"{"permissions":{"allow":["Bash(git:*)"]},"hooks":[{"a":1}]}"#,
+        );
+        let mut m = Manifest::new(
+            "h".into(),
+            paths::home_dir().unwrap().to_string_lossy().to_string(),
+        );
+        record_files(&mut m, &staging);
+        m.write_to(&staging).unwrap();
+
+        let claude = tmp.path().join("claude");
+        write(
+            &claude.join("settings.json"),
+            r#"{"permissions":{"allow":["Read","Bash(git:*)"]},"hooks":[{"b":2}]}"#,
+        );
+
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Merge,
+            claude_json: None,
+        };
+        run(&claude, &staging, &Config::default(), &opts).unwrap();
+
+        let merged: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
+                .unwrap();
+        // Locally-added scalar entries survive; incoming ones are deduped in.
+        assert_eq!(
+            merged["permissions"]["allow"],
+            serde_json::json!(["Read", "Bash(git:*)"])
+        );
+        // Arrays of objects are still replaced wholesale by the incoming value.
+        assert_eq!(merged["hooks"], serde_json::json!([{"a":1}]));
+    }
+
+    #[test]
     fn restores_mcp_servers_into_claude_json() {
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
@@ -402,10 +582,11 @@ mod tests {
             &data.join(crate::mcp::MCP_FILE),
             r#"{"mcpServers":{"fetch":{"command":"uvx"}}}"#,
         );
-        let m = Manifest::new(
+        let mut m = Manifest::new(
             "h".into(),
             paths::home_dir().unwrap().to_string_lossy().to_string(),
         );
+        record_files(&mut m, &staging);
         m.write_to(&staging).unwrap();
 
         let claude = tmp.path().join("claude");

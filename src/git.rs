@@ -124,10 +124,18 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         std::fs::copy(src, dst)?;
         return Ok(());
     }
-    for entry in WalkDir::new(src) {
+    for entry in WalkDir::new(src).follow_links(false) {
         let entry = entry?;
         if entry.file_type().is_file() {
             let rel = entry.path().strip_prefix(src).unwrap();
+            // The clone contents come from a remote; never let a crafted path
+            // write outside `dst`.
+            if !rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(CcError::Git(format!("unsafe path in repo: {}", rel.display())).into());
+            }
             let target = dst.join(rel);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;

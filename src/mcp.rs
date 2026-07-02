@@ -162,8 +162,9 @@ fn insert_server(target: &mut Map<String, Value>, name: &str, def: &Value, overw
     }
 }
 
-/// Deep-merge `incoming` into `base`; objects merge key-by-key, everything else
-/// is replaced by `incoming`. Mirrors `restore::merge_value`.
+/// Deep-merge `incoming` into `base`; objects merge key-by-key, scalar arrays
+/// union, everything else is replaced by `incoming`. Mirrors
+/// `restore::merge_value`.
 fn merge_value(base: &mut Value, incoming: &Value) {
     match (base, incoming) {
         (Value::Object(b), Value::Object(i)) => {
@@ -171,8 +172,21 @@ fn merge_value(base: &mut Value, incoming: &Value) {
                 merge_value(b.entry(k.clone()).or_insert(Value::Null), v);
             }
         }
+        (Value::Array(b), Value::Array(i))
+            if b.iter().all(is_scalar) && i.iter().all(is_scalar) =>
+        {
+            for v in i {
+                if !b.contains(v) {
+                    b.push(v.clone());
+                }
+            }
+        }
         (b, i) => *b = i.clone(),
     }
+}
+
+fn is_scalar(v: &Value) -> bool {
+    !v.is_object() && !v.is_array()
 }
 
 /// Borrow (creating if needed) a nested object under `key`.
