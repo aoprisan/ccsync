@@ -84,20 +84,35 @@ pub fn run(
         None
     };
 
-    // Apply remapping to the staged data in place (skipped for dry-run since it
-    // mutates staging; mappings are still reported).
-    if !opts.dry_run && opts.remap {
-        remap::apply(&data_root, &mappings)?;
-    }
+    // Remap operates on a temporary copy of the staged data (the "apply set")
+    // so staging itself is never mutated: a pulled snapshot stays reusable for
+    // repeated or later restores. The temp dir lives next to staging so the
+    // copy stays on the same filesystem.
+    // The TempDir handle must stay alive until copying finishes; dropping it
+    // removes the apply set.
+    let mut _apply_tmp = None;
+    let apply_root = if !opts.dry_run && opts.remap && !mappings.is_empty() {
+        let tmp = tempfile::Builder::new()
+            .prefix("ccsync-apply-")
+            .tempdir_in(staging.parent().unwrap_or(staging))
+            .context("creating remap apply-set dir")?;
+        copy_dir(&data_root, tmp.path()).context("copying staged data to apply set")?;
+        remap::apply(tmp.path(), &mappings, &manifest.project_roots)?;
+        let root = tmp.path().to_path_buf();
+        _apply_tmp = Some(tmp);
+        root
+    } else {
+        data_root.clone()
+    };
 
     // Copy staged files into the claude dir.
     let mut files_written = Vec::new();
-    for entry in WalkDir::new(&data_root) {
+    for entry in WalkDir::new(&apply_root) {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
-        let rel = entry.path().strip_prefix(&data_root).unwrap();
+        let rel = entry.path().strip_prefix(&apply_root).unwrap();
         let rel_str = rel.to_string_lossy().replace('\\', "/");
 
         // The bundled MCP servers file is not a `~/.claude` file; it is merged
@@ -285,6 +300,56 @@ mod tests {
         let content = fs::read_to_string(restored_sess).unwrap();
         assert!(content.contains(&new_home_str));
         assert!(!content.contains("/Users/alice"));
+    }
+
+    #[test]
+    fn restore_leaves_staging_untouched_and_is_repeatable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let data = staging.join("data");
+        write(
+            &data.join("projects/-Users-alice-proj/s.jsonl"),
+            "{\"cwd\":\"/Users/alice/proj\"}\n",
+        );
+        let mut m = Manifest::new("h".into(), "/Users/alice".into());
+        m.project_roots.push(crate::manifest::ProjectRoot {
+            encoded: "-Users-alice-proj".into(),
+            decoded_path: "/Users/alice/proj".into(),
+        });
+        m.write_to(&staging).unwrap();
+
+        let fake_home = tmp.path().join("home-bob");
+        fs::create_dir_all(&fake_home).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: true,
+            merge: MergeMode::Overwrite,
+            claude_json: None,
+        };
+        let dst1 = tmp.path().join("claude-1");
+        run(&dst1, &staging, &Config::default(), &opts).unwrap();
+
+        // Staging still holds the original, un-remapped snapshot.
+        let staged = fs::read_to_string(data.join("projects/-Users-alice-proj/s.jsonl")).unwrap();
+        assert!(staged.contains("/Users/alice/proj"), "staging was mutated");
+
+        // A second restore from the same staging produces the same result.
+        let dst2 = tmp.path().join("claude-2");
+        run(&dst2, &staging, &Config::default(), &opts).unwrap();
+        let encoded = paths::encode_path(&fake_home.join("proj"));
+        for dst in [&dst1, &dst2] {
+            let sess = dst.join("projects").join(&encoded).join("s.jsonl");
+            assert!(
+                sess.exists(),
+                "missing remapped session in {}",
+                dst.display()
+            );
+            let content = fs::read_to_string(sess).unwrap();
+            assert!(content.contains(&fake_home.to_string_lossy().to_string()));
+            assert!(!content.contains("/Users/alice"));
+        }
     }
 
     #[test]

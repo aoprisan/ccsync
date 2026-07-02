@@ -145,16 +145,31 @@ fn build_inner(
         p.finish();
     }
 
-    // Record decoded project roots for remapping, even in dry-run.
+    // Record decoded project roots for remapping, even in dry-run. Dashes in
+    // encoded names are ambiguous (separator vs literal), so resolve each name
+    // against the real working directories this machine knows about: the
+    // `projects` keys of `~/.claude.json` first, then the live filesystem,
+    // with the naive decode as a last resort.
     if config.include_sessions {
         let projects = claude_dir.join("projects");
         if projects.is_dir() {
+            let known = known_project_paths(opts.claude_json.as_deref());
             for child in fs::read_dir(&projects)? {
                 let child = child?;
                 if child.file_type()?.is_dir() {
                     let encoded = child.file_name().to_string_lossy().to_string();
+                    let decoded_path = known
+                        .get(&encoded)
+                        .cloned()
+                        .or_else(|| {
+                            paths::resolve_encoded_on_disk(&encoded)
+                                .map(|p| p.to_string_lossy().to_string())
+                        })
+                        .unwrap_or_else(|| {
+                            paths::decode_path(&encoded).to_string_lossy().to_string()
+                        });
                     manifest.project_roots.push(ProjectRoot {
-                        decoded_path: paths::decode_path(&encoded).to_string_lossy().to_string(),
+                        decoded_path,
                         encoded,
                     });
                 }
@@ -174,6 +189,28 @@ fn build_inner(
         manifest.write_to(staging)?;
     }
     Ok(manifest)
+}
+
+/// Map encoded project-directory names to the real working directories listed
+/// in `~/.claude.json`'s `projects` object — the authoritative source, since
+/// Claude Code derived the encoded names from exactly these paths.
+fn known_project_paths(claude_json: Option<&Path>) -> std::collections::BTreeMap<String, String> {
+    let mut known = std::collections::BTreeMap::new();
+    let Some(cj) = claude_json else {
+        return known;
+    };
+    let Ok(text) = fs::read_to_string(cj) else {
+        return known;
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return known;
+    };
+    if let Some(projects) = doc.get("projects").and_then(|p| p.as_object()) {
+        for key in projects.keys() {
+            known.insert(paths::encode_path(Path::new(key)), key.clone());
+        }
+    }
+    known
 }
 
 /// Extract MCP server definitions from `claude_json` and stage them as

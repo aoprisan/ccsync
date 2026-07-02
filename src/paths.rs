@@ -105,6 +105,37 @@ pub fn decode_path(encoded: &str) -> PathBuf {
     PathBuf::from(encoded.replace('-', "/"))
 }
 
+/// Resolve an encoded project-directory name against the live filesystem,
+/// disambiguating dashes that are part of a real directory name from dashes
+/// that encode a separator. Walks from the root trying separator splits first,
+/// so the naive all-separators decode wins when both interpretations exist.
+/// Returns `None` when no split matches an existing directory chain (e.g. the
+/// project was deleted since the session was recorded).
+pub fn resolve_encoded_on_disk(encoded: &str) -> Option<PathBuf> {
+    let rest = encoded.strip_prefix('-')?;
+    let segments: Vec<&str> = rest.split('-').collect();
+
+    fn dfs(base: &Path, segments: &[&str]) -> Option<PathBuf> {
+        if segments.is_empty() {
+            return Some(base.to_path_buf());
+        }
+        for take in 1..=segments.len() {
+            let component = segments[..take].join("-");
+            if component.is_empty() {
+                continue;
+            }
+            let candidate = base.join(&component);
+            if candidate.is_dir() {
+                if let Some(found) = dfs(&candidate, &segments[take..]) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    dfs(Path::new("/"), &segments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +161,26 @@ mod tests {
         let p = Path::new("/var/tmp/work");
         let encoded = encode_path(p);
         assert_eq!(decode_path(&encoded), p);
+    }
+
+    #[test]
+    fn resolves_dashed_dirs_against_the_filesystem() {
+        // A real directory whose name contains a dash: the naive decode of its
+        // encoded form is wrong, but the disk walk recovers the true path.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("my-proj").join("sub");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let encoded = encode_path(&real);
+        assert_ne!(decode_path(&encoded), real, "naive decode should be lossy");
+        assert_eq!(resolve_encoded_on_disk(&encoded), Some(real));
+    }
+
+    #[test]
+    fn resolve_returns_none_for_missing_dirs() {
+        assert_eq!(
+            resolve_encoded_on_disk("-definitely-not-a-real-ccsync-path-xyz"),
+            None
+        );
     }
 }
