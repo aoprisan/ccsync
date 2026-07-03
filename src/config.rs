@@ -54,10 +54,15 @@ pub struct Config {
     pub profiles: ProfilesConfig,
     /// Per-machine additions, keyed by machine id and merged over the base
     /// config at load time on the matching machine (see
-    /// [`Config::with_machine_overrides`]).
+    /// [`Config::with_machine_overrides`]). Skipped when empty so a saved
+    /// config stays hand-editable (no stray `machines = {}` blocking a later
+    /// `[machines.<id>]` table).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub machines: BTreeMap<String, MachineOverrides>,
     /// Read-only shared layers (e.g. a team's skills/commands repo), pulled
     /// with `ccsync layer pull` and applied with `ccsync layer apply`.
+    /// Skipped when empty so `[[layers]]` can be appended by hand.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<LayerConfig>,
 }
 
@@ -480,6 +485,26 @@ mod tests {
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
         assert!(Config::load(&path).unwrap().machines.is_empty());
+    }
+
+    #[test]
+    fn saved_config_accepts_appended_layer_and_machine_tables() {
+        // A default save must not emit empty `machines`/`layers` keys, or a
+        // user appending `[[layers]]` / `[machines.x]` by hand gets duplicate
+        // key errors.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "\n[[layers]]\nname = \"team\"\nremote = \"git@x:y.git\"\ncomponents = [\"skills\"]\n\
+             \n[machines.laptop]\nexclude_extra = [\"projects\"]\n",
+        );
+        std::fs::write(&path, text).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.layers.len(), 1);
+        assert_eq!(loaded.layers[0].name, "team");
+        assert!(loaded.machines.contains_key("laptop"));
     }
 
     #[test]

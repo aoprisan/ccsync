@@ -70,13 +70,17 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
 ```
 
 - **`cli.rs`** — clap subcommand definitions. `main.rs` dispatches them; note
-  `status` is just `snapshot --dry-run`, and `backup` is `snapshot` + `push`.
-  `profile` and `diff` have their own modules below.
+  `status` is just `snapshot --dry-run`, `backup` is `snapshot` + `push`, and
+  `rollback` is `pull --at` + `restore`. `profile`, `diff`, and `layer` have
+  their own modules below.
 - **`config.rs`** — `Config` (TOML at `~/.config/ccsync/config.toml`). The
   `Default` impl *is* the include/exclude policy (the portable-vs-sensitive
   split). `#[serde(default)]` is load-bearing: configs written before a field
   existed must still load, and several tests assert this — preserve it when
-  adding fields.
+  adding fields. `[machines.<id>]` overrides fold in via
+  `with_machine_overrides()` at load; anything that *saves* config must reload
+  from disk first or the folded overrides leak into the base sets (see
+  `cmd_push`). `effective_machine_id()` names this machine's repo subtree.
 - **`paths.rs`** — single source of truth for *all* filesystem locations and for
   the `encode_path`/`decode_path` dash-encoding. Honors `CLAUDE_CONFIG_DIR`.
   ccsync's own files live under `dirs::config_dir()/ccsync/` — that's
@@ -119,12 +123,25 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
   `~/.claude.json` into `mcp-servers.json` inside the snapshot, and merges them
   back on restore. This file is special-cased in `restore.rs` (NOT copied into
   `~/.claude/`). Project `.mcp.json` files are deliberately untouched.
-- **`git.rs`** — shells out to the system `git` binary (no libgit2); caches a
-  clone at `~/.config/ccsync/repo`. **`archive.rs`** — `tar.gz` + `age`
-  encryption, passphrase from `CCSYNC_PASSPHRASE` (no plaintext mode).
+- **`git.rs`** — shells out to the system `git` binary (no libgit2, transports
+  restricted to ssh/https/http/file); caches a clone at
+  `~/.config/ccsync/repo`. Repo layout: one `machines/<machine-id>/` subtree
+  per machine (legacy root snapshots migrate to `machines/default` on first
+  push); pushes align the cache to the remote tip with `reset --hard` (history
+  is disposable, last writer wins per subtree). Also serves `history`
+  (`log`), `machines`, `pull --at` (reset → copy → re-align), and
+  `remote_manifest` for `diff --remote`. **`archive.rs`** — `tar.gz` + `age`
+  encryption, passphrase from `CCSYNC_PASSPHRASE` (no plaintext mode);
+  extraction is per-entry and refuses unsafe paths/links.
+- **`layer.rs`** — read-only shared layers (`[[layers]]` config): `pull`
+  clones/updates under `<config>/ccsync/layers/`, `apply` copies only the
+  declared components into `~/.claude` after credential/secret/hook vetting —
+  a layer repo is untrusted input.
 - **`service.rs`** — `daemon` (foreground loop) + `service install/uninstall/
-  start/stop/status`. `install` writes a systemd user unit / launchd agent;
-  `start` runs detached nohup-style with a pidfile. Pure orchestration over
+  start/stop/status`. `install` writes a systemd user unit / launchd agent
+  (both source `<config>/ccsync/service.env` for secrets); `start` runs
+  detached with an atomically-claimed pidfile, and stop/status verify the PID
+  is really a ccsync process before trusting it. Pure orchestration over
   `snapshot`/`git`/`archive` — keep transport logic out of here.
 - **`tui.rs`** / **`theme.rs`** / **`backups.rs`** — ratatui interactive UI for
   reviewing/browsing/pushing backups.

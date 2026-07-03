@@ -113,9 +113,13 @@ ccsync restore
 | `ccsync snapshot [--dry-run] [--allow-secrets]` | Capture a sanitized snapshot into the staging dir. |
 | `ccsync status` | Show what a snapshot would capture (dry run). |
 | `ccsync push [--remote URL] [--archive FILE]` | Publish the staged snapshot (git by default). |
-| `ccsync pull [--remote URL] [--archive FILE]` | Fetch a snapshot into staging. |
+| `ccsync pull [--remote URL] [--archive FILE] [--from MACHINE] [--at COMMIT]` | Fetch a snapshot into staging (another machine's, or a past commit's). |
 | `ccsync restore [--dry-run] [--no-remap] [--overwrite] [--only COMPONENTS] [--yes]` | Apply the staged snapshot to `~/.claude` (optionally only named components). |
-| `ccsync diff` | Show how local `~/.claude` differs from the staged snapshot. |
+| `ccsync diff [--remote [--from MACHINE]]` | Show how local `~/.claude` differs from the staged snapshot (or the remote's, manifest-only). |
+| `ccsync history [--limit N]` | List snapshot commits on the remote, newest first. |
+| `ccsync machines` | List every machine with a snapshot on the remote. |
+| `ccsync rollback COMMIT [--only COMPONENTS] [--yes]` | Restore `~/.claude` from a past snapshot commit. |
+| `ccsync layer list\|pull\|apply` | Pull and apply read-only shared layers (see [Shared layers](#shared-layers)). |
 | `ccsync export FILE` | One-shot snapshot → encrypted archive. |
 | `ccsync import FILE` | Encrypted archive → staging. |
 | `ccsync backup [--remote URL] [--archive FILE]` | `snapshot` + `push`. |
@@ -172,6 +176,61 @@ include_user_mcp = true
 sync = true
 ```
 
+## Multiple machines, history, and rollback
+
+Each machine owns a `machines/<machine-id>/` subtree in the sync repo, so
+several machines can share one remote without overwriting each other. The
+identity defaults to the hostname and is recorded as `machine_id` in the
+config on your first push (set it yourself to survive hostname changes).
+
+```sh
+ccsync machines                 # who has pushed snapshots, and when
+ccsync pull --from laptop       # deliberately stage another machine's snapshot
+ccsync diff --remote            # how does local state differ from my last push?
+ccsync diff --remote --from laptop   # ...or from another machine's?
+
+ccsync history                  # snapshot commits, newest first
+ccsync pull --at <commit>       # stage the snapshot as of a past commit
+ccsync rollback <commit>        # pull --at + restore in one step
+```
+
+`pull` with no `--from` uses this machine's own subtree (or the only one
+present). Rollback and `pull --at` verify manifest integrity like any other
+restore, so an old or tampered snapshot cannot slip past the checks.
+
+Per-machine config tweaks live under `[machines.<id>]` and fold into the base
+config only on that machine:
+
+```toml
+[machines.laptop]
+exclude_extra = ["projects"]        # don't sync sessions from the laptop
+[machines.laptop.remap]
+"/Volumes/src" = "/home/you/src"
+```
+
+## Shared layers
+
+A layer is a read-only git repo — typically a team's shared `skills/` and
+`commands/` — declared in the config and applied beneath your own state:
+
+```toml
+[[layers]]
+name = "team"
+remote = "git@github.com:acme/claude-shared.git"
+components = ["skills", "commands"]
+```
+
+```sh
+ccsync layer list     # configured layers + checkout state
+ccsync layer pull     # clone/update the checkouts
+ccsync layer apply team
+```
+
+`apply` copies only the declared components and treats the repo as untrusted
+input: credential files are hard-blocked, text files are secret-scanned, and
+a layer `settings.json` that would install new hook commands requires the
+same confirmation as a restore. ccsync never pushes to a layer.
+
 ## Background service
 
 Instead of running `ccsync backup` by hand, you can have ccsync back up
@@ -226,11 +285,12 @@ Each tick builds a sanitized snapshot and publishes it to `destination`:
 **Things to know:**
 
 - **Secrets aren't inherited by the service.** A systemd user unit / launchd
-  agent does not see your shell environment, so the `archive` destination needs
-  `CCSYNC_PASSPHRASE` added to the unit, and the `git` destination needs SSH
-  keys / a credential helper the agent can reach (an HTTPS remote with a stored
-  credential is simplest). `install` prints a reminder; it never writes your
-  secret into the generated unit.
+  agent does not see your shell environment. The installed unit sources
+  `<config>/ccsync/service.env` (optional, create it with mode 600), so the
+  `archive` destination works by putting `CCSYNC_PASSPHRASE=...` there; the
+  `git` destination needs SSH keys / a credential helper the agent can reach
+  (an HTTPS remote with a stored credential is simplest). `install` prints the
+  exact command; ccsync never writes your secret itself.
 - **`allow_secrets = false` (default) makes a tick fail closed** — if a config
   file looks like it contains a secret the snapshot aborts and the error is
   logged; the daemon keeps running and retries next interval.
@@ -291,10 +351,11 @@ transcripts verbatim on a same-path machine.
 `<config>/ccsync/config.toml` (created by `ccsync init`) controls the
 `include`/`exclude` sets, `include_sessions`, `include_mcp_servers`,
 `transcript_secrets` (`"redact"` default / `"abort"` / `"ignore"`),
-`confirm_hooks`, the git `remote`, the `[remap]` table, the `[service]` table
-(see [Background service](#background-service)), and the `[profiles]` table
-(see [Profiles](#profiles)). `CLAUDE_CONFIG_DIR` is honored when locating the
-source directory.
+`confirm_hooks`, the git `remote`, `machine_id`, the `[remap]` table, the
+`[service]` table (see [Background service](#background-service)), the
+`[profiles]` table (see [Profiles](#profiles)), per-machine `[machines.<id>]`
+overrides, and `[[layers]]` entries (see [Shared layers](#shared-layers)).
+`CLAUDE_CONFIG_DIR` is honored when locating the source directory.
 
 > **Where is `<config>`?** All of ccsync's own files (config, staging,
 > backups, repo cache, daemon pid/log) live under your platform config
