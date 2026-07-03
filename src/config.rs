@@ -40,6 +40,10 @@ pub struct Config {
     pub confirm_hooks: bool,
     /// Git remote URL used by `push --git` / `pull --git`.
     pub remote: Option<String>,
+    /// Stable identity for this machine's subtree in the sync repo
+    /// (`machines/<id>/`). Defaults to the hostname and is persisted here on
+    /// the first push so a later hostname change doesn't fork the history.
+    pub machine_id: Option<String>,
     /// Explicit path remap pairs applied on restore, in addition to the
     /// automatic `source_home -> local_home` mapping. Keys are source prefixes,
     /// values are target prefixes.
@@ -193,6 +197,7 @@ impl Default for Config {
             transcript_secrets: TranscriptSecrets::default(),
             confirm_hooks: true,
             remote: None,
+            machine_id: None,
             remap: BTreeMap::new(),
             service: ServiceConfig::default(),
             profiles: ProfilesConfig::default(),
@@ -220,6 +225,32 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(path, text)?;
         Ok(())
+    }
+
+    /// The effective machine identity used for this machine's `machines/<id>/`
+    /// subtree in the sync repo: the configured `machine_id`, else the
+    /// hostname, sanitized to a safe directory name.
+    pub fn effective_machine_id(&self) -> String {
+        let raw = self
+            .machine_id
+            .clone()
+            .unwrap_or_else(crate::snapshot::hostname);
+        let id: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let id = id.trim_matches('.').to_string();
+        if id.is_empty() {
+            "default".to_string()
+        } else {
+            id
+        }
     }
 
     /// True if `rel` (a path relative to `~/.claude`) is excluded by any

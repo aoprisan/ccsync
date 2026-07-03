@@ -35,7 +35,7 @@ pub fn run_once(config: &Config) -> Result<String> {
     match config.service.destination {
         ServiceDestination::Git => {
             let remote = git::resolve_remote(None, config.remote.as_deref())?;
-            git::push(&remote, &staging)?;
+            git::push(&remote, &staging, &config.effective_machine_id())?;
             Ok(format!("pushed {files} files to {remote}"))
         }
         ServiceDestination::Archive => {

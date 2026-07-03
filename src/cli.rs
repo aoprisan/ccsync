@@ -55,6 +55,13 @@ pub enum Command {
         /// Git remote URL (overrides config).
         #[arg(long)]
         remote: Option<String>,
+        /// Pull another machine's snapshot instead of this machine's own
+        /// (see `ccsync machines`).
+        #[arg(long, value_name = "MACHINE")]
+        from: Option<String>,
+        /// Pull the snapshot as of a past commit (see `ccsync history`).
+        #[arg(long, value_name = "COMMIT")]
+        at: Option<String>,
     },
 
     /// Apply the staged snapshot to the local ~/.claude (backs up first).
@@ -79,6 +86,41 @@ pub enum Command {
 
     /// Show how local ~/.claude differs from the staged snapshot.
     Diff,
+
+    /// List snapshot history on the git remote (newest first).
+    History {
+        /// Maximum number of commits to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Git remote URL (overrides config).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// List every machine with a snapshot on the git remote.
+    Machines {
+        /// Git remote URL (overrides config).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Restore ~/.claude from a past snapshot commit (pull --at + restore).
+    Rollback {
+        /// Commit hash from `ccsync history`.
+        commit: String,
+        /// Git remote URL (overrides config).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Roll back to another machine's snapshot at that commit.
+        #[arg(long, value_name = "MACHINE")]
+        from: Option<String>,
+        /// Restore only these top-level components (comma-separated).
+        #[arg(long, value_delimiter = ',', value_name = "COMPONENTS")]
+        only: Vec<String>,
+        /// Accept incoming settings.json hook commands without confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 
     /// One-shot: snapshot ~/.claude and write an encrypted archive.
     Export {

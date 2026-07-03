@@ -76,8 +76,25 @@ fn run() -> Result<()> {
         // A true alias for `snapshot --dry-run`: secrets are scanned so status
         // reports exactly what a real snapshot would do.
         Command::Status => cmd_snapshot(&config, true, false),
-        Command::Push { archive, remote } => cmd_push(&config, archive, remote),
-        Command::Pull { archive, remote } => cmd_pull(&config, archive, remote),
+        Command::Push { archive, remote } => cmd_push(&config_path, config, archive, remote),
+        Command::Pull {
+            archive,
+            remote,
+            from,
+            at,
+        } => cmd_pull(&config, archive, remote, from, at),
+        Command::History { limit, remote } => cmd_history(&config, limit, remote),
+        Command::Machines { remote } => cmd_machines(&config, remote),
+        Command::Rollback {
+            commit,
+            remote,
+            from,
+            only,
+            yes,
+        } => {
+            cmd_pull(&config, None, remote, from, Some(commit))?;
+            cmd_restore(&config, false, false, false, yes, only)
+        }
         Command::Restore {
             dry_run,
             no_remap,
@@ -114,7 +131,7 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             } else {
-                cmd_push(&config, archive, remote)
+                cmd_push(&config_path, config, archive, remote)
             }
         }
         Command::Install => install::install(),
@@ -369,7 +386,8 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
 }
 
 fn cmd_push(
-    config: &Config,
+    config_path: &std::path::Path,
+    mut config: Config,
     archive_path: Option<std::path::PathBuf>,
     remote: Option<String>,
 ) -> Result<()> {
@@ -381,9 +399,18 @@ fn cmd_push(
         archive::create(&staging, &out, &pass)?;
         println!("wrote encrypted archive to {}", out.display());
     } else {
+        // Persist the machine identity on first push so a later hostname
+        // change doesn't fork this machine's history under a new subtree.
+        let machine_id = config.effective_machine_id();
+        if config.machine_id.is_none() {
+            config.machine_id = Some(machine_id.clone());
+            if config.save(config_path).is_ok() {
+                println!("recorded machine_id = {machine_id:?} in the config");
+            }
+        }
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
-        git::push(&remote, &staging)?;
-        println!("pushed snapshot to {remote}");
+        git::push(&remote, &staging, &machine_id)?;
+        println!("pushed snapshot to {remote} (machine {machine_id})");
     }
     Ok(())
 }
@@ -392,22 +419,75 @@ fn cmd_pull(
     config: &Config,
     archive_path: Option<std::path::PathBuf>,
     remote: Option<String>,
+    from: Option<String>,
+    at: Option<String>,
 ) -> Result<()> {
     let staging = paths::staging_dir()?;
 
     if let Some(input) = archive_path {
+        if from.is_some() || at.is_some() {
+            anyhow::bail!("--from/--at select git snapshots and cannot combine with --archive");
+        }
         let pass = archive::passphrase_from_env()?;
         archive::extract(&input, &staging, &pass)?;
         println!("imported snapshot from {}", input.display());
     } else {
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
-        git::pull(&remote, &staging)?;
-        println!("pulled snapshot from {remote}");
+        let own_id = config.effective_machine_id();
+        match &at {
+            Some(commit) => {
+                git::pull_at(&remote, commit, &staging, from.as_deref(), &own_id)?;
+                println!("pulled snapshot at {commit} from {remote}");
+            }
+            None => {
+                git::pull(&remote, &staging, from.as_deref(), &own_id)?;
+                println!("pulled snapshot from {remote}");
+            }
+        }
     }
     println!(
         "  staged at {} — run `ccsync restore` to apply",
         staging.display()
     );
+    Ok(())
+}
+
+fn cmd_history(config: &Config, limit: usize, remote: Option<String>) -> Result<()> {
+    // `git::log` reads the local cache; refresh it from the remote first so
+    // history shows other machines' pushes too.
+    let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
+    git::refresh_cache(&remote)?;
+    let commits = git::log(limit)?;
+    if commits.is_empty() {
+        println!("no snapshot history yet; `ccsync backup` creates the first commit");
+        return Ok(());
+    }
+    for (hash, date, subject) in commits {
+        println!("{hash}  {date}  {subject}");
+    }
+    println!("restore one with `ccsync rollback <commit>` (or `ccsync pull --at <commit>`)");
+    Ok(())
+}
+
+fn cmd_machines(config: &Config, remote: Option<String>) -> Result<()> {
+    let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
+    let own_id = config.effective_machine_id();
+    let machines = git::machines(&remote)?;
+    if machines.is_empty() {
+        println!("no machine snapshots on {remote} yet");
+        return Ok(());
+    }
+    for (name, m) in machines {
+        let marker = if name == own_id { "* " } else { "  " };
+        println!(
+            "{marker}{name}  —  host {}, {} file(s), {}, ccsync {}",
+            m.source_host,
+            m.files.len(),
+            m.created_at,
+            m.ccsync_version
+        );
+    }
+    println!("pull another machine's snapshot with `ccsync pull --from <machine>`");
     Ok(())
 }
 

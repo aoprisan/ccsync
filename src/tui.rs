@@ -347,7 +347,7 @@ fn run_upload_action(action: usize, config: &Config) -> Result<String> {
         0 => {
             stage_fresh_snapshot(config, &staging)?;
             let remote = git::resolve_remote(None, config.remote.as_deref())?;
-            git::push(&remote, &staging)?;
+            git::push(&remote, &staging, &config.effective_machine_id())?;
             Ok(format!("pushed snapshot to {remote}"))
         }
         1 => {
