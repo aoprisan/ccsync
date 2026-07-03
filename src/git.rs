@@ -317,6 +317,24 @@ pub fn refresh_cache(remote: &str) -> Result<()> {
     ensure_clone(remote, &cache)
 }
 
+/// Read a machine's manifest from the remote without transferring snapshot
+/// data into staging. Backs `ccsync diff --remote`.
+pub fn remote_manifest(remote: &str, from: Option<&str>, own_id: &str) -> Result<Manifest> {
+    let cache = repo_cache()?;
+    remote_manifest_with_cache(remote, &cache, from, own_id)
+}
+
+pub(crate) fn remote_manifest_with_cache(
+    remote: &str,
+    cache: &Path,
+    from: Option<&str>,
+    own_id: &str,
+) -> Result<Manifest> {
+    ensure_clone(remote, cache)?;
+    let subtree = select_subtree(cache, from, own_id)?;
+    Manifest::read_from(&subtree)
+}
+
 /// Every machine with a snapshot on the remote, with its manifest (source
 /// host, timestamp, file count, producing version).
 pub fn machines(remote: &str) -> Result<Vec<(String, Manifest)>> {
@@ -577,6 +595,19 @@ mod tests {
         let err =
             pull_at_with_cache(&remote, "--hard", &pulled, &cache, None, "laptop").unwrap_err();
         assert!(err.to_string().contains("invalid commit"), "got: {err:#}");
+    }
+
+    #[test]
+    fn remote_manifest_reads_without_touching_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&tmp.path().join("remote.git"));
+        let staging = tmp.path().join("staging");
+        write_staging(&staging, "content");
+        push_with_cache(&remote, &staging, &tmp.path().join("cache"), "laptop").unwrap();
+
+        let m = remote_manifest_with_cache(&remote, &tmp.path().join("cache-2"), None, "laptop")
+            .unwrap();
+        assert_eq!(m.source_host, "test-host");
     }
 
     #[test]

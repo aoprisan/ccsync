@@ -65,7 +65,9 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let config_path = paths::config_file()?;
-    let config = Config::load(&config_path)?;
+    // `[machines.<id>]` overrides are folded in here for every command; code
+    // that persists config must reload from disk first (see cmd_push).
+    let config = Config::load(&config_path)?.with_machine_overrides();
 
     match cli.command {
         Command::Init { remote } => cmd_init(&config_path, config, remote),
@@ -102,7 +104,7 @@ fn run() -> Result<()> {
             yes,
             only,
         } => cmd_restore(&config, dry_run, no_remap, overwrite, yes, only),
-        Command::Diff => cmd_diff(&config),
+        Command::Diff { remote, from } => cmd_diff(&config, remote, from),
         Command::Export {
             file,
             allow_secrets,
@@ -387,7 +389,7 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
 
 fn cmd_push(
     config_path: &std::path::Path,
-    mut config: Config,
+    config: Config,
     archive_path: Option<std::path::PathBuf>,
     remote: Option<String>,
 ) -> Result<()> {
@@ -401,11 +403,15 @@ fn cmd_push(
     } else {
         // Persist the machine identity on first push so a later hostname
         // change doesn't fork this machine's history under a new subtree.
+        // Saved from a freshly-loaded config: `config` has machine overrides
+        // folded in and must never be written back.
         let machine_id = config.effective_machine_id();
         if config.machine_id.is_none() {
-            config.machine_id = Some(machine_id.clone());
-            if config.save(config_path).is_ok() {
-                println!("recorded machine_id = {machine_id:?} in the config");
+            if let Ok(mut fresh) = Config::load(config_path) {
+                fresh.machine_id = Some(machine_id.clone());
+                if fresh.save(config_path).is_ok() {
+                    println!("recorded machine_id = {machine_id:?} in the config");
+                }
             }
         }
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
@@ -556,19 +562,34 @@ fn cmd_restore(
     Ok(())
 }
 
-fn cmd_diff(config: &Config) -> Result<()> {
+fn cmd_diff(config: &Config, remote: bool, from: Option<String>) -> Result<()> {
     let claude = paths::claude_dir()?;
     let staging = paths::staging_dir()?;
-    snapshot::require_staged(&staging)?;
 
     let claude_json = if config.include_mcp_servers {
         paths::claude_json_file().ok()
     } else {
         None
     };
-    let entries = diff::against_staged(&claude, &staging, config, claude_json)?;
+    let (entries, other_label) = if remote {
+        let url = git::resolve_remote(None, config.remote.as_deref())?;
+        let manifest = git::remote_manifest(&url, from.as_deref(), &config.effective_machine_id())?;
+        let label = from
+            .map(|m| format!("remote snapshot of {m:?}"))
+            .unwrap_or_else(|| "remote snapshot".to_string());
+        (
+            diff::against_manifest(&claude, &staging, config, claude_json, &manifest)?,
+            label,
+        )
+    } else {
+        snapshot::require_staged(&staging)?;
+        (
+            diff::against_staged(&claude, &staging, config, claude_json)?,
+            "staged snapshot".to_string(),
+        )
+    };
     if entries.is_empty() {
-        println!("local {} matches the staged snapshot", claude.display());
+        println!("local {} matches the {other_label}", claude.display());
         return Ok(());
     }
     for e in &entries {
@@ -580,7 +601,7 @@ fn cmd_diff(config: &Config) -> Result<()> {
         println!("  {tag} {}", e.rel);
     }
     println!(
-        "{} difference(s); `ccsync snapshot` to refresh staging, `ccsync restore` to apply it",
+        "{} difference(s) vs the {other_label}; `ccsync snapshot` refreshes staging, `ccsync restore` applies it",
         entries.len()
     );
     Ok(())

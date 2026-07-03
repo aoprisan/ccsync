@@ -84,8 +84,17 @@ pub enum Command {
         only: Vec<String>,
     },
 
-    /// Show how local ~/.claude differs from the staged snapshot.
-    Diff,
+    /// Show how local ~/.claude differs from the staged snapshot (or, with
+    /// --remote, from the latest snapshot on the git remote).
+    Diff {
+        /// Compare against the remote's manifest instead of local staging
+        /// (only the manifest is fetched, no snapshot data).
+        #[arg(long)]
+        remote: bool,
+        /// With --remote: compare against another machine's snapshot.
+        #[arg(long, value_name = "MACHINE", requires = "remote")]
+        from: Option<String>,
+    },
 
     /// List snapshot history on the git remote (newest first).
     History {

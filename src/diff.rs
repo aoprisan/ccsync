@@ -42,6 +42,19 @@ pub fn against_staged(
     claude_json: Option<std::path::PathBuf>,
 ) -> Result<Vec<DiffEntry>> {
     let staged = Manifest::read_from(staging)?;
+    against_manifest(claude_dir, staging, config, claude_json, &staged)
+}
+
+/// Diff the local `~/.claude` (as a snapshot would capture it) against an
+/// arbitrary manifest — e.g. one read from the remote, so `diff --remote`
+/// needs no data transfer beyond the manifest itself.
+pub fn against_manifest(
+    claude_dir: &Path,
+    staging: &Path,
+    config: &Config,
+    claude_json: Option<std::path::PathBuf>,
+    other: &Manifest,
+) -> Result<Vec<DiffEntry>> {
     let opts = SnapshotOptions {
         dry_run: true,
         allow_secrets: false,
@@ -51,7 +64,7 @@ pub fn against_staged(
     let local = snapshot::build(claude_dir, staging, config, &opts)?;
     Ok(diff_manifest_maps(
         &hash_map_of(&local),
-        &hash_map_of(&staged),
+        &hash_map_of(other),
     ))
 }
 

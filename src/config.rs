@@ -52,6 +52,23 @@ pub struct Config {
     pub service: ServiceConfig,
     /// Settings for named profiles (`ccsync profile ...`).
     pub profiles: ProfilesConfig,
+    /// Per-machine additions, keyed by machine id and merged over the base
+    /// config at load time on the matching machine (see
+    /// [`Config::with_machine_overrides`]).
+    pub machines: BTreeMap<String, MachineOverrides>,
+}
+
+/// Extra include/exclude/remap entries that apply on one machine only, e.g.
+/// `[machines.laptop]` with `exclude_extra = ["projects"]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MachineOverrides {
+    /// Appended to `include`.
+    pub include_extra: Vec<String>,
+    /// Appended to `exclude` (exclusion wins over inclusion, as always).
+    pub exclude_extra: Vec<String>,
+    /// Merged into `[remap]` (machine entry wins on conflicts).
+    pub remap: BTreeMap<String, String>,
 }
 
 /// Configuration for named profiles: which parts of `~/.claude` a profile
@@ -201,6 +218,7 @@ impl Default for Config {
             remap: BTreeMap::new(),
             service: ServiceConfig::default(),
             profiles: ProfilesConfig::default(),
+            machines: BTreeMap::new(),
         }
     }
 }
@@ -251,6 +269,27 @@ impl Config {
         } else {
             id
         }
+    }
+
+    /// Fold this machine's `[machines.<id>]` overrides into the base config.
+    /// Callers must NOT save the result back to disk — the overrides would be
+    /// baked into the base sets; persist from a freshly-loaded copy instead.
+    pub fn with_machine_overrides(mut self) -> Self {
+        let id = self.effective_machine_id();
+        if let Some(overrides) = self.machines.get(&id).cloned() {
+            for inc in overrides.include_extra {
+                if !self.include.contains(&inc) {
+                    self.include.push(inc);
+                }
+            }
+            for exc in overrides.exclude_extra {
+                if !self.exclude.contains(&exc) {
+                    self.exclude.push(exc);
+                }
+            }
+            self.remap.extend(overrides.remap);
+        }
+        self
     }
 
     /// True if `rel` (a path relative to `~/.claude`) is excluded by any
@@ -387,6 +426,55 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.transcript_secrets, TranscriptSecrets::Abort);
         assert!(!loaded.confirm_hooks);
+    }
+
+    #[test]
+    fn machine_overrides_fold_in_only_for_matching_id() {
+        let mut c = Config {
+            machine_id: Some("laptop".into()),
+            ..Config::default()
+        };
+        c.machines.insert(
+            "laptop".into(),
+            MachineOverrides {
+                include_extra: vec!["extra-dir".into()],
+                exclude_extra: vec!["projects".into()],
+                remap: [("/a".to_string(), "/b".to_string())].into(),
+            },
+        );
+        c.machines.insert(
+            "other".into(),
+            MachineOverrides {
+                include_extra: vec!["never-here".into()],
+                ..Default::default()
+            },
+        );
+
+        let effective = c.with_machine_overrides();
+        assert!(effective.include.iter().any(|i| i == "extra-dir"));
+        assert!(!effective.include.iter().any(|i| i == "never-here"));
+        assert!(effective.is_excluded("projects/x/s.jsonl"));
+        assert_eq!(effective.remap.get("/a").map(String::as_str), Some("/b"));
+
+        // Back-compat: configs without [machines] load fine.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
+        assert!(Config::load(&path).unwrap().machines.is_empty());
+    }
+
+    #[test]
+    fn effective_machine_id_sanitizes() {
+        let c = Config {
+            machine_id: Some("Al's MacBook Pro!".into()),
+            ..Config::default()
+        };
+        assert_eq!(c.effective_machine_id(), "Al-s-MacBook-Pro-");
+        let c = Config {
+            machine_id: Some("...".into()),
+            ..Config::default()
+        };
+        assert_eq!(c.effective_machine_id(), "default");
     }
 
     #[test]
