@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ProjectRoot};
 use crate::paths;
 
 /// A single prefix translation: any absolute path beginning with `from` is
@@ -54,7 +54,11 @@ pub fn build_mappings(
 }
 
 /// Apply `mappings` to the staged `data/projects` tree in place.
-pub fn apply(data_root: &Path, mappings: &[Mapping]) -> Result<()> {
+///
+/// `project_roots` (from the manifest) is the authoritative encoded → decoded
+/// table recorded on the source machine, where the real paths were known.
+/// Falling back to `paths::decode_path` is lossy for paths containing dashes.
+pub fn apply(data_root: &Path, mappings: &[Mapping], project_roots: &[ProjectRoot]) -> Result<()> {
     if mappings.is_empty() {
         return Ok(());
     }
@@ -63,13 +67,23 @@ pub fn apply(data_root: &Path, mappings: &[Mapping]) -> Result<()> {
         return Ok(());
     }
 
+    // Transcripts also reference project dirs by their encoded names, so each
+    // mapping is applied in raw form and in dash-encoded form.
+    let encoded_mappings: Vec<Mapping> = mappings
+        .iter()
+        .map(|m| Mapping {
+            from: paths::encode_path(Path::new(&m.from)),
+            to: paths::encode_path(Path::new(&m.to)),
+        })
+        .collect();
+
     // 1. Rewrite transcript contents.
     for entry in walkdir::WalkDir::new(&projects) {
         let entry = entry?;
         if entry.file_type().is_file()
             && entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl")
         {
-            rewrite_file(entry.path(), mappings)
+            rewrite_file(entry.path(), mappings, &encoded_mappings)
                 .with_context(|| format!("remapping {}", entry.path().display()))?;
         }
     }
@@ -82,7 +96,11 @@ pub fn apply(data_root: &Path, mappings: &[Mapping]) -> Result<()> {
             continue;
         }
         let encoded = child.file_name().to_string_lossy().to_string();
-        let decoded = paths::decode_path(&encoded).to_string_lossy().to_string();
+        let decoded = project_roots
+            .iter()
+            .find(|r| r.encoded == encoded)
+            .map(|r| r.decoded_path.clone())
+            .unwrap_or_else(|| paths::decode_path(&encoded).to_string_lossy().to_string());
         if let Some(new_decoded) = remap_str(&decoded, mappings) {
             let new_encoded = paths::encode_path(Path::new(&new_decoded));
             if new_encoded != encoded {
@@ -103,19 +121,80 @@ pub fn apply(data_root: &Path, mappings: &[Mapping]) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite every mapped prefix occurrence in a file's text content.
-fn rewrite_file(path: &Path, mappings: &[Mapping]) -> Result<()> {
+/// Rewrite every mapped prefix occurrence in a file's text content. Matches
+/// must end at a path boundary so remapping `/Users/alice` leaves the sibling
+/// `/Users/alice2` (and `-Users-alice2` in encoded form) untouched.
+fn rewrite_file(path: &Path, raw: &[Mapping], encoded: &[Mapping]) -> Result<()> {
     let content = fs::read_to_string(path)?;
     let mut out = content.clone();
-    for m in mappings {
-        if out.contains(&m.from) {
-            out = out.replace(&m.from, &m.to);
+    for m in raw {
+        if let Some(replaced) = replace_bounded(&out, &m.from, &m.to, raw_boundary) {
+            out = replaced;
+        }
+    }
+    for m in encoded {
+        if let Some(replaced) = replace_bounded(&out, &m.from, &m.to, encoded_boundary) {
+            out = replaced;
         }
     }
     if out != content {
         fs::write(path, out)?;
     }
     Ok(())
+}
+
+/// Characters that may legally follow a raw absolute-path prefix.
+fn raw_boundary(c: char) -> bool {
+    matches!(c, '/' | '\\' | '"' | '\'') || c.is_whitespace()
+}
+
+/// Characters that may legally follow a dash-encoded path prefix (dash is the
+/// separator in that form).
+fn encoded_boundary(c: char) -> bool {
+    matches!(c, '-' | '"' | '\'') || c.is_whitespace()
+}
+
+/// True for characters that belong to a path component; a match preceded by
+/// one of these starts mid-component and must not be rewritten.
+fn component_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '.')
+}
+
+/// Replace occurrences of `from` with `to` where the match is not preceded by
+/// a component character and is followed by a boundary character (or ends the
+/// text). Returns `None` when nothing matched.
+fn replace_bounded(
+    text: &str,
+    from: &str,
+    to: &str,
+    boundary: impl Fn(char) -> bool,
+) -> Option<String> {
+    if from.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut last = 0;
+    let mut search = 0;
+    while let Some(pos) = text[search..].find(from) {
+        let start = search + pos;
+        let end = start + from.len();
+        let prev_ok = !text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(component_char);
+        let next_ok = text[end..].chars().next().map(&boundary).unwrap_or(true);
+        if prev_ok && next_ok {
+            out.push_str(&text[last..start]);
+            out.push_str(to);
+            last = end;
+        }
+        search = end;
+    }
+    if last == 0 {
+        return None;
+    }
+    out.push_str(&text[last..]);
+    Some(out)
 }
 
 /// Apply the first matching prefix mapping to a single path string, returning
@@ -179,7 +258,7 @@ mod tests {
         let mappings = build_mappings(&manifest, "/home/bob", &Default::default());
         // sanity: also exercise explicit override path
         let _ = &mut manifest;
-        apply(&data, &mappings).unwrap();
+        apply(&data, &mappings, &[]).unwrap();
 
         // Directory renamed to the new home.
         let new_dir = data.join("projects/-home-bob-proj");
@@ -198,8 +277,67 @@ mod tests {
             &data.join("projects/-home-x-p/s.jsonl"),
             "{\"cwd\":\"/home/x/p\"}\n",
         );
-        apply(&data, &[]).unwrap();
+        apply(&data, &[], &[]).unwrap();
         assert!(data.join("projects/-home-x-p/s.jsonl").exists());
+    }
+
+    #[test]
+    fn rewrite_respects_path_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let sess = data.join("projects/-Users-alice-proj/s.jsonl");
+        write(
+            &sess,
+            concat!(
+                "{\"cwd\":\"/Users/alice/proj\",",
+                "\"other\":\"/Users/alice2/proj\",",
+                "\"enc\":\"-Users-alice-proj\",",
+                "\"enc2\":\"-Users-alice2-proj\",",
+                "\"home\":\"/Users/alice\"}\n",
+            ),
+        );
+
+        let manifest = Manifest::new("h".into(), "/Users/alice".into());
+        let mappings = build_mappings(&manifest, "/home/bob", &Default::default());
+        apply(&data, &mappings, &[]).unwrap();
+
+        let content = fs::read_to_string(data.join("projects/-home-bob-proj/s.jsonl")).unwrap();
+        // The sibling user `/Users/alice2` (and its encoded form) is untouched.
+        assert!(content.contains("\"other\":\"/Users/alice2/proj\""));
+        assert!(content.contains("\"enc2\":\"-Users-alice2-proj\""));
+        // The real home refs are rewritten in both forms, including a bare
+        // home path terminated by a quote.
+        assert!(content.contains("\"cwd\":\"/home/bob/proj\""));
+        assert!(content.contains("\"enc\":\"-home-bob-proj\""));
+        assert!(content.contains("\"home\":\"/home/bob\""));
+    }
+
+    #[test]
+    fn manifest_roots_drive_dashed_dir_renames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        // A project whose real path contains a dash: naive decode would read
+        // this dir as /Users/alice/my/proj and an explicit mapping for the
+        // real path would never match.
+        write(
+            &data.join("projects/-Users-alice-my-proj/s.jsonl"),
+            "{\"cwd\":\"/Users/alice/my-proj\"}\n",
+        );
+
+        let manifest = Manifest::new("h".into(), "/Users/alice".into());
+        let mappings = build_mappings(&manifest, "/home/bob", &Default::default());
+        let roots = [ProjectRoot {
+            encoded: "-Users-alice-my-proj".into(),
+            decoded_path: "/Users/alice/my-proj".into(),
+        }];
+        apply(&data, &mappings, &roots).unwrap();
+
+        // Renamed using the authoritative decoded path, so dir name and the
+        // rewritten cwd stay in sync.
+        let new_dir = data.join("projects/-home-bob-my-proj");
+        assert!(new_dir.exists(), "expected dash-aware rename");
+        let content = fs::read_to_string(new_dir.join("s.jsonl")).unwrap();
+        assert!(content.contains("\"cwd\":\"/home/bob/my-proj\""));
     }
 
     #[test]

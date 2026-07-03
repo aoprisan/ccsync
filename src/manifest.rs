@@ -31,6 +31,10 @@ pub struct Manifest {
     /// One entry per captured session project directory, recording the encoded
     /// directory name and the decoded absolute working directory it represents.
     pub project_roots: Vec<ProjectRoot>,
+    /// Number of secret-shaped spans redacted from transcripts in the staged
+    /// copy (informational; absent in pre-redaction manifests).
+    #[serde(default)]
+    pub redacted_spans: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +67,7 @@ impl Manifest {
             created_at: chrono::Utc::now().to_rfc3339(),
             files: Vec::new(),
             project_roots: Vec::new(),
+            redacted_spans: 0,
         }
     }
 

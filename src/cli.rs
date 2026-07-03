@@ -55,6 +55,13 @@ pub enum Command {
         /// Git remote URL (overrides config).
         #[arg(long)]
         remote: Option<String>,
+        /// Pull another machine's snapshot instead of this machine's own
+        /// (see `ccsync machines`).
+        #[arg(long, value_name = "MACHINE")]
+        from: Option<String>,
+        /// Pull the snapshot as of a past commit (see `ccsync history`).
+        #[arg(long, value_name = "COMMIT")]
+        at: Option<String>,
     },
 
     /// Apply the staged snapshot to the local ~/.claude (backs up first).
@@ -68,6 +75,60 @@ pub enum Command {
         /// Replace config files wholesale instead of deep-merging JSON.
         #[arg(long)]
         overwrite: bool,
+        /// Accept incoming settings.json hook commands without confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Restore only these top-level components (comma-separated), e.g.
+        /// `--only skills,commands` or `--only settings.json`.
+        #[arg(long, value_delimiter = ',', value_name = "COMPONENTS")]
+        only: Vec<String>,
+    },
+
+    /// Show how local ~/.claude differs from the staged snapshot (or, with
+    /// --remote, from the latest snapshot on the git remote).
+    Diff {
+        /// Compare against the remote's manifest instead of local staging
+        /// (only the manifest is fetched, no snapshot data).
+        #[arg(long)]
+        remote: bool,
+        /// With --remote: compare against another machine's snapshot.
+        #[arg(long, value_name = "MACHINE", requires = "remote")]
+        from: Option<String>,
+    },
+
+    /// List snapshot history on the git remote (newest first).
+    History {
+        /// Maximum number of commits to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Git remote URL (overrides config).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// List every machine with a snapshot on the git remote.
+    Machines {
+        /// Git remote URL (overrides config).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Restore ~/.claude from a past snapshot commit (pull --at + restore).
+    Rollback {
+        /// Commit hash from `ccsync history`.
+        commit: String,
+        /// Git remote URL (overrides config).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Roll back to another machine's snapshot at that commit.
+        #[arg(long, value_name = "MACHINE")]
+        from: Option<String>,
+        /// Restore only these top-level components (comma-separated).
+        #[arg(long, value_delimiter = ',', value_name = "COMPONENTS")]
+        only: Vec<String>,
+        /// Accept incoming settings.json hook commands without confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// One-shot: snapshot ~/.claude and write an encrypted archive.
@@ -120,6 +181,71 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// Manage named profiles: overlays of settings, memory, agents, skills,
+    /// commands, and user-scope MCP servers over the shared base state.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+
+    /// Manage read-only shared layers ([[layers]] in the config), e.g. a
+    /// team's skills/commands repo.
+    Layer {
+        #[command(subcommand)]
+        action: LayerAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LayerAction {
+    /// List configured layers and their checkout state.
+    List,
+    /// Clone or update the checkout of one layer (or all configured layers).
+    Pull { name: Option<String> },
+    /// Copy a layer's declared components into ~/.claude (scanned and
+    /// hook-gated like a restore).
+    Apply {
+        name: String,
+        /// Accept the layer's settings.json hook commands without confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Apply even if layer files look like they contain secrets.
+        #[arg(long)]
+        allow_secrets: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProfileAction {
+    /// List profiles (the active one is marked).
+    List,
+    /// Create a new profile.
+    Create {
+        name: String,
+        /// Capture the current ~/.claude components into the new profile.
+        #[arg(long)]
+        from_current: bool,
+        /// Free-form description shown by `profile list`/`show`.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Capture the active profile's live edits, then swap in this profile's
+    /// components (previous state is backed up; use rollback to revert).
+    Switch {
+        name: String,
+        /// Accept the profile's settings.json hook commands without confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show a profile's description, components, and stored MCP servers.
+    Show { name: String },
+    /// Show how live ~/.claude components differ from a profile's store.
+    Diff { name: String },
+    /// Delete a profile's store (refused while it is active).
+    Delete { name: String },
+    /// Revert the last switch.
+    Rollback,
 }
 
 #[derive(Subcommand)]

@@ -70,6 +70,27 @@ pub fn backups_dir() -> Result<PathBuf, CcError> {
     Ok(base.join("ccsync").join("backups"))
 }
 
+/// ccsync's profile store: `<config>/ccsync/profiles/<name>/{profile.toml,
+/// data/,mcp-servers.json}` plus `active.json` marking the active profile.
+pub fn profiles_dir() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("profiles"))
+}
+
+/// Checkouts of read-only shared layers: `<config>/ccsync/layers/<name>/`.
+pub fn layers_dir() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("layers"))
+}
+
+/// Environment file the installed service sources for secrets the service
+/// manager does not inherit (notably `CCSYNC_PASSPHRASE`):
+/// `<config>/ccsync/service.env`. Created by the user, never by ccsync.
+pub fn service_env_file() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("service.env"))
+}
+
 /// PID file for a detached daemon started with `ccsync service start`:
 /// `<config>/ccsync/daemon.pid`.
 pub fn daemon_pidfile() -> Result<PathBuf, CcError> {
@@ -105,6 +126,37 @@ pub fn decode_path(encoded: &str) -> PathBuf {
     PathBuf::from(encoded.replace('-', "/"))
 }
 
+/// Resolve an encoded project-directory name against the live filesystem,
+/// disambiguating dashes that are part of a real directory name from dashes
+/// that encode a separator. Walks from the root trying separator splits first,
+/// so the naive all-separators decode wins when both interpretations exist.
+/// Returns `None` when no split matches an existing directory chain (e.g. the
+/// project was deleted since the session was recorded).
+pub fn resolve_encoded_on_disk(encoded: &str) -> Option<PathBuf> {
+    let rest = encoded.strip_prefix('-')?;
+    let segments: Vec<&str> = rest.split('-').collect();
+
+    fn dfs(base: &Path, segments: &[&str]) -> Option<PathBuf> {
+        if segments.is_empty() {
+            return Some(base.to_path_buf());
+        }
+        for take in 1..=segments.len() {
+            let component = segments[..take].join("-");
+            if component.is_empty() {
+                continue;
+            }
+            let candidate = base.join(&component);
+            if candidate.is_dir() {
+                if let Some(found) = dfs(&candidate, &segments[take..]) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    dfs(Path::new("/"), &segments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +182,26 @@ mod tests {
         let p = Path::new("/var/tmp/work");
         let encoded = encode_path(p);
         assert_eq!(decode_path(&encoded), p);
+    }
+
+    #[test]
+    fn resolves_dashed_dirs_against_the_filesystem() {
+        // A real directory whose name contains a dash: the naive decode of its
+        // encoded form is wrong, but the disk walk recovers the true path.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("my-proj").join("sub");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let encoded = encode_path(&real);
+        assert_ne!(decode_path(&encoded), real, "naive decode should be lossy");
+        assert_eq!(resolve_encoded_on_disk(&encoded), Some(real));
+    }
+
+    #[test]
+    fn resolve_returns_none_for_missing_dirs() {
+        assert_eq!(
+            resolve_encoded_on_disk("-definitely-not-a-real-ccsync-path-xyz"),
+            None
+        );
     }
 }

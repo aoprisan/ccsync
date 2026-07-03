@@ -9,12 +9,15 @@ mod archive;
 mod backups;
 mod cli;
 mod config;
+mod diff;
 mod error;
 mod git;
 mod install;
+mod layer;
 mod manifest;
 mod mcp;
 mod paths;
+mod profile;
 mod redact;
 mod remap;
 mod restore;
@@ -63,7 +66,9 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let config_path = paths::config_file()?;
-    let config = Config::load(&config_path)?;
+    // `[machines.<id>]` overrides are folded in here for every command; code
+    // that persists config must reload from disk first (see cmd_push).
+    let config = Config::load(&config_path)?.with_machine_overrides();
 
     match cli.command {
         Command::Init { remote } => cmd_init(&config_path, config, remote),
@@ -71,14 +76,36 @@ fn run() -> Result<()> {
             dry_run,
             allow_secrets,
         } => cmd_snapshot(&config, dry_run, allow_secrets),
-        Command::Status => cmd_snapshot(&config, true, true),
-        Command::Push { archive, remote } => cmd_push(&config, archive, remote),
-        Command::Pull { archive, remote } => cmd_pull(&config, archive, remote),
+        // A true alias for `snapshot --dry-run`: secrets are scanned so status
+        // reports exactly what a real snapshot would do.
+        Command::Status => cmd_snapshot(&config, true, false),
+        Command::Push { archive, remote } => cmd_push(&config_path, config, archive, remote),
+        Command::Pull {
+            archive,
+            remote,
+            from,
+            at,
+        } => cmd_pull(&config, archive, remote, from, at),
+        Command::History { limit, remote } => cmd_history(&config, limit, remote),
+        Command::Machines { remote } => cmd_machines(&config, remote),
+        Command::Rollback {
+            commit,
+            remote,
+            from,
+            only,
+            yes,
+        } => {
+            cmd_pull(&config, None, remote, from, Some(commit))?;
+            cmd_restore(&config, false, false, false, yes, only)
+        }
         Command::Restore {
             dry_run,
             no_remap,
             overwrite,
-        } => cmd_restore(&config, dry_run, no_remap, overwrite),
+            yes,
+            only,
+        } => cmd_restore(&config, dry_run, no_remap, overwrite, yes, only),
+        Command::Diff { remote, from } => cmd_diff(&config, remote, from),
         Command::Export {
             file,
             allow_secrets,
@@ -107,7 +134,7 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             } else {
-                cmd_push(&config, archive, remote)
+                cmd_push(&config_path, config, archive, remote)
             }
         }
         Command::Install => install::install(),
@@ -120,6 +147,221 @@ fn run() -> Result<()> {
             cli::ServiceAction::Stop => service::stop(),
             cli::ServiceAction::Status => service::status(),
         },
+        Command::Profile { action } => cmd_profile(&config, action),
+        Command::Layer { action } => cmd_layer(&config, action),
+    }
+}
+
+fn cmd_layer(config: &Config, action: cli::LayerAction) -> Result<()> {
+    use cli::LayerAction;
+
+    let layers_root = paths::layers_dir()?;
+    match action {
+        LayerAction::List => {
+            if config.layers.is_empty() {
+                println!("no layers configured; add a [[layers]] entry to the config, e.g.");
+                println!("  [[layers]]");
+                println!("  name = \"team\"");
+                println!("  remote = \"git@github.com:acme/claude-shared.git\"");
+                println!("  components = [\"skills\", \"commands\"]");
+                return Ok(());
+            }
+            for l in &config.layers {
+                let state = if layers_root.join(&l.name).is_dir() {
+                    "pulled"
+                } else {
+                    "not pulled"
+                };
+                println!(
+                    "  {}  —  {} ({}), components: {}",
+                    l.name,
+                    l.remote,
+                    state,
+                    l.components.join(", ")
+                );
+            }
+            Ok(())
+        }
+        LayerAction::Pull { name } => {
+            let targets: Vec<_> = match &name {
+                Some(n) => vec![layer::find(config, n)?],
+                None => config.layers.iter().collect(),
+            };
+            if targets.is_empty() {
+                println!("no layers configured; nothing to pull");
+                return Ok(());
+            }
+            for l in targets {
+                layer::pull(l, &layers_root)?;
+                println!("pulled layer {:?} from {}", l.name, l.remote);
+            }
+            Ok(())
+        }
+        LayerAction::Apply {
+            name,
+            yes,
+            allow_secrets,
+        } => {
+            let l = layer::find(config, &name)?;
+            let claude = paths::claude_dir()?;
+            let applied = layer::apply(
+                l,
+                &layers_root,
+                &claude,
+                config.confirm_hooks && !yes,
+                allow_secrets,
+            )?;
+            println!(
+                "applied {} file(s) from layer {name:?} into {}",
+                applied.len(),
+                claude.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn cmd_profile(config: &Config, action: cli::ProfileAction) -> Result<()> {
+    use cli::ProfileAction;
+
+    let root = paths::profiles_dir()?;
+    let claude = paths::claude_dir()?;
+    let claude_json = if config.profiles.include_user_mcp {
+        paths::claude_json_file().ok()
+    } else {
+        None
+    };
+    let live = profile::LiveState {
+        claude_dir: &claude,
+        claude_json: claude_json.as_deref(),
+    };
+
+    match action {
+        ProfileAction::List => {
+            let names = profile::list(&root)?;
+            if names.is_empty() {
+                println!("no profiles yet; `ccsync profile create <name> --from-current`");
+                return Ok(());
+            }
+            let active = profile::active(&root)?.map(|a| a.name);
+            for name in names {
+                let marker = if active.as_deref() == Some(&name) {
+                    "* "
+                } else {
+                    "  "
+                };
+                let desc = profile::read_meta(&root, &name)?.description;
+                if desc.is_empty() {
+                    println!("{marker}{name}");
+                } else {
+                    println!("{marker}{name} — {desc}");
+                }
+            }
+            Ok(())
+        }
+        ProfileAction::Create {
+            name,
+            from_current,
+            description,
+        } => {
+            let captured = profile::create(
+                &root,
+                &name,
+                description,
+                config,
+                from_current.then_some(&live),
+            )?;
+            if from_current {
+                println!("created profile {name:?} with {captured} file(s) from current state");
+            } else {
+                println!("created empty profile {name:?}");
+            }
+            Ok(())
+        }
+        ProfileAction::Switch { name, yes } => {
+            let report =
+                profile::switch(&root, &name, &live, config, config.confirm_hooks && !yes)?;
+            if let Some(from) = &report.from {
+                if from == &report.to {
+                    println!(
+                        "already on {:?}; captured {} live file(s) into its store",
+                        report.to, report.captured_files
+                    );
+                    return Ok(());
+                }
+                println!(
+                    "captured {} file(s) back into {:?}",
+                    report.captured_files, from
+                );
+            }
+            if let Some(backup) = &report.backup_dir {
+                println!("backed up previous state to {}", backup.display());
+            }
+            println!(
+                "switched to {:?}: {} file(s) applied, {} user-scope MCP server(s)",
+                report.to, report.applied_files, report.mcp_servers
+            );
+            Ok(())
+        }
+        ProfileAction::Show { name } => {
+            if !profile::exists(&root, &name) {
+                anyhow::bail!("profile {name:?} does not exist");
+            }
+            let meta = profile::read_meta(&root, &name)?;
+            let active = profile::active(&root)?.map(|a| a.name);
+            println!(
+                "{name}{}",
+                if active.as_deref() == Some(&name) {
+                    " (active)"
+                } else {
+                    ""
+                }
+            );
+            if !meta.description.is_empty() {
+                println!("  {}", meta.description);
+            }
+            let comps = profile::components(&root, &name, config)?;
+            let data = profile::profile_dir(&root, &name).join("data");
+            for comp in comps {
+                let present = data.join(&comp).exists();
+                println!("  {} {comp}", if present { "+" } else { "-" });
+            }
+            let mcp_count = profile::stored_mcp_count(&root, &name);
+            if mcp_count > 0 {
+                println!("  + {mcp_count} user-scope MCP server(s)");
+            }
+            Ok(())
+        }
+        ProfileAction::Diff { name } => {
+            let entries = profile::diff_live(&root, &name, &live, config)?;
+            if entries.is_empty() {
+                println!("live state matches profile {name:?}");
+                return Ok(());
+            }
+            for e in &entries {
+                let tag = match e.state {
+                    diff::DiffState::LocalOnly => "live only   ",
+                    diff::DiffState::OtherOnly => "profile only",
+                    diff::DiffState::Changed => "differs     ",
+                };
+                println!("  {tag} {}", e.rel);
+            }
+            println!(
+                "{} difference(s); `ccsync profile switch {name}` captures live state back when {name:?} is active",
+                entries.len()
+            );
+            Ok(())
+        }
+        ProfileAction::Delete { name } => {
+            profile::delete(&root, &name)?;
+            println!("deleted profile {name:?}");
+            Ok(())
+        }
+        ProfileAction::Rollback => {
+            let msg = profile::rollback(&root, &live, config)?;
+            println!("{msg}");
+            Ok(())
+        }
     }
 }
 
@@ -181,11 +423,25 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
             );
         }
     }
+    if m.redacted_spans > 0 {
+        println!(
+            "  {} secret-shaped span(s) redacted from transcripts in the staged copy",
+            m.redacted_spans
+        );
+    }
     if !m.project_roots.is_empty() {
         println!(
             "  {} session project root(s) recorded for remapping",
             m.project_roots.len()
         );
+    }
+    let unclassified = snapshot::unclassified_top_level(&claude, config);
+    if !unclassified.is_empty() {
+        println!(
+            "  warning: not classified by include/exclude (never synced): {}",
+            unclassified.join(", ")
+        );
+        println!("    add them to `include` or `exclude` in the config to silence this");
     }
     if let Some(claude_json) = &opts.claude_json {
         if let Some(doc) = mcp::extract(claude_json)? {
@@ -203,7 +459,8 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
 }
 
 fn cmd_push(
-    config: &Config,
+    config_path: &std::path::Path,
+    config: Config,
     archive_path: Option<std::path::PathBuf>,
     remote: Option<String>,
 ) -> Result<()> {
@@ -215,9 +472,22 @@ fn cmd_push(
         archive::create(&staging, &out, &pass)?;
         println!("wrote encrypted archive to {}", out.display());
     } else {
+        // Persist the machine identity on first push so a later hostname
+        // change doesn't fork this machine's history under a new subtree.
+        // Saved from a freshly-loaded config: `config` has machine overrides
+        // folded in and must never be written back.
+        let machine_id = config.effective_machine_id();
+        if config.machine_id.is_none() {
+            if let Ok(mut fresh) = Config::load(config_path) {
+                fresh.machine_id = Some(machine_id.clone());
+                if fresh.save(config_path).is_ok() {
+                    println!("recorded machine_id = {machine_id:?} in the config");
+                }
+            }
+        }
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
-        git::push(&remote, &staging)?;
-        println!("pushed snapshot to {remote}");
+        git::push(&remote, &staging, &machine_id)?;
+        println!("pushed snapshot to {remote} (machine {machine_id})");
     }
     Ok(())
 }
@@ -226,17 +496,31 @@ fn cmd_pull(
     config: &Config,
     archive_path: Option<std::path::PathBuf>,
     remote: Option<String>,
+    from: Option<String>,
+    at: Option<String>,
 ) -> Result<()> {
     let staging = paths::staging_dir()?;
 
     if let Some(input) = archive_path {
+        if from.is_some() || at.is_some() {
+            anyhow::bail!("--from/--at select git snapshots and cannot combine with --archive");
+        }
         let pass = archive::passphrase_from_env()?;
         archive::extract(&input, &staging, &pass)?;
         println!("imported snapshot from {}", input.display());
     } else {
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
-        git::pull(&remote, &staging)?;
-        println!("pulled snapshot from {remote}");
+        let own_id = config.effective_machine_id();
+        match &at {
+            Some(commit) => {
+                git::pull_at(&remote, commit, &staging, from.as_deref(), &own_id)?;
+                println!("pulled snapshot at {commit} from {remote}");
+            }
+            None => {
+                git::pull(&remote, &staging, from.as_deref(), &own_id)?;
+                println!("pulled snapshot from {remote}");
+            }
+        }
     }
     println!(
         "  staged at {} — run `ccsync restore` to apply",
@@ -245,7 +529,53 @@ fn cmd_pull(
     Ok(())
 }
 
-fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) -> Result<()> {
+fn cmd_history(config: &Config, limit: usize, remote: Option<String>) -> Result<()> {
+    // `git::log` reads the local cache; refresh it from the remote first so
+    // history shows other machines' pushes too.
+    let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
+    git::refresh_cache(&remote)?;
+    let commits = git::log(limit)?;
+    if commits.is_empty() {
+        println!("no snapshot history yet; `ccsync backup` creates the first commit");
+        return Ok(());
+    }
+    for (hash, date, subject) in commits {
+        println!("{hash}  {date}  {subject}");
+    }
+    println!("restore one with `ccsync rollback <commit>` (or `ccsync pull --at <commit>`)");
+    Ok(())
+}
+
+fn cmd_machines(config: &Config, remote: Option<String>) -> Result<()> {
+    let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
+    let own_id = config.effective_machine_id();
+    let machines = git::machines(&remote)?;
+    if machines.is_empty() {
+        println!("no machine snapshots on {remote} yet");
+        return Ok(());
+    }
+    for (name, m) in machines {
+        let marker = if name == own_id { "* " } else { "  " };
+        println!(
+            "{marker}{name}  —  host {}, {} file(s), {}, ccsync {}",
+            m.source_host,
+            m.files.len(),
+            m.created_at,
+            m.ccsync_version
+        );
+    }
+    println!("pull another machine's snapshot with `ccsync pull --from <machine>`");
+    Ok(())
+}
+
+fn cmd_restore(
+    config: &Config,
+    dry_run: bool,
+    no_remap: bool,
+    overwrite: bool,
+    yes: bool,
+    only: Vec<String>,
+) -> Result<()> {
     let claude = paths::claude_dir()?;
     let staging = paths::staging_dir()?;
     let opts = RestoreOptions {
@@ -258,6 +588,13 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
         },
         claude_json: if config.include_mcp_servers {
             paths::claude_json_file().ok()
+        } else {
+            None
+        },
+        confirm_hooks: config.confirm_hooks && !yes,
+        components: if only.is_empty() { None } else { Some(only) },
+        profiles_root: if config.profiles.sync {
+            paths::profiles_dir().ok()
         } else {
             None
         },
@@ -293,6 +630,51 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
             report.mcp_servers_restored
         );
     }
+    Ok(())
+}
+
+fn cmd_diff(config: &Config, remote: bool, from: Option<String>) -> Result<()> {
+    let claude = paths::claude_dir()?;
+    let staging = paths::staging_dir()?;
+
+    let claude_json = if config.include_mcp_servers {
+        paths::claude_json_file().ok()
+    } else {
+        None
+    };
+    let (entries, other_label) = if remote {
+        let url = git::resolve_remote(None, config.remote.as_deref())?;
+        let manifest = git::remote_manifest(&url, from.as_deref(), &config.effective_machine_id())?;
+        let label = from
+            .map(|m| format!("remote snapshot of {m:?}"))
+            .unwrap_or_else(|| "remote snapshot".to_string());
+        (
+            diff::against_manifest(&claude, &staging, config, claude_json, &manifest)?,
+            label,
+        )
+    } else {
+        snapshot::require_staged(&staging)?;
+        (
+            diff::against_staged(&claude, &staging, config, claude_json)?,
+            "staged snapshot".to_string(),
+        )
+    };
+    if entries.is_empty() {
+        println!("local {} matches the {other_label}", claude.display());
+        return Ok(());
+    }
+    for e in &entries {
+        let tag = match e.state {
+            diff::DiffState::LocalOnly => "local only   ",
+            diff::DiffState::OtherOnly => "snapshot only",
+            diff::DiffState::Changed => "differs      ",
+        };
+        println!("  {tag} {}", e.rel);
+    }
+    println!(
+        "{} difference(s) vs the {other_label}; `ccsync snapshot` refreshes staging, `ccsync restore` applies it",
+        entries.len()
+    );
     Ok(())
 }
 

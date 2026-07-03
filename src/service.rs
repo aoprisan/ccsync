@@ -35,7 +35,7 @@ pub fn run_once(config: &Config) -> Result<String> {
     match config.service.destination {
         ServiceDestination::Git => {
             let remote = git::resolve_remote(None, config.remote.as_deref())?;
-            git::push(&remote, &staging)?;
+            git::push(&remote, &staging, &config.effective_machine_id())?;
             Ok(format!("pushed {files} files to {remote}"))
         }
         ServiceDestination::Archive => {
@@ -113,9 +113,14 @@ fn log(msg: &str) {
 fn warn_about_secrets(service: &ServiceConfig) {
     match service.destination {
         ServiceDestination::Archive => {
+            let env = paths::service_env_file()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<config>/ccsync/service.env".into());
             println!(
                 "note: archive backups need CCSYNC_PASSPHRASE, which the service does NOT\n      \
-                 inherit from your shell. Add it to the unit (see below) before relying on it."
+                 inherit from your shell. The installed unit sources {env}\n      \
+                 — create it with:\n        \
+                 printf 'CCSYNC_PASSPHRASE=your-passphrase\\n' > {env} && chmod 600 {env}"
             );
         }
         ServiceDestination::Git => {
@@ -133,22 +138,30 @@ fn warn_about_secrets(service: &ServiceConfig) {
 // ---------------------------------------------------------------------------
 
 /// Render the systemd user unit that runs `ccsync daemon`.
+///
+/// `Wants=` is required alongside `After=` — `After` alone only orders
+/// against network-online.target if something else pulls it in. The optional
+/// (`-` prefixed) EnvironmentFile carries secrets like `CCSYNC_PASSPHRASE`
+/// that a user unit does not inherit from any shell.
 #[cfg(target_os = "linux")]
-pub fn systemd_unit(exec_path: &Path) -> String {
+pub fn systemd_unit(exec_path: &Path, env_file: &Path) -> String {
     format!(
         "[Unit]\n\
          Description=ccsync background backup of ~/.claude\n\
+         Wants=network-online.target\n\
          After=network-online.target\n\
          \n\
          [Service]\n\
          Type=simple\n\
+         EnvironmentFile=-{env}\n\
          ExecStart={exec} daemon\n\
          Restart=on-failure\n\
          RestartSec=30\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exec = exec_path.display()
+        exec = exec_path.display(),
+        env = env_file.display()
     )
 }
 
@@ -165,7 +178,7 @@ pub fn install(config: &Config) -> Result<()> {
     if let Some(parent) = unit_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&unit_path, systemd_unit(&exe))
+    std::fs::write(&unit_path, systemd_unit(&exe, &paths::service_env_file()?))
         .with_context(|| format!("writing {}", unit_path.display()))?;
     println!("wrote systemd unit to {}", unit_path.display());
 
@@ -230,11 +243,23 @@ fn report_unit_status() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Render the launchd agent plist that runs `ccsync daemon`.
+///
+/// launchd has no EnvironmentFile equivalent, so the agent runs through
+/// `/bin/sh`, sourcing the optional service.env (secrets like
+/// `CCSYNC_PASSPHRASE`) before exec'ing the daemon. ThrottleInterval keeps a
+/// crash-looping daemon from restarting on launchd's 10s floor.
 #[cfg(target_os = "macos")]
 pub fn launchd_plist(exec_path: &Path) -> String {
     let home = dirs::home_dir()
         .map(|h| h.display().to_string())
         .unwrap_or_default();
+    let env_file = paths::service_env_file()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let shell_cmd = format!(
+        "if [ -f '{env_file}' ]; then set -a; . '{env_file}'; set +a; fi; exec '{exec}' daemon",
+        exec = exec_path.display()
+    );
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -243,14 +268,15 @@ pub fn launchd_plist(exec_path: &Path) -> String {
          <dict>\n\
          \t<key>Label</key>\n\t<string>com.ccsync.daemon</string>\n\
          \t<key>ProgramArguments</key>\n\t<array>\n\
-         \t\t<string>{exec}</string>\n\t\t<string>daemon</string>\n\t</array>\n\
+         \t\t<string>/bin/sh</string>\n\t\t<string>-c</string>\n\
+         \t\t<string>{shell_cmd}</string>\n\t</array>\n\
          \t<key>RunAtLoad</key>\n\t<true/>\n\
          \t<key>KeepAlive</key>\n\t<true/>\n\
+         \t<key>ThrottleInterval</key>\n\t<integer>60</integer>\n\
          \t<key>StandardOutPath</key>\n\t<string>{home}/Library/Logs/ccsync.log</string>\n\
          \t<key>StandardErrorPath</key>\n\t<string>{home}/Library/Logs/ccsync.log</string>\n\
          </dict>\n\
          </plist>\n",
-        exec = exec_path.display(),
     )
 }
 
@@ -377,9 +403,85 @@ fn pid_is_running(pid: i32) -> bool {
     }
 }
 
+/// Best-effort check that `pid` is actually a ccsync process. PIDs are
+/// recycled by the OS, so a stale pidfile can end up naming an unrelated
+/// process — `stop` must never SIGTERM that.
+fn pid_is_ccsync(pid: i32) -> bool {
+    // Linux: /proc/<pid>/cmdline is authoritative and cheap.
+    if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let first = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
+        return String::from_utf8_lossy(first).contains("ccsync");
+    }
+    // Elsewhere (macOS/BSD): ask ps.
+    #[cfg(unix)]
+    {
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        {
+            if out.status.success() {
+                return String::from_utf8_lossy(&out.stdout).contains("ccsync");
+            }
+        }
+    }
+    false
+}
+
+/// A live process that is really ours.
+fn pid_is_our_daemon(pid: i32) -> bool {
+    pid_is_running(pid) && pid_is_ccsync(pid)
+}
+
+/// Outcome of trying to take exclusive ownership of the daemon pidfile.
+enum PidfileClaim {
+    /// The pidfile was created exclusively by us; write the PID into it.
+    Claimed,
+    /// A live ccsync daemon already owns it.
+    Running(i32),
+}
+
+/// Atomically claim the pidfile: `create_new` is the lock, so two concurrent
+/// `service start` invocations cannot both proceed. A pidfile naming a dead
+/// or non-ccsync process is stale and gets cleared (one retry).
+fn claim_pidfile(path: &Path) -> Result<PidfileClaim> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => return Ok(PidfileClaim::Claimed),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let pid = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                match pid {
+                    Some(pid) if pid_is_our_daemon(pid) => {
+                        return Ok(PidfileClaim::Running(pid));
+                    }
+                    _ => {
+                        // Dead process, PID reuse, or garbage: stale.
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating {}", path.display()));
+            }
+        }
+    }
+    anyhow::bail!(
+        "could not claim {} (another `service start` racing?)",
+        path.display()
+    )
+}
+
 fn report_detached_status() {
     match read_pid() {
-        Some(pid) if pid_is_running(pid) => {
+        Some(pid) if pid_is_our_daemon(pid) => {
             println!("detached daemon: running (pid {pid})");
             if let Ok(log) = paths::daemon_logfile() {
                 println!("  logs: {}", log.display());
@@ -402,11 +504,13 @@ pub fn start(config: &Config) -> Result<()> {
         println!("set `enabled = true` under [service] first");
         return Ok(());
     }
-    if let Some(pid) = read_pid() {
-        if pid_is_running(pid) {
+    let pid_path = paths::daemon_pidfile()?;
+    match claim_pidfile(&pid_path)? {
+        PidfileClaim::Running(pid) => {
             println!("daemon already running (pid {pid}); use `ccsync service stop` first");
             return Ok(());
         }
+        PidfileClaim::Claimed => {}
     }
 
     let exe = std::env::current_exe().context("resolving the ccsync executable path")?;
@@ -436,10 +540,16 @@ pub fn start(config: &Config) -> Result<()> {
             Ok(())
         });
     }
-    let child = cmd.spawn().context("spawning the detached daemon")?;
+    let child = match cmd.spawn().context("spawning the detached daemon") {
+        Ok(child) => child,
+        Err(e) => {
+            // Release the claim so the next start is not blocked by an empty file.
+            let _ = std::fs::remove_file(&pid_path);
+            return Err(e);
+        }
+    };
     let pid = child.id();
 
-    let pid_path = paths::daemon_pidfile()?;
     std::fs::write(&pid_path, pid.to_string())
         .with_context(|| format!("writing {}", pid_path.display()))?;
 
@@ -462,6 +572,14 @@ pub fn stop() -> Result<()> {
     };
     if !pid_is_running(pid) {
         println!("daemon (pid {pid}) is not running; clearing stale pidfile");
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(());
+    }
+    if !pid_is_ccsync(pid) {
+        println!(
+            "pid {pid} is alive but is not a ccsync process (PID reuse after a crash?); \
+             clearing the stale pidfile without signalling it"
+        );
         let _ = std::fs::remove_file(&pid_path);
         return Ok(());
     }
@@ -562,9 +680,63 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn systemd_unit_runs_daemon() {
-        let unit = systemd_unit(Path::new("/usr/local/bin/ccsync"));
+        let unit = systemd_unit(
+            Path::new("/usr/local/bin/ccsync"),
+            Path::new("/home/u/.config/ccsync/service.env"),
+        );
         assert!(unit.contains("ExecStart=/usr/local/bin/ccsync daemon"));
         assert!(unit.contains("WantedBy=default.target"));
+        // After= alone does not pull the target in; Wants= is required.
+        assert!(unit.contains("Wants=network-online.target"));
+        assert!(unit.contains("After=network-online.target"));
+        // Optional env file so a missing one is not a start failure.
+        assert!(unit.contains("EnvironmentFile=-/home/u/.config/ccsync/service.env"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_pidfile_clears_stale_and_respects_live_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon.pid");
+
+        // Fresh claim succeeds and leaves the file in place as the lock.
+        assert!(matches!(
+            claim_pidfile(&path).unwrap(),
+            PidfileClaim::Claimed
+        ));
+        assert!(path.exists());
+
+        // A pidfile naming a dead process is stale: cleared and re-claimed.
+        std::fs::write(&path, "2147483646").unwrap();
+        assert!(matches!(
+            claim_pidfile(&path).unwrap(),
+            PidfileClaim::Claimed
+        ));
+
+        // Garbage content is stale too.
+        std::fs::write(&path, "not-a-pid").unwrap();
+        assert!(matches!(
+            claim_pidfile(&path).unwrap(),
+            PidfileClaim::Claimed
+        ));
+
+        // Our own PID is alive and its binary contains "ccsync" (the test
+        // binary), so it reads as a running daemon.
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        assert!(matches!(
+            claim_pidfile(&path).unwrap(),
+            PidfileClaim::Running(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_identity_check_rejects_non_ccsync_processes() {
+        // PID 1 (init/systemd/launchd) is alive but is not ccsync.
+        assert!(pid_is_running(1));
+        assert!(!pid_is_ccsync(1));
+        // The test process itself is a ccsync binary.
+        assert!(pid_is_ccsync(std::process::id() as i32));
     }
 
     #[cfg(target_os = "macos")]

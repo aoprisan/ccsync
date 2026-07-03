@@ -20,6 +20,9 @@ pub enum CcError {
     #[error("potential secret detected in {file}: {hint}\n  re-run with --allow-secrets to include it anyway")]
     SecretDetected { file: String, hint: String },
 
+    #[error("staged snapshot failed integrity check: {0}\n  the snapshot may be corrupt or tampered with; re-run `ccsync pull` or re-create it")]
+    SnapshotIntegrity(String),
+
     #[error("git command failed: {0}")]
     Git(String),
 

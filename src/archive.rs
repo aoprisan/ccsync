@@ -84,14 +84,32 @@ pub fn extract(archive: &Path, staging: &Path, passphrase: &str) -> Result<()> {
     let mut tar_gz = Vec::new();
     reader.read_to_end(&mut tar_gz)?;
 
-    // Clean and recreate staging, then unpack.
+    // Clean and recreate staging, then unpack entry by entry so a hostile
+    // archive cannot escape the staging dir (absolute paths, `..`, or
+    // link entries pointing elsewhere).
     if staging.exists() {
         std::fs::remove_dir_all(staging).ok();
     }
     std::fs::create_dir_all(staging)?;
     let gz = GzDecoder::new(&tar_gz[..]);
     let mut archive = tar::Archive::new(gz);
-    archive.unpack(staging)?;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let safe_path = path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        let kind = entry.header().entry_type();
+        let safe_kind = matches!(kind, tar::EntryType::Regular | tar::EntryType::Directory);
+        if !safe_path || !safe_kind {
+            return Err(anyhow!(
+                "refusing unsafe archive entry {} ({kind:?})",
+                path.display()
+            ));
+        }
+        // unpack_in re-checks that the destination stays under `staging`.
+        entry.unpack_in(staging)?;
+    }
     Ok(())
 }
 
@@ -116,6 +134,37 @@ mod tests {
         assert!(restored.join(MANIFEST_NAME).exists());
         let s = std::fs::read_to_string(restored.join("data/settings.json")).unwrap();
         assert!(s.contains("dark"));
+    }
+
+    #[test]
+    fn rejects_link_entries() {
+        // Hand-build an encrypted archive holding a symlink entry; extract
+        // must refuse it rather than materialize a link out of staging.
+        let mut tar_gz: Vec<u8> = Vec::new();
+        {
+            let enc = GzEncoder::new(&mut tar_gz, Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            builder
+                .append_link(&mut header, "data/evil", "/etc/passwd")
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("evil.tar.gz.age");
+        let encryptor = age::Encryptor::with_user_passphrase(Secret::new("hunter2".to_owned()));
+        let mut writer = encryptor
+            .wrap_output(std::fs::File::create(&out).unwrap())
+            .unwrap();
+        writer.write_all(&tar_gz).unwrap();
+        writer.finish().unwrap();
+
+        let staging = tmp.path().join("staging");
+        let err = extract(&out, &staging, "hunter2").unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "got: {err:#}");
+        assert!(!staging.join("data/evil").exists());
     }
 
     #[test]

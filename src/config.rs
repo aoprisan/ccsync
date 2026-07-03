@@ -28,14 +28,118 @@ pub struct Config {
     /// scanned, so a server `env` holding an API key aborts the snapshot unless
     /// `--allow-secrets` is passed.
     pub include_mcp_servers: bool,
+    /// How to handle secret-shaped strings found in session transcripts
+    /// (`projects/**/*.jsonl`). Transcripts legitimately discuss secrets, so
+    /// aborting like config files do would make snapshots unusable; the
+    /// default rewrites each matched span to `[REDACTED:ccsync]` in the
+    /// *staged copy only* — source files are never touched.
+    pub transcript_secrets: TranscriptSecrets,
+    /// Require confirmation before a restore installs new hook commands from
+    /// an incoming settings.json. Hooks are arbitrary shell commands that will
+    /// run in Claude Code sessions on this machine.
+    pub confirm_hooks: bool,
     /// Git remote URL used by `push --git` / `pull --git`.
     pub remote: Option<String>,
+    /// Stable identity for this machine's subtree in the sync repo
+    /// (`machines/<id>/`). Defaults to the hostname and is persisted here on
+    /// the first push so a later hostname change doesn't fork the history.
+    pub machine_id: Option<String>,
     /// Explicit path remap pairs applied on restore, in addition to the
     /// automatic `source_home -> local_home` mapping. Keys are source prefixes,
     /// values are target prefixes.
     pub remap: BTreeMap<String, String>,
     /// Settings for the background service (`ccsync daemon` / `ccsync service`).
     pub service: ServiceConfig,
+    /// Settings for named profiles (`ccsync profile ...`).
+    pub profiles: ProfilesConfig,
+    /// Per-machine additions, keyed by machine id and merged over the base
+    /// config at load time on the matching machine (see
+    /// [`Config::with_machine_overrides`]). Skipped when empty so a saved
+    /// config stays hand-editable (no stray `machines = {}` blocking a later
+    /// `[machines.<id>]` table).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub machines: BTreeMap<String, MachineOverrides>,
+    /// Read-only shared layers (e.g. a team's skills/commands repo), pulled
+    /// with `ccsync layer pull` and applied with `ccsync layer apply`.
+    /// Skipped when empty so `[[layers]]` can be appended by hand.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<LayerConfig>,
+}
+
+/// One `[[layers]]` entry: a git repo whose declared top-level components are
+/// copied into `~/.claude` on `layer apply`. Layers are read-only sources —
+/// ccsync never pushes to them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayerConfig {
+    /// Local name (also the checkout directory under `<config>/ccsync/layers/`).
+    pub name: String,
+    /// Git URL of the shared repo.
+    pub remote: String,
+    /// Top-level components of the repo to apply (e.g. `["skills", "commands"]`).
+    /// Nothing outside this list is ever copied.
+    pub components: Vec<String>,
+}
+
+/// Extra include/exclude/remap entries that apply on one machine only, e.g.
+/// `[machines.laptop]` with `exclude_extra = ["projects"]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MachineOverrides {
+    /// Appended to `include`.
+    pub include_extra: Vec<String>,
+    /// Appended to `exclude` (exclusion wins over inclusion, as always).
+    pub exclude_extra: Vec<String>,
+    /// Merged into `[remap]` (machine entry wins on conflicts).
+    pub remap: BTreeMap<String, String>,
+}
+
+/// Configuration for named profiles: which parts of `~/.claude` a profile
+/// owns, and whether the profile store rides along inside snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfilesConfig {
+    /// Top-level components of `~/.claude` a profile owns. Everything else
+    /// (sessions, agent memory, keybindings, ...) is shared base state that
+    /// survives a switch untouched.
+    pub components: Vec<String>,
+    /// Whether a profile also owns the user-scope `mcpServers` of
+    /// `~/.claude.json` (per-project servers are tied to directories, not
+    /// environments, and are never touched).
+    pub include_user_mcp: bool,
+    /// Bundle the profile store into snapshots so profiles sync across
+    /// machines with the normal push/pull/export flow.
+    pub sync: bool,
+}
+
+impl Default for ProfilesConfig {
+    fn default() -> Self {
+        ProfilesConfig {
+            components: vec![
+                "settings.json".into(),
+                "CLAUDE.md".into(),
+                "agents".into(),
+                "skills".into(),
+                "commands".into(),
+                "output-styles".into(),
+            ],
+            include_user_mcp: true,
+            sync: true,
+        }
+    }
+}
+
+/// Policy for secret-shaped strings inside session transcripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptSecrets {
+    /// Replace each match with `[REDACTED:ccsync]` in the staged copy.
+    #[default]
+    Redact,
+    /// Abort the snapshot, exactly like a secret in a config file.
+    Abort,
+    /// Capture transcripts verbatim.
+    Ignore,
 }
 
 /// Where the background service publishes each automatic backup.
@@ -100,9 +204,14 @@ impl Default for Config {
                 "output-styles".into(),
                 "workflows".into(),
                 "themes".into(),
+                // Plugin configuration (the re-fetchable clones under it are
+                // excluded below).
+                "plugins".into(),
                 // Session transcripts + per-repo auto memory. Gated additionally
                 // by `include_sessions`.
                 "projects".into(),
+                // Per-session todo state; travels with the sessions.
+                "todos".into(),
             ],
             exclude: vec![
                 // Sensitive: never sync.
@@ -116,12 +225,24 @@ impl Default for Config {
                 "launcher-settings.json".into(),
                 "policy-limits.json".into(),
                 "remote-settings.json".into(),
+                "settings.local.json".into(),
+                "ide".into(),
+                // Plugin checkouts/caches are large and re-fetchable.
+                "plugins/repos".into(),
+                "plugins/cache".into(),
+                "plugins/marketplaces".into(),
             ],
             include_sessions: true,
             include_mcp_servers: true,
+            transcript_secrets: TranscriptSecrets::default(),
+            confirm_hooks: true,
             remote: None,
+            machine_id: None,
             remap: BTreeMap::new(),
             service: ServiceConfig::default(),
+            profiles: ProfilesConfig::default(),
+            machines: BTreeMap::new(),
+            layers: Vec::new(),
         }
     }
 }
@@ -146,6 +267,53 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(path, text)?;
         Ok(())
+    }
+
+    /// The effective machine identity used for this machine's `machines/<id>/`
+    /// subtree in the sync repo: the configured `machine_id`, else the
+    /// hostname, sanitized to a safe directory name.
+    pub fn effective_machine_id(&self) -> String {
+        let raw = self
+            .machine_id
+            .clone()
+            .unwrap_or_else(crate::snapshot::hostname);
+        let id: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let id = id.trim_matches('.').to_string();
+        if id.is_empty() {
+            "default".to_string()
+        } else {
+            id
+        }
+    }
+
+    /// Fold this machine's `[machines.<id>]` overrides into the base config.
+    /// Callers must NOT save the result back to disk — the overrides would be
+    /// baked into the base sets; persist from a freshly-loaded copy instead.
+    pub fn with_machine_overrides(mut self) -> Self {
+        let id = self.effective_machine_id();
+        if let Some(overrides) = self.machines.get(&id).cloned() {
+            for inc in overrides.include_extra {
+                if !self.include.contains(&inc) {
+                    self.include.push(inc);
+                }
+            }
+            for exc in overrides.exclude_extra {
+                if !self.exclude.contains(&exc) {
+                    self.exclude.push(exc);
+                }
+            }
+            self.remap.extend(overrides.remap);
+        }
+        self
     }
 
     /// True if `rel` (a path relative to `~/.claude`) is excluded by any
@@ -195,8 +363,10 @@ mod tests {
     fn config_roundtrips_toml() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        let mut c = Config::default();
-        c.remote = Some("git@example.com:me/ccsync-data.git".into());
+        let mut c = Config {
+            remote: Some("git@example.com:me/ccsync-data.git".into()),
+            ..Config::default()
+        };
         c.remap.insert("/Users/alice".into(), "/home/alice".into());
         c.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
@@ -240,6 +410,115 @@ mod tests {
             Some(PathBuf::from("/mnt/backups"))
         );
         assert!(loaded.service.allow_secrets);
+    }
+
+    #[test]
+    fn defaults_classify_plugins_todos_and_local_state() {
+        let c = Config::default();
+        // Newly-classified entries: plugin config travels, its checkouts don't.
+        assert!(c.include.iter().any(|i| i == "plugins"));
+        assert!(c.include.iter().any(|i| i == "todos"));
+        assert!(!c.is_excluded("plugins/config.json"));
+        assert!(c.is_excluded("plugins/repos/org/repo/index.js"));
+        assert!(c.is_excluded("plugins/cache/x"));
+        // Machine-local by convention.
+        assert!(c.is_excluded("settings.local.json"));
+        assert!(c.is_excluded("ide/lock"));
+    }
+
+    #[test]
+    fn secret_policy_defaults_and_back_compat() {
+        let c = Config::default();
+        assert_eq!(c.transcript_secrets, TranscriptSecrets::Redact);
+        assert!(c.confirm_hooks);
+
+        // A config written before these fields existed loads the defaults.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.transcript_secrets, TranscriptSecrets::Redact);
+        assert!(loaded.confirm_hooks);
+
+        // And the policy round-trips.
+        let c = Config {
+            transcript_secrets: TranscriptSecrets::Abort,
+            confirm_hooks: false,
+            ..Config::default()
+        };
+        c.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.transcript_secrets, TranscriptSecrets::Abort);
+        assert!(!loaded.confirm_hooks);
+    }
+
+    #[test]
+    fn machine_overrides_fold_in_only_for_matching_id() {
+        let mut c = Config {
+            machine_id: Some("laptop".into()),
+            ..Config::default()
+        };
+        c.machines.insert(
+            "laptop".into(),
+            MachineOverrides {
+                include_extra: vec!["extra-dir".into()],
+                exclude_extra: vec!["projects".into()],
+                remap: [("/a".to_string(), "/b".to_string())].into(),
+            },
+        );
+        c.machines.insert(
+            "other".into(),
+            MachineOverrides {
+                include_extra: vec!["never-here".into()],
+                ..Default::default()
+            },
+        );
+
+        let effective = c.with_machine_overrides();
+        assert!(effective.include.iter().any(|i| i == "extra-dir"));
+        assert!(!effective.include.iter().any(|i| i == "never-here"));
+        assert!(effective.is_excluded("projects/x/s.jsonl"));
+        assert_eq!(effective.remap.get("/a").map(String::as_str), Some("/b"));
+
+        // Back-compat: configs without [machines] load fine.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
+        assert!(Config::load(&path).unwrap().machines.is_empty());
+    }
+
+    #[test]
+    fn saved_config_accepts_appended_layer_and_machine_tables() {
+        // A default save must not emit empty `machines`/`layers` keys, or a
+        // user appending `[[layers]]` / `[machines.x]` by hand gets duplicate
+        // key errors.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "\n[[layers]]\nname = \"team\"\nremote = \"git@x:y.git\"\ncomponents = [\"skills\"]\n\
+             \n[machines.laptop]\nexclude_extra = [\"projects\"]\n",
+        );
+        std::fs::write(&path, text).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.layers.len(), 1);
+        assert_eq!(loaded.layers[0].name, "team");
+        assert!(loaded.machines.contains_key("laptop"));
+    }
+
+    #[test]
+    fn effective_machine_id_sanitizes() {
+        let c = Config {
+            machine_id: Some("Al's MacBook Pro!".into()),
+            ..Config::default()
+        };
+        assert_eq!(c.effective_machine_id(), "Al-s-MacBook-Pro-");
+        let c = Config {
+            machine_id: Some("...".into()),
+            ..Config::default()
+        };
+        assert_eq!(c.effective_machine_id(), "default");
     }
 
     #[test]
