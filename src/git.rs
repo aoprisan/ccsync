@@ -317,6 +317,13 @@ pub fn refresh_cache(remote: &str) -> Result<()> {
     ensure_clone(remote, &cache)
 }
 
+/// Clone `remote` into `dest` or fast-forward an existing checkout to the
+/// remote tip. Used for read-only layer checkouts, which are plain repos
+/// rather than snapshot stores.
+pub fn clone_or_update(remote: &str, dest: &Path) -> Result<()> {
+    ensure_clone(remote, dest)
+}
+
 /// Read a machine's manifest from the remote without transferring snapshot
 /// data into staging. Backs `ccsync diff --remote`.
 pub fn remote_manifest(remote: &str, from: Option<&str>, own_id: &str) -> Result<Manifest> {

@@ -188,6 +188,32 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+
+    /// Manage read-only shared layers ([[layers]] in the config), e.g. a
+    /// team's skills/commands repo.
+    Layer {
+        #[command(subcommand)]
+        action: LayerAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LayerAction {
+    /// List configured layers and their checkout state.
+    List,
+    /// Clone or update the checkout of one layer (or all configured layers).
+    Pull { name: Option<String> },
+    /// Copy a layer's declared components into ~/.claude (scanned and
+    /// hook-gated like a restore).
+    Apply {
+        name: String,
+        /// Accept the layer's settings.json hook commands without confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Apply even if layer files look like they contain secrets.
+        #[arg(long)]
+        allow_secrets: bool,
+    },
 }
 
 #[derive(Subcommand)]

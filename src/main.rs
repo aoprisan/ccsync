@@ -13,6 +13,7 @@ mod diff;
 mod error;
 mod git;
 mod install;
+mod layer;
 mod manifest;
 mod mcp;
 mod paths;
@@ -147,6 +148,76 @@ fn run() -> Result<()> {
             cli::ServiceAction::Status => service::status(),
         },
         Command::Profile { action } => cmd_profile(&config, action),
+        Command::Layer { action } => cmd_layer(&config, action),
+    }
+}
+
+fn cmd_layer(config: &Config, action: cli::LayerAction) -> Result<()> {
+    use cli::LayerAction;
+
+    let layers_root = paths::layers_dir()?;
+    match action {
+        LayerAction::List => {
+            if config.layers.is_empty() {
+                println!("no layers configured; add a [[layers]] entry to the config, e.g.");
+                println!("  [[layers]]");
+                println!("  name = \"team\"");
+                println!("  remote = \"git@github.com:acme/claude-shared.git\"");
+                println!("  components = [\"skills\", \"commands\"]");
+                return Ok(());
+            }
+            for l in &config.layers {
+                let state = if layers_root.join(&l.name).is_dir() {
+                    "pulled"
+                } else {
+                    "not pulled"
+                };
+                println!(
+                    "  {}  —  {} ({}), components: {}",
+                    l.name,
+                    l.remote,
+                    state,
+                    l.components.join(", ")
+                );
+            }
+            Ok(())
+        }
+        LayerAction::Pull { name } => {
+            let targets: Vec<_> = match &name {
+                Some(n) => vec![layer::find(config, n)?],
+                None => config.layers.iter().collect(),
+            };
+            if targets.is_empty() {
+                println!("no layers configured; nothing to pull");
+                return Ok(());
+            }
+            for l in targets {
+                layer::pull(l, &layers_root)?;
+                println!("pulled layer {:?} from {}", l.name, l.remote);
+            }
+            Ok(())
+        }
+        LayerAction::Apply {
+            name,
+            yes,
+            allow_secrets,
+        } => {
+            let l = layer::find(config, &name)?;
+            let claude = paths::claude_dir()?;
+            let applied = layer::apply(
+                l,
+                &layers_root,
+                &claude,
+                config.confirm_hooks && !yes,
+                allow_secrets,
+            )?;
+            println!(
+                "applied {} file(s) from layer {name:?} into {}",
+                applied.len(),
+                claude.display()
+            );
+            Ok(())
+        }
     }
 }
 

@@ -56,6 +56,24 @@ pub struct Config {
     /// config at load time on the matching machine (see
     /// [`Config::with_machine_overrides`]).
     pub machines: BTreeMap<String, MachineOverrides>,
+    /// Read-only shared layers (e.g. a team's skills/commands repo), pulled
+    /// with `ccsync layer pull` and applied with `ccsync layer apply`.
+    pub layers: Vec<LayerConfig>,
+}
+
+/// One `[[layers]]` entry: a git repo whose declared top-level components are
+/// copied into `~/.claude` on `layer apply`. Layers are read-only sources —
+/// ccsync never pushes to them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayerConfig {
+    /// Local name (also the checkout directory under `<config>/ccsync/layers/`).
+    pub name: String,
+    /// Git URL of the shared repo.
+    pub remote: String,
+    /// Top-level components of the repo to apply (e.g. `["skills", "commands"]`).
+    /// Nothing outside this list is ever copied.
+    pub components: Vec<String>,
 }
 
 /// Extra include/exclude/remap entries that apply on one machine only, e.g.
@@ -219,6 +237,7 @@ impl Default for Config {
             service: ServiceConfig::default(),
             profiles: ProfilesConfig::default(),
             machines: BTreeMap::new(),
+            layers: Vec::new(),
         }
     }
 }

@@ -77,6 +77,12 @@ pub fn profiles_dir() -> Result<PathBuf, CcError> {
     Ok(base.join("ccsync").join("profiles"))
 }
 
+/// Checkouts of read-only shared layers: `<config>/ccsync/layers/<name>/`.
+pub fn layers_dir() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("layers"))
+}
+
 /// Environment file the installed service sources for secrets the service
 /// manager does not inherit (notably `CCSYNC_PASSPHRASE`):
 /// `<config>/ccsync/service.env`. Created by the user, never by ccsync.

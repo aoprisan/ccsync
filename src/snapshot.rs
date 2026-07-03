@@ -62,7 +62,7 @@ impl SnapshotOptions {
 }
 
 /// File extensions we treat as text and therefore scan for secrets.
-const SCANNED_EXTS: &[&str] = &["json", "toml", "md", "yaml", "yml", "env"];
+pub(crate) const SCANNED_EXTS: &[&str] = &["json", "toml", "md", "yaml", "yml", "env"];
 
 /// Reports copy progress while a snapshot is built. Implemented by the CLI to
 /// drive a progress bar; `snapshot::build` itself stays UI-agnostic.
