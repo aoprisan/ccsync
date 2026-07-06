@@ -1,9 +1,11 @@
-//! ccsync — sync and back up Claude Code settings, sessions, and memory.
+//! ccsync — sync and back up Claude Code and Copilot CLI settings, sessions,
+//! and memory.
 //!
 //! See `README.md` for the full workflow. In short: `snapshot` captures a
-//! sanitized copy of `~/.claude` into a staging area, `push`/`export` transport
-//! it (git remote or encrypted archive), and on another machine `pull`/`import`
-//! followed by `restore` applies it with absolute-path remapping.
+//! sanitized copy of each enabled tool directory (`~/.claude`, `~/.copilot`)
+//! into a staging area, `push`/`export` transport it (git remote or encrypted
+//! archive), and on another machine `pull`/`import` followed by `restore`
+//! applies it with absolute-path remapping.
 
 mod archive;
 mod backups;
@@ -21,6 +23,7 @@ mod restore;
 mod service;
 mod snapshot;
 mod theme;
+mod tools;
 mod tui;
 
 use std::io::IsTerminal;
@@ -70,15 +73,17 @@ fn run() -> Result<()> {
         Command::Snapshot {
             dry_run,
             allow_secrets,
-        } => cmd_snapshot(&config, dry_run, allow_secrets),
-        Command::Status => cmd_snapshot(&config, true, true),
+            tool,
+        } => cmd_snapshot(&config, dry_run, allow_secrets, &tool),
+        Command::Status { tool } => cmd_snapshot(&config, true, true, &tool),
         Command::Push { archive, remote } => cmd_push(&config, archive, remote),
         Command::Pull { archive, remote } => cmd_pull(&config, archive, remote),
         Command::Restore {
             dry_run,
             no_remap,
             overwrite,
-        } => cmd_restore(&config, dry_run, no_remap, overwrite),
+            tool,
+        } => cmd_restore(&config, dry_run, no_remap, overwrite, tool),
         Command::Export {
             file,
             allow_secrets,
@@ -89,8 +94,9 @@ fn run() -> Result<()> {
             remote,
             allow_secrets,
             dry_run,
+            tool,
         } => {
-            cmd_snapshot(&config, dry_run, allow_secrets)?;
+            cmd_snapshot(&config, dry_run, allow_secrets, &tool)?;
             if dry_run {
                 // Report the transport target without touching git or writing an
                 // archive — the snapshot above already listed the files.
@@ -139,10 +145,18 @@ fn cmd_init(
     Ok(())
 }
 
-fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<()> {
-    let claude = paths::claude_dir()?;
+fn cmd_snapshot(
+    config: &Config,
+    dry_run: bool,
+    allow_secrets: bool,
+    tool_filter: &[tools::ToolId],
+) -> Result<()> {
     let staging = paths::staging_dir()?;
     let opts = SnapshotOptions::new(dry_run, allow_secrets, config);
+    let plans: Vec<tools::ToolPlan> = tools::plans(config)?
+        .into_iter()
+        .filter(|p| tool_filter.is_empty() || tool_filter.contains(&p.id))
+        .collect();
 
     // Show a live progress bar for real captures on an interactive terminal;
     // dry-runs and piped output fall back to the plain summary below.
@@ -156,26 +170,44 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
             .progress_chars("=>-"),
         );
         let sink = BarSink { bar };
-        snapshot::build_with_progress(&claude, &staging, config, &opts, &sink)?
+        snapshot::build_with_progress(&plans, &staging, config, &opts, &sink)?
     } else {
-        snapshot::build(&claude, &staging, config, &opts)?
+        snapshot::build(&plans, &staging, config, &opts)?
     };
 
-    let total: u64 = m.files.iter().map(|f| f.size).sum();
-    println!(
-        "{} {} files ({}) from {}",
-        if dry_run { "would capture" } else { "captured" },
-        m.files.len(),
-        human_size(total),
-        claude.display()
-    );
+    // Per-tool summary lines.
+    for entry in &m.tools {
+        let (count, total) = m
+            .files
+            .iter()
+            .filter(|f| f.tool == entry.tool)
+            .fold((0u64, 0u64), |(c, s), f| (c + 1, s + f.size));
+        println!(
+            "{} {count} files ({}) from {}",
+            if dry_run { "would capture" } else { "captured" },
+            human_size(total),
+            entry.source_root
+        );
+    }
+    if m.tools.is_empty() {
+        println!(
+            "{}: no tool data directories found",
+            if dry_run {
+                "would capture nothing"
+            } else {
+                "captured nothing"
+            }
+        );
+    }
     // In dry-run, enumerate each file and the copy it implies so you can see
     // exactly what the backup will carry before anything leaves the machine.
     if dry_run {
         for f in &m.files {
             println!(
-                "  copy {} -> data/{} ({})",
+                "  copy {}/{} -> data/{}/{} ({})",
+                f.tool.as_str(),
                 f.rel_path,
+                f.tool.as_str(),
                 f.rel_path,
                 human_size(f.size)
             );
@@ -245,8 +277,13 @@ fn cmd_pull(
     Ok(())
 }
 
-fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) -> Result<()> {
-    let claude = paths::claude_dir()?;
+fn cmd_restore(
+    config: &Config,
+    dry_run: bool,
+    no_remap: bool,
+    overwrite: bool,
+    tool_filter: Vec<tools::ToolId>,
+) -> Result<()> {
     let staging = paths::staging_dir()?;
     let opts = RestoreOptions {
         dry_run,
@@ -261,8 +298,9 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
         } else {
             None
         },
+        tools: tool_filter,
     };
-    let report = restore::run(&claude, &staging, config, &opts)?;
+    let report = restore::run(&staging, config, &opts)?;
 
     if !report.mappings.is_empty() {
         println!("path remapping:");
@@ -270,22 +308,35 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
             println!("  {} -> {}", m.from, m.to);
         }
     }
-    if let Some(backup) = &report.backup_dir {
+    for (tool, backup) in &report.backups {
         println!(
             "backed up existing {} to {}",
-            claude.display(),
+            paths::tool_dir(*tool)?.display(),
             backup.display()
         );
     }
     if let Some(backup) = &report.claude_json_backup {
         println!("backed up existing ~/.claude.json to {}", backup.display());
     }
-    println!(
-        "{} {} files to {}",
-        if dry_run { "would restore" } else { "restored" },
-        report.files_written.len(),
-        claude.display()
-    );
+    // Per-tool restored counts.
+    for &tool in tools::ToolId::all() {
+        let prefix = format!("{}/", tool.as_str());
+        let count = report
+            .files_written
+            .iter()
+            .filter(|f| f.starts_with(&prefix))
+            .count();
+        if count > 0 {
+            println!(
+                "{} {count} files to {}",
+                if dry_run { "would restore" } else { "restored" },
+                paths::tool_dir(tool)?.display()
+            );
+        }
+    }
+    if report.files_written.is_empty() {
+        println!("nothing to restore");
+    }
     if report.mcp_servers_restored > 0 {
         println!(
             "{} {} local MCP server(s) into ~/.claude.json",
@@ -298,7 +349,7 @@ fn cmd_restore(config: &Config, dry_run: bool, no_remap: bool, overwrite: bool) 
 
 fn cmd_export(config: &Config, file: &std::path::Path, allow_secrets: bool) -> Result<()> {
     let pass = archive::passphrase_from_env()?;
-    cmd_snapshot(config, false, allow_secrets)?;
+    cmd_snapshot(config, false, allow_secrets, &[])?;
     let staging = paths::staging_dir()?;
     archive::create(&staging, file, &pass)?;
     println!("wrote encrypted archive to {}", file.display());

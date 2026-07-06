@@ -20,6 +20,9 @@ pub enum CcError {
     #[error("potential secret detected in {file}: {hint}\n  re-run with --allow-secrets to include it anyway")]
     SecretDetected { file: String, hint: String },
 
+    #[error("snapshot manifest version {found} is newer than this ccsync supports (max {max}); upgrade ccsync before restoring")]
+    ManifestTooNew { found: u32, max: u32 },
+
     #[error("git command failed: {0}")]
     Git(String),
 

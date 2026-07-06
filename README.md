@@ -1,15 +1,15 @@
 # ccsync
 
-Sync and back up your **Claude Code** settings, sessions, and memory across
-machines.
+Sync and back up your **Claude Code** and **GitHub Copilot CLI** settings,
+sessions, and memory across machines.
 
-Claude Code keeps its state in `~/.claude/` (and `~/.claude.json`). Some of it
-is portable (settings, `CLAUDE.md`, skills, agents, commands), some is
-machine-specific (session transcripts whose directory names encode absolute
-working-directory paths), and some is **sensitive and must never leave the
-machine** (`~/.claude/.credentials.json`, OAuth tokens). A plain `rsync` of
-`~/.claude` either leaks credentials or produces sessions that don't resolve on
-the target machine.
+Claude Code keeps its state in `~/.claude/` (and `~/.claude.json`); Copilot CLI
+keeps its state in `~/.copilot/`. Some of it is portable (settings, `CLAUDE.md`,
+skills, agents, commands), some is machine-specific (session state that embeds
+absolute working-directory paths), and some is **sensitive and must never leave
+the machine** (`~/.claude/.credentials.json`, `~/.copilot/config.json`, OAuth
+tokens). A plain `rsync` of these directories either leaks credentials or
+produces sessions that don't resolve on the target machine.
 
 `ccsync` solves this by taking a **sanitized, manifested snapshot**, transporting
 it over a **git remote** or an **encrypted archive**, and **remapping absolute
@@ -17,6 +17,8 @@ paths** on restore so your conversation history shows up correctly on the new
 machine.
 
 ## What gets synced
+
+### Claude Code (`~/.claude`)
 
 **Included (portable):**
 `settings.json`, `CLAUDE.md`, `keybindings.json`, and the `rules/`, `skills/`,
@@ -43,6 +45,31 @@ are not touched — they already travel with their repository.
 wholesale because it embeds OAuth tokens and per-project trust decisions; only
 its `mcpServers` definitions are bundled (see above).
 
+### GitHub Copilot CLI (`~/.copilot`)
+
+Captured by default when `~/.copilot` exists; disable with `enabled = false`
+under `[copilot]` in the config, or limit any run with `--tool claude` /
+`--tool copilot`. Honors `COPILOT_HOME`.
+
+**Included (portable):**
+`settings.json`, `mcp-config.json`, `copilot-instructions.md`, `lsp-config.json`,
+`permissions-config.json`, and the `instructions/`, `agents/`, `skills/`,
+`extensions/`, `hooks/` directories.
+
+**Included (sessions, with path remapping):**
+`session-state/` and `command-history-state/`. Copilot session dirs are keyed
+by session ID, so remapping rewrites absolute-path prefixes inside the JSON
+content (including `permissions-config.json`'s per-project keys) without any
+directory renaming.
+
+**Never synced:**
+`config.json` at the root of `~/.copilot` (hard-blocked — it stores auth
+tokens), `mcp-oauth-config/` and `mcp-secrets/` (hard-blocked keychain
+fallbacks), plus machine-local state (`logs/`, `ide/`, `installed-plugins/`,
+`plugin-data/`, and the rebuildable `session-store.db`).
+
+### Secret scanning
+
 Config files — including the extracted MCP server definitions — are scanned for
 secret-shaped strings (API keys, tokens) before inclusion; a match aborts the
 snapshot unless you pass `--allow-secrets`. A server `env` holding a literal API
@@ -64,7 +91,7 @@ cargo build --release   # binary at target/release/ccsync
 # Configure a git remote (a private repo you control) for sync + versioned backup.
 ccsync init --remote git@github.com:you/claude-backup.git
 
-# Snapshot ~/.claude and push it.
+# Snapshot ~/.claude and ~/.copilot and push them.
 ccsync backup
 ```
 
@@ -73,7 +100,7 @@ ccsync backup
 ```sh
 ccsync init --remote git@github.com:you/claude-backup.git
 ccsync pull
-ccsync restore         # backs up the existing ~/.claude first, then applies + remaps
+ccsync restore         # backs up the existing tool dirs first, then applies + remaps
 ```
 
 ### Offline / portable backup (encrypted archive)
@@ -94,14 +121,14 @@ ccsync restore
 | Command | Description |
 |---------|-------------|
 | `ccsync init [--remote URL]` | Write the default config to `~/.config/ccsync/config.toml`. |
-| `ccsync snapshot [--dry-run] [--allow-secrets]` | Capture a sanitized snapshot into the staging dir. |
-| `ccsync status` | Show what a snapshot would capture (dry run). |
+| `ccsync snapshot [--dry-run] [--allow-secrets] [--tool T]` | Capture a sanitized snapshot into the staging dir. |
+| `ccsync status [--tool T]` | Show what a snapshot would capture (dry run). |
 | `ccsync push [--remote URL] [--archive FILE]` | Publish the staged snapshot (git by default). |
 | `ccsync pull [--remote URL] [--archive FILE]` | Fetch a snapshot into staging. |
-| `ccsync restore [--dry-run] [--no-remap] [--overwrite]` | Apply the staged snapshot to `~/.claude`. |
+| `ccsync restore [--dry-run] [--no-remap] [--overwrite] [--tool T]` | Apply the staged snapshot to the local tool dirs. |
 | `ccsync export FILE` | One-shot snapshot → encrypted archive. |
 | `ccsync import FILE` | Encrypted archive → staging. |
-| `ccsync backup [--remote URL] [--archive FILE]` | `snapshot` + `push`. |
+| `ccsync backup [--remote URL] [--archive FILE] [--tool T]` | `snapshot` + `push`. |
 | `ccsync tui` | Launch an interactive terminal UI: review what would be backed up, browse local backups, and push/export. |
 | `ccsync daemon` | Run the background backup loop in the foreground (used by the installed service). |
 | `ccsync service install\|uninstall` | Register/remove an OS service (systemd user unit / launchd agent). |
@@ -156,7 +183,7 @@ only; on Windows use `ccsync daemon` under your own supervisor.)
 Each tick builds a sanitized snapshot and publishes it to `destination`:
 
 - **`git`** — pushes to the configured `remote`, exactly like `ccsync push`.
-- **`archive`** — writes a timestamped `claude-backup-<ts>.tar.gz.age` into
+- **`archive`** — writes a timestamped `ccsync-backup-<ts>.tar.gz.age` into
   `backup_dir` (default `~/.config/ccsync/backups`). These appear in `ccsync tui`.
 
 **Things to know:**
@@ -199,24 +226,27 @@ transcripts verbatim on a same-path machine.
 
 ## Safety
 
-- **Credentials never leave the machine** — `.credentials.json` is hard-blocked
-  in the capture path regardless of configuration.
+- **Credentials never leave the machine** — Claude's `.credentials.json` and
+  Copilot's root `config.json`, `mcp-oauth-config/`, and `mcp-secrets/` are
+  hard-blocked in the capture path regardless of configuration.
 - **Archives are always encrypted** with [age](https://age-encryption.org/)
   using `CCSYNC_PASSPHRASE`; there is no plaintext mode.
-- **`restore` is reversible** — it backs up the existing `~/.claude` to a
-  timestamped `~/.claude.ccsync-backup-<ts>` directory before writing, supports
-  `--dry-run`, and deep-merges `settings.json` by default (`--overwrite` to
-  replace). When MCP servers are bundled, `~/.claude.json` is likewise copied to
-  a timestamped `~/.claude.json.ccsync-backup-<ts>` before its `mcpServers` are
-  merged.
+- **`restore` is reversible** — it backs up each existing tool dir to a
+  timestamped sibling (`~/.claude.ccsync-backup-<ts>`,
+  `~/.copilot.ccsync-backup-<ts>`) before writing, supports `--dry-run`, and
+  deep-merges JSON configs by default (`--overwrite` to replace; JSONC files
+  like Copilot's `settings.json` are copied verbatim). When MCP servers are
+  bundled, `~/.claude.json` is likewise copied to a timestamped
+  `~/.claude.json.ccsync-backup-<ts>` before its `mcpServers` are merged.
 
 ## Configuration
 
 `<config>/ccsync/config.toml` (created by `ccsync init`) controls the
-`include`/`exclude` sets, `include_sessions`, `include_mcp_servers`, the git
-`remote`, the `[remap]` table, and the `[service]` table (see
-[Background service](#background-service)). `CLAUDE_CONFIG_DIR` is honored when
-locating the source directory.
+Claude `include`/`exclude` sets, `include_sessions`, `include_mcp_servers`, the
+git `remote`, the `[remap]` table, the `[copilot]` table (Copilot's `enabled`
+flag and its own `include`/`exclude`/`include_sessions`), and the `[service]`
+table (see [Background service](#background-service)). `CLAUDE_CONFIG_DIR` and
+`COPILOT_HOME` are honored when locating the source directories.
 
 > **Where is `<config>`?** All of ccsync's own files (config, staging,
 > backups, repo cache, daemon pid/log) live under your platform config

@@ -4,8 +4,9 @@
 //! lives under `~/.config/ccsync/staging`, versioned snapshots accumulate as
 //! commits in the local repo cache (`~/.config/ccsync/repo`), managed encrypted
 //! archives are written into `~/.config/ccsync/backups`, and `restore` leaves
-//! timestamped `~/.claude.ccsync-backup-*` copies next to `~/.claude`. This
-//! module gathers all four into one list for the TUI to display.
+//! timestamped `<root>.ccsync-backup-*` copies next to each tool root
+//! (`~/.claude`, `~/.copilot`). This module gathers all four into one list for
+//! the TUI to display.
 
 use std::path::PathBuf;
 
@@ -25,7 +26,7 @@ pub enum BackupKind {
     GitCommit,
     /// A managed encrypted archive under `~/.config/ccsync/backups`.
     Archive,
-    /// A timestamped `~/.claude.ccsync-backup-*` left behind by `restore`.
+    /// A timestamped `<root>.ccsync-backup-*` left behind by `restore`.
     RestoreBackup,
 }
 
@@ -171,39 +172,41 @@ fn collect_archives(out: &mut Vec<LocalBackup>) {
 }
 
 fn collect_restore_backups(out: &mut Vec<LocalBackup>) {
-    let Ok(claude) = paths::claude_dir() else {
-        return;
-    };
-    let Some(parent) = claude.parent().map(|p| p.to_path_buf()) else {
-        return;
-    };
-    let base = claude
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".claude".to_string());
-    let prefix = format!("{base}.ccsync-backup-");
-    let Ok(entries) = std::fs::read_dir(&parent) else {
-        return;
-    };
     let mut backups: Vec<LocalBackup> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&prefix) {
+    for &tool in crate::tools::ToolId::all() {
+        let Ok(root) = paths::tool_dir(tool) else {
             continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) if m.is_dir() => m,
-            _ => continue,
         };
-        let created_at = meta.modified().ok().map(format_mtime);
-        backups.push(LocalBackup {
-            kind: BackupKind::RestoreBackup,
-            label: name,
-            created_at,
-            detail: "pre-restore copy of ~/.claude".to_string(),
-            size: None,
-            path: Some(entry.path()),
-        });
+        let Some(parent) = root.parent().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        let base = root
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!(".{}", tool.as_str()));
+        let prefix = format!("{base}.ccsync-backup-");
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) if m.is_dir() => m,
+                _ => continue,
+            };
+            let created_at = meta.modified().ok().map(format_mtime);
+            backups.push(LocalBackup {
+                kind: BackupKind::RestoreBackup,
+                label: name,
+                created_at,
+                detail: format!("pre-restore copy of {}", root.display()),
+                size: None,
+                path: Some(entry.path()),
+            });
+        }
     }
     backups.sort_by(|a, b| b.label.cmp(&a.label));
     out.extend(backups);
@@ -266,11 +269,13 @@ mod tests {
                 rel_path: "settings.json".into(),
                 sha256: "abc".into(),
                 size: 100,
+                tool: crate::tools::ToolId::Claude,
             });
             m.files.push(FileEntry {
                 rel_path: "CLAUDE.md".into(),
                 sha256: "def".into(),
                 size: 28,
+                tool: crate::tools::ToolId::Claude,
             });
             m.write_to(&staging).unwrap();
 
@@ -304,27 +309,38 @@ mod tests {
     }
 
     #[test]
-    fn restore_backups_are_listed() {
+    fn restore_backups_are_listed_for_every_tool() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let claude = home.join(".claude");
+        let copilot = home.join(".copilot");
         std::fs::create_dir_all(&claude).unwrap();
+        std::fs::create_dir_all(&copilot).unwrap();
         std::fs::create_dir_all(home.join(".claude.ccsync-backup-20260101-101010")).unwrap();
+        std::fs::create_dir_all(home.join(".copilot.ccsync-backup-20260202-101010")).unwrap();
         // Unrelated sibling dir must be ignored.
         std::fs::create_dir_all(home.join(".config")).unwrap();
 
         let prev_claude = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let prev_copilot = std::env::var("COPILOT_HOME").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
+        std::env::set_var("COPILOT_HOME", &copilot);
         let mut out = Vec::new();
         collect_restore_backups(&mut out);
         match prev_claude {
             Some(p) => std::env::set_var("CLAUDE_CONFIG_DIR", p),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
+        match prev_copilot {
+            Some(p) => std::env::set_var("COPILOT_HOME", p),
+            None => std::env::remove_var("COPILOT_HOME"),
+        }
 
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, BackupKind::RestoreBackup);
-        assert_eq!(out[0].label, ".claude.ccsync-backup-20260101-101010");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|b| b.kind == BackupKind::RestoreBackup));
+        // Newest label first across tools.
+        assert_eq!(out[0].label, ".copilot.ccsync-backup-20260202-101010");
+        assert_eq!(out[1].label, ".claude.ccsync-backup-20260101-101010");
     }
 
     #[test]

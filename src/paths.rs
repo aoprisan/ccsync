@@ -31,6 +31,30 @@ pub fn claude_dir() -> Result<PathBuf, CcError> {
     Ok(home.join(".claude"))
 }
 
+/// Locate the GitHub Copilot CLI directory.
+///
+/// Honors `COPILOT_HOME` (which replaces the whole path, mirroring
+/// `CLAUDE_CONFIG_DIR`) first, then falls back to `~/.copilot`.
+pub fn copilot_dir() -> Result<PathBuf, CcError> {
+    if let Ok(dir) = std::env::var("COPILOT_HOME") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    let home = dirs::home_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(home.join(".copilot"))
+}
+
+/// The single generic resolver for a tool's data directory. All multi-tool
+/// code paths route through here so each tool's env override is honored in
+/// exactly one place.
+pub fn tool_dir(id: crate::tools::ToolId) -> Result<PathBuf, CcError> {
+    match id {
+        crate::tools::ToolId::Claude => claude_dir(),
+        crate::tools::ToolId::Copilot => copilot_dir(),
+    }
+}
+
 /// The user's home directory, used as the default remap source/target.
 pub fn home_dir() -> Result<PathBuf, CcError> {
     dirs::home_dir().ok_or(CcError::ClaudeDirNotFound)
@@ -108,6 +132,22 @@ pub fn decode_path(encoded: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_dir_honors_copilot_home() {
+        let prev = std::env::var("COPILOT_HOME").ok();
+        std::env::set_var("COPILOT_HOME", "/custom/copilot-home");
+        assert_eq!(
+            copilot_dir().unwrap(),
+            PathBuf::from("/custom/copilot-home")
+        );
+        std::env::remove_var("COPILOT_HOME");
+        let fallback = copilot_dir().unwrap();
+        assert!(fallback.ends_with(".copilot"));
+        if let Some(p) = prev {
+            std::env::set_var("COPILOT_HOME", p);
+        }
+    }
 
     #[test]
     fn encode_roundtrip_unix() {

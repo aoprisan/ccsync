@@ -1,15 +1,21 @@
-//! Path remapping. Session transcripts live under directories whose names
-//! encode the absolute working directory on the source machine, and the JSONL
-//! transcripts themselves embed that absolute path in their `cwd` field and in
-//! tool references. When restoring onto a machine with a different home
-//! directory (or a different checkout location), those paths must be rewritten
-//! so Claude Code's session picker finds them and tool references resolve.
+//! Path remapping. Session state embeds absolute paths from the source
+//! machine; when restoring onto a machine with a different home directory (or
+//! a different checkout location), those paths must be rewritten so each
+//! tool's session picker finds them and tool references resolve.
 //!
-//! This module operates on the staged `data/` tree in place, before `restore`
-//! copies it into `~/.claude`:
+//! This module operates on a tool's staged data subtree in place, before
+//! `restore` copies it out. How depends on the tool's
+//! [`RemapStrategy`](crate::tools::RemapStrategy):
+//!
+//! - `ClaudeProjects` (Claude Code): session dirs under `projects/` are named
+//!   after the dash-encoded absolute cwd, and transcripts embed that path.
 //!   1. rewrite absolute-path prefixes inside every `projects/**/ *.jsonl`, then
 //!   2. rename each encoded `projects/<encoded>` directory to its re-encoded
 //!      target name.
+//! - `ContentOnly` (Copilot CLI): session dirs are keyed by session ID, but
+//!   `session-state/**` content and `permissions-config.json` keys embed
+//!   absolute paths. Rewrite prefixes inside every `*.json`/`*.jsonl` in the
+//!   subtree; no directory renaming.
 
 use std::fs;
 use std::path::Path;
@@ -18,6 +24,7 @@ use anyhow::{Context, Result};
 
 use crate::manifest::Manifest;
 use crate::paths;
+use crate::tools::RemapStrategy;
 
 /// A single prefix translation: any absolute path beginning with `from` is
 /// rewritten to begin with `to`.
@@ -49,15 +56,43 @@ pub fn build_mappings(
         });
     }
     // Longest source prefix first.
-    mappings.sort_by(|a, b| b.from.len().cmp(&a.from.len()));
+    mappings.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     mappings
 }
 
-/// Apply `mappings` to the staged `data/projects` tree in place.
-pub fn apply(data_root: &Path, mappings: &[Mapping]) -> Result<()> {
+/// Apply `mappings` to a tool's staged data subtree in place, using the
+/// tool's remap strategy.
+pub fn apply(data_root: &Path, mappings: &[Mapping], strategy: &RemapStrategy) -> Result<()> {
     if mappings.is_empty() {
         return Ok(());
     }
+    match strategy {
+        RemapStrategy::ClaudeProjects => apply_claude_projects(data_root, mappings),
+        RemapStrategy::ContentOnly => apply_content_only(data_root, mappings),
+    }
+}
+
+/// Rewrite `*.json`/`*.jsonl` contents anywhere under `data_root`. Used for
+/// tools (Copilot) whose state embeds absolute paths — session events,
+/// permission keys — but whose directory names carry no paths.
+fn apply_content_only(data_root: &Path, mappings: &[Mapping]) -> Result<()> {
+    for entry in walkdir::WalkDir::new(data_root) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let ext = entry.path().extension().and_then(|e| e.to_str());
+        if matches!(ext, Some("json") | Some("jsonl")) {
+            rewrite_file(entry.path(), mappings)
+                .with_context(|| format!("remapping {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The Claude Code strategy: rewrite transcripts under `projects/`, then
+/// rename the dash-encoded project directories.
+fn apply_claude_projects(data_root: &Path, mappings: &[Mapping]) -> Result<()> {
     let projects = data_root.join("projects");
     if !projects.is_dir() {
         return Ok(());
@@ -103,9 +138,14 @@ pub fn apply(data_root: &Path, mappings: &[Mapping]) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite every mapped prefix occurrence in a file's text content.
+/// Rewrite every mapped prefix occurrence in a file's text content. Files
+/// that are not valid UTF-8 (e.g. binary workspace artifacts riding along in
+/// Copilot session state) are left untouched rather than erroring.
 fn rewrite_file(path: &Path, mappings: &[Mapping]) -> Result<()> {
-    let content = fs::read_to_string(path)?;
+    let bytes = fs::read(path)?;
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Ok(());
+    };
     let mut out = content.clone();
     for m in mappings {
         if out.contains(&m.from) {
@@ -179,7 +219,7 @@ mod tests {
         let mappings = build_mappings(&manifest, "/home/bob", &Default::default());
         // sanity: also exercise explicit override path
         let _ = &mut manifest;
-        apply(&data, &mappings).unwrap();
+        apply(&data, &mappings, &RemapStrategy::ClaudeProjects).unwrap();
 
         // Directory renamed to the new home.
         let new_dir = data.join("projects/-home-bob-proj");
@@ -198,8 +238,48 @@ mod tests {
             &data.join("projects/-home-x-p/s.jsonl"),
             "{\"cwd\":\"/home/x/p\"}\n",
         );
-        apply(&data, &[]).unwrap();
+        apply(&data, &[], &RemapStrategy::ClaudeProjects).unwrap();
         assert!(data.join("projects/-home-x-p/s.jsonl").exists());
+    }
+
+    #[test]
+    fn content_only_rewrites_json_everywhere_without_renames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(
+            &data.join("session-state/abc123/events.jsonl"),
+            "{\"cwd\":\"/Users/alice/proj\"}\n",
+        );
+        write(
+            &data.join("permissions-config.json"),
+            r#"{"/Users/alice/proj":{"allow":["shell"]}}"#,
+        );
+        // Prose is deliberately not rewritten.
+        write(
+            &data.join("copilot-instructions.md"),
+            "see /Users/alice/proj",
+        );
+        // Binary content must be skipped, not errored on.
+        fs::write(
+            data.join("session-state/abc123/artifact.json"),
+            [0xff, 0xfe, 0x00],
+        )
+        .unwrap();
+
+        let manifest = Manifest::new("h".into(), "/Users/alice".into());
+        let mappings = build_mappings(&manifest, "/home/bob", &Default::default());
+        apply(&data, &mappings, &RemapStrategy::ContentOnly).unwrap();
+
+        // Session dir name unchanged (keyed by ID, not cwd).
+        let events = fs::read_to_string(data.join("session-state/abc123/events.jsonl")).unwrap();
+        assert!(events.contains("/home/bob/proj"));
+        assert!(!events.contains("/Users/alice"));
+        // Absolute-path keys are plain strings in the text — rewritten too.
+        let perms = fs::read_to_string(data.join("permissions-config.json")).unwrap();
+        assert!(perms.contains("\"/home/bob/proj\""));
+        // Markdown untouched.
+        let md = fs::read_to_string(data.join("copilot-instructions.md")).unwrap();
+        assert!(md.contains("/Users/alice/proj"));
     }
 
     #[test]

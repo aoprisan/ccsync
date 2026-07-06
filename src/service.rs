@@ -1,9 +1,10 @@
 //! Background backup service.
 //!
 //! `ccsync daemon` runs a foreground loop that, on a fixed interval, builds a
-//! sanitized snapshot of `~/.claude` and publishes it to the destination
-//! configured in the `[service]` table — either the git `remote` or a
-//! timestamped encrypted archive. It is pure orchestration over the existing
+//! sanitized snapshot of the enabled tool directories (`~/.claude`,
+//! `~/.copilot`) and publishes it to the destination configured in the
+//! `[service]` table — either the git `remote` or a timestamped encrypted
+//! archive. It is pure orchestration over the existing
 //! `snapshot`, `git`, and `archive` modules; no new transport logic lives here.
 //!
 //! `ccsync service install|uninstall|status` registers that loop with the
@@ -26,10 +27,10 @@ use crate::snapshot::{self, SnapshotOptions};
 
 /// Run a single snapshot+publish cycle and return a one-line human summary.
 pub fn run_once(config: &Config) -> Result<String> {
-    let claude = paths::claude_dir()?;
+    let plans = crate::tools::plans(config)?;
     let staging = paths::staging_dir()?;
     let opts = SnapshotOptions::new(false, config.service.allow_secrets, config);
-    let manifest = snapshot::build(&claude, &staging, config, &opts)?;
+    let manifest = snapshot::build(&plans, &staging, config, &opts)?;
     let files = manifest.files.len();
 
     match config.service.destination {
@@ -84,13 +85,14 @@ pub fn archive_dir(config: &Config) -> Result<PathBuf> {
     }
 }
 
-/// Timestamped archive filename, e.g. `claude-backup-20260617-142530.tar.gz.age`.
+/// Timestamped archive filename, e.g. `ccsync-backup-20260617-142530.tar.gz.age`.
 ///
 /// The `.tar.gz.age` suffix matches the convention `archive::create` produces
 /// and the `.age` filter `backups::collect_archives` lists, so daemon-written
-/// archives appear in the TUI automatically.
+/// archives appear in the TUI automatically (as do older `claude-backup-*`
+/// archives — the listing filters on the suffix only).
 pub fn archive_filename(now: DateTime<Local>) -> String {
-    format!("claude-backup-{}.tar.gz.age", now.format("%Y%m%d-%H%M%S"))
+    format!("ccsync-backup-{}.tar.gz.age", now.format("%Y%m%d-%H%M%S"))
 }
 
 fn destination_label(dest: ServiceDestination) -> &'static str {
@@ -137,7 +139,7 @@ fn warn_about_secrets(service: &ServiceConfig) {
 pub fn systemd_unit(exec_path: &Path) -> String {
     format!(
         "[Unit]\n\
-         Description=ccsync background backup of ~/.claude\n\
+         Description=ccsync background backup of AI CLI data (~/.claude, ~/.copilot)\n\
          After=network-online.target\n\
          \n\
          [Service]\n\
@@ -535,7 +537,7 @@ mod tests {
             .single()
             .unwrap();
         let name = archive_filename(now);
-        assert_eq!(name, "claude-backup-20260617-142530.tar.gz.age");
+        assert_eq!(name, "ccsync-backup-20260617-142530.tar.gz.age");
         // `.age` is what backups::collect_archives filters on.
         assert!(name.ends_with(".age"));
     }

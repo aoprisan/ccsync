@@ -1,6 +1,11 @@
 //! ccsync configuration. The config file (`~/.config/ccsync/config.toml`)
-//! declares what to include/exclude from the Claude Code directory, the git
+//! declares what to include/exclude from each tool's data directory, the git
 //! remote used for sync, and any explicit path-remap pairs applied on restore.
+//!
+//! The top-level `include`/`exclude`/`include_sessions` fields are the
+//! *Claude Code* policy (they predate multi-tool support and stay top-level so
+//! existing configs keep working unchanged); the `[copilot]` table carries the
+//! GitHub Copilot CLI policy.
 //!
 //! The defaults encode the portable-vs-sensitive split described in the design:
 //! credentials and machine-local state are excluded; settings, memory, skills,
@@ -36,6 +41,67 @@ pub struct Config {
     pub remap: BTreeMap<String, String>,
     /// Settings for the background service (`ccsync daemon` / `ccsync service`).
     pub service: ServiceConfig,
+    /// Policy for the GitHub Copilot CLI source (`~/.copilot`).
+    pub copilot: CopilotConfig,
+}
+
+/// Include/exclude policy for the GitHub Copilot CLI directory. Materialized
+/// from the `[copilot]` table in `config.toml`; absent keys fall back to these
+/// defaults, so configs written before the table existed keep loading.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CopilotConfig {
+    /// Whether to capture `~/.copilot` at all. A missing `~/.copilot` is
+    /// always skipped silently, so leaving this on is harmless for users who
+    /// don't run Copilot.
+    pub enabled: bool,
+    /// Relative paths under `~/.copilot` to include.
+    pub include: Vec<String>,
+    /// Relative paths (or path prefixes) under `~/.copilot` to always exclude.
+    pub exclude: Vec<String>,
+    /// Whether to capture session history (`session-state/`,
+    /// `command-history-state/`).
+    pub include_sessions: bool,
+}
+
+impl Default for CopilotConfig {
+    fn default() -> Self {
+        CopilotConfig {
+            enabled: true,
+            include: vec![
+                "settings.json".into(),
+                "mcp-config.json".into(),
+                "copilot-instructions.md".into(),
+                "instructions".into(),
+                "agents".into(),
+                "skills".into(),
+                "extensions".into(),
+                "hooks".into(),
+                "lsp-config.json".into(),
+                "permissions-config.json".into(),
+                // Session history. Gated additionally by `include_sessions`.
+                "session-state".into(),
+                "command-history-state".into(),
+            ],
+            exclude: vec![
+                // Sensitive: never sync. These duplicate the hard block in
+                // `tools::spec` so default runs skip them silently instead of
+                // aborting on the guard.
+                "config.json".into(),
+                "mcp-oauth-config".into(),
+                "mcp-secrets".into(),
+                // Machine-local / cache / runtime state.
+                "logs".into(),
+                "ide".into(),
+                "installed-plugins".into(),
+                "plugin-data".into(),
+                // Binary SQLite checkpoint index; Copilot rebuilds it with
+                // `/chronicle reindex`, and merging it is hopeless anyway.
+                "session-store.db".into(),
+            ],
+            include_sessions: true,
+        }
+    }
 }
 
 /// Where the background service publishes each automatic backup.
@@ -81,10 +147,6 @@ impl Default for ServiceConfig {
     }
 }
 
-/// File names that are credentials and must never be captured, regardless of
-/// configuration. Enforced in `snapshot`/`redact` as a hard block.
-pub const CREDENTIAL_BLOCKLIST: &[&str] = &[".credentials.json"];
-
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -122,6 +184,7 @@ impl Default for Config {
             remote: None,
             remap: BTreeMap::new(),
             service: ServiceConfig::default(),
+            copilot: CopilotConfig::default(),
         }
     }
 }
@@ -147,16 +210,6 @@ impl Config {
         std::fs::write(path, text)?;
         Ok(())
     }
-
-    /// True if `rel` (a path relative to `~/.claude`) is excluded by any
-    /// configured exclude prefix.
-    pub fn is_excluded(&self, rel: &str) -> bool {
-        let rel = rel.replace('\\', "/");
-        self.exclude.iter().any(|ex| {
-            let ex = ex.trim_end_matches('/');
-            rel == ex || rel.starts_with(&format!("{ex}/"))
-        })
-    }
 }
 
 #[cfg(test)]
@@ -166,11 +219,51 @@ mod tests {
     #[test]
     fn defaults_exclude_credentials_and_caches() {
         let c = Config::default();
-        assert!(c.is_excluded(".credentials.json"));
-        assert!(c.is_excluded("shell-snapshots/snapshot-1.sh"));
-        assert!(c.is_excluded("session-env/abc/x"));
-        assert!(!c.is_excluded("settings.json"));
-        assert!(!c.is_excluded("projects/-home-user-x/sess.jsonl"));
+        let excluded = |rel: &str| crate::tools::is_excluded_by(&c.exclude, rel);
+        assert!(excluded(".credentials.json"));
+        assert!(excluded("shell-snapshots/snapshot-1.sh"));
+        assert!(excluded("session-env/abc/x"));
+        assert!(!excluded("settings.json"));
+        assert!(!excluded("projects/-home-user-x/sess.jsonl"));
+    }
+
+    #[test]
+    fn copilot_defaults_are_safe_and_on() {
+        let c = CopilotConfig::default();
+        assert!(c.enabled);
+        assert!(c.include_sessions);
+        let excluded = |rel: &str| crate::tools::is_excluded_by(&c.exclude, rel);
+        assert!(excluded("config.json"));
+        assert!(excluded("mcp-oauth-config/token.json"));
+        assert!(excluded("mcp-secrets/index.json"));
+        assert!(excluded("logs/process-1-2.log"));
+        assert!(excluded("session-store.db"));
+        assert!(!excluded("settings.json"));
+        assert!(!excluded("session-state/abc/events.jsonl"));
+    }
+
+    #[test]
+    fn config_without_copilot_table_loads_defaults() {
+        // A config file written before `[copilot]` existed must still load,
+        // picking up the current copilot defaults.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.copilot.enabled);
+        assert!(!loaded.copilot.include.is_empty());
+    }
+
+    #[test]
+    fn partial_copilot_table_keeps_default_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[copilot]\nenabled = false\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(!loaded.copilot.enabled);
+        // Unspecified keys fall back to the defaults, not to empty.
+        assert_eq!(loaded.copilot.include, CopilotConfig::default().include);
+        assert!(loaded.copilot.include_sessions);
     }
 
     #[test]
@@ -195,8 +288,10 @@ mod tests {
     fn config_roundtrips_toml() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        let mut c = Config::default();
-        c.remote = Some("git@example.com:me/ccsync-data.git".into());
+        let mut c = Config {
+            remote: Some("git@example.com:me/ccsync-data.git".into()),
+            ..Config::default()
+        };
         c.remap.insert("/Users/alice".into(), "/home/alice".into());
         c.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();

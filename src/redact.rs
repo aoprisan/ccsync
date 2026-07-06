@@ -4,18 +4,36 @@
 //! `--allow-secrets`. This is a best-effort guard, not a guarantee — it exists
 //! to stop the obvious foot-guns (a literal API key pasted into settings).
 //!
-//! Credential *files* (`.credentials.json`) are handled separately as a hard
-//! block in `snapshot`; they are never scanned because they are never captured.
+//! Credential *files* are handled separately as a hard block in `snapshot`:
+//! each tool's [`crate::tools::ToolSpec`] carries a blocklist checked here by
+//! [`credential_block_match`]. Blocked files are never scanned because they
+//! are never captured.
 
 use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::config::CREDENTIAL_BLOCKLIST;
+use crate::tools::{CredentialBlock, ToolSpec};
 
-/// Returns the file name if `name` is on the credential blocklist.
-pub fn is_credential_file(name: &str) -> bool {
-    CREDENTIAL_BLOCKLIST.contains(&name)
+/// Check `rel` (a root-relative path with forward slashes) against a tool's
+/// credential hard-block list. Returns the matched blocklist entry so the
+/// caller can name it in the abort error.
+pub fn credential_block_match(spec: &ToolSpec, rel: &str) -> Option<String> {
+    for block in spec.credential_blocklist {
+        match block {
+            CredentialBlock::Name(name) => {
+                if rel.split('/').any(|component| component == *name) {
+                    return Some((*name).to_string());
+                }
+            }
+            CredentialBlock::Root(root) => {
+                if rel == *root || rel.starts_with(&format!("{root}/")) {
+                    return Some((*root).to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn secret_patterns() -> &'static [Regex] {
@@ -54,6 +72,7 @@ pub fn scan_for_secrets(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{spec, ToolId};
 
     #[test]
     fn flags_obvious_keys() {
@@ -69,8 +88,27 @@ mod tests {
     }
 
     #[test]
-    fn detects_credential_file_by_name() {
-        assert!(is_credential_file(".credentials.json"));
-        assert!(!is_credential_file("settings.json"));
+    fn claude_blocks_credentials_at_any_depth() {
+        let s = spec(ToolId::Claude);
+        assert!(credential_block_match(s, ".credentials.json").is_some());
+        assert!(credential_block_match(s, "backups/old/.credentials.json").is_some());
+        assert!(credential_block_match(s, "settings.json").is_none());
+    }
+
+    #[test]
+    fn copilot_blocks_root_config_but_not_nested() {
+        let s = spec(ToolId::Copilot);
+        // `~/.copilot/config.json` holds auth tokens.
+        assert!(credential_block_match(s, "config.json").is_some());
+        // A skill's own config.json is not a credential file.
+        assert!(credential_block_match(s, "skills/my-skill/config.json").is_none());
+    }
+
+    #[test]
+    fn copilot_blocks_secret_dirs_recursively() {
+        let s = spec(ToolId::Copilot);
+        assert!(credential_block_match(s, "mcp-oauth-config/token.json").is_some());
+        assert!(credential_block_match(s, "mcp-secrets/index.json").is_some());
+        assert!(credential_block_match(s, "mcp-config.json").is_none());
     }
 }

@@ -1,7 +1,8 @@
 //! Interactive terminal UI (`ccsync tui`). A small tabbed ratatui app that
 //! presents three views over the existing backup machinery:
 //!
-//! 1. **What's backed up** — a dry-run snapshot summary of `~/.claude`.
+//! 1. **What's backed up** — a dry-run snapshot summary of the enabled tool
+//!    directories (`~/.claude`, `~/.copilot`).
 //! 2. **Local backups** — the unified list from [`crate::backups`].
 //! 3. **Upload** — run a git push or write an encrypted archive.
 //!
@@ -29,6 +30,7 @@ use crate::config::Config;
 use crate::manifest::Manifest;
 use crate::snapshot::{self, ProgressSink, SnapshotOptions};
 use crate::theme::{Theme, ThemeVariant};
+use crate::tools;
 use crate::{archive, git, paths};
 
 const TAB_TITLES: [&str; 3] = ["What's backed up", "Local backups", "Upload"];
@@ -36,8 +38,8 @@ const UPLOAD_ACTIONS: [&str; 2] = ["Push to git remote", "Export encrypted archi
 
 /// Cached result of the dry-run snapshot used by the first tab.
 enum CaptureSummary {
-    /// The background scan is still walking `~/.claude`; `progress` carries the
-    /// live file/byte counts shown while it runs.
+    /// The background scan is still walking the tool directories; `progress`
+    /// carries the live file/byte counts shown while it runs.
     Loading,
     Ready(Vec<String>),
     Failed(String),
@@ -318,8 +320,7 @@ impl App {
         self.stage_fresh_snapshot(&staging)?;
         let dir = paths::backups_dir()?;
         std::fs::create_dir_all(&dir)?;
-        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let out = dir.join(format!("claude-backup-{ts}.tar.gz.age"));
+        let out = dir.join(crate::service::archive_filename(chrono::Local::now()));
         archive::create(&staging, &out, &pass)?;
         Ok(format!("wrote encrypted archive to {}", out.display()))
     }
@@ -327,9 +328,9 @@ impl App {
     /// Build a fresh (non-dry-run) snapshot into `staging`, mirroring the
     /// `backup`/`export` CLI paths so an upload always reflects current state.
     fn stage_fresh_snapshot(&self, staging: &std::path::Path) -> Result<()> {
-        let claude = paths::claude_dir()?;
+        let plans = tools::plans(&self.config)?;
         let opts = SnapshotOptions::new(false, false, &self.config);
-        snapshot::build(&claude, staging, &self.config, &opts)?;
+        snapshot::build(&plans, staging, &self.config, &opts)?;
         Ok(())
     }
 }
@@ -350,8 +351,8 @@ fn run_load(config: Config, tx: Sender<LoadMsg>) {
 /// error (e.g. a detected secret) so the user sees why a backup would abort.
 /// Per-file progress is streamed through `tx` so the UI can show a scan bar.
 fn compute_capture(config: &Config, tx: &Sender<LoadMsg>) -> CaptureSummary {
-    let claude = match paths::claude_dir() {
-        Ok(c) => c,
+    let plans = match tools::plans(config) {
+        Ok(p) => p,
         Err(e) => return CaptureSummary::Failed(format!("{e}")),
     };
     let staging = match paths::staging_dir() {
@@ -360,47 +361,56 @@ fn compute_capture(config: &Config, tx: &Sender<LoadMsg>) -> CaptureSummary {
     };
     let opts = SnapshotOptions::new(true, true, config);
     let sink = ChannelSink { tx: tx.clone() };
-    match snapshot::build_with_progress(&claude, &staging, config, &opts, &sink) {
-        Ok(manifest) => CaptureSummary::Ready(summarize_manifest(&manifest, &claude)),
+    match snapshot::build_with_progress(&plans, &staging, config, &opts, &sink) {
+        Ok(manifest) => CaptureSummary::Ready(summarize_manifest(&manifest)),
         Err(e) => CaptureSummary::Failed(format!("{e:#}")),
     }
 }
 
-/// Group a manifest's files by their top-level component for a compact summary.
-fn summarize_manifest(m: &Manifest, claude: &std::path::Path) -> Vec<String> {
+/// Group a manifest's files per tool and top-level component for a compact
+/// summary.
+fn summarize_manifest(m: &Manifest) -> Vec<String> {
     let total: u64 = m.files.iter().map(|f| f.size).sum();
-    let mut lines = vec![
-        format!("source: {}", claude.display()),
-        format!(
-            "{} files · {} · {} session root(s)",
-            m.files.len(),
-            backups::human_size(total),
-            m.project_roots.len(),
-        ),
-        String::new(),
-        "included:".to_string(),
-    ];
+    let mut lines = Vec::new();
+    for entry in &m.tools {
+        lines.push(format!("source: {}", entry.source_root));
+    }
+    lines.push(format!(
+        "{} files · {} · {} session root(s)",
+        m.files.len(),
+        backups::human_size(total),
+        m.project_roots.len(),
+    ));
 
-    let mut groups: BTreeMap<String, (usize, u64)> = BTreeMap::new();
-    for f in &m.files {
-        let top = f
-            .rel_path
-            .split('/')
-            .next()
-            .unwrap_or(&f.rel_path)
-            .to_string();
-        let e = groups.entry(top).or_insert((0, 0));
-        e.0 += 1;
-        e.1 += f.size;
+    if m.files.is_empty() {
+        lines.push(String::new());
+        lines.push("  (nothing — tool directories are empty or fully excluded)".to_string());
+        return lines;
     }
-    if groups.is_empty() {
-        lines.push("  (nothing — ~/.claude is empty or fully excluded)".to_string());
-    }
-    for (name, (count, size)) in groups {
-        lines.push(format!(
-            "  {name}  —  {count} file(s), {}",
-            backups::human_size(size)
-        ));
+    for &tool in tools::ToolId::all() {
+        let mut groups: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+        for f in m.files.iter().filter(|f| f.tool == tool) {
+            let top = f
+                .rel_path
+                .split('/')
+                .next()
+                .unwrap_or(&f.rel_path)
+                .to_string();
+            let e = groups.entry(top).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += f.size;
+        }
+        if groups.is_empty() {
+            continue;
+        }
+        lines.push(String::new());
+        lines.push(format!("{} included:", tool.as_str()));
+        for (name, (count, size)) in groups {
+            lines.push(format!(
+                "  {name}  —  {count} file(s), {}",
+                backups::human_size(size)
+            ));
+        }
     }
     lines
 }
@@ -546,11 +556,11 @@ fn ui(f: &mut Frame, app: &mut App) {
 /// still running) it just reports that the index is building.
 fn scan_progress_text(p: &ScanProgress) -> String {
     if p.files_total == 0 {
-        return "Indexing ~/.claude …\n\n  walking files & scanning for secrets".to_string();
+        return "Indexing tool data …\n\n  walking files & scanning for secrets".to_string();
     }
     let pct = (p.files_done as f64 / p.files_total as f64 * 100.0).clamp(0.0, 100.0);
     format!(
-        "Indexing ~/.claude … (scanning for secrets)\n\n{}  {pct:.0}%\n\n{} / {} files  ·  {} / {}",
+        "Indexing tool data … (scanning for secrets)\n\n{}  {pct:.0}%\n\n{} / {} files  ·  {} / {}",
         progress_bar(pct, 32),
         p.files_done,
         p.files_total,
@@ -672,7 +682,8 @@ fn render_upload(f: &mut Frame, area: Rect, app: &App) {
         .map(|p| !p.is_empty())
         .unwrap_or(false);
     let help = format!(
-        "Each action first captures a fresh snapshot of ~/.claude, then:\n\n\
+        "Each action first captures a fresh snapshot of the enabled tool\n\
+         directories (~/.claude, ~/.copilot), then:\n\n\
          • Push to git remote → commits & pushes to the configured remote.\n    \
          remote: {remote}\n\n\
          • Export encrypted archive → writes a timestamped .tar.gz.age into\n    \

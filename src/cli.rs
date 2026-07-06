@@ -4,11 +4,13 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::tools::ToolId;
+
 #[derive(Parser)]
 #[command(
     name = "ccsync",
     version,
-    about = "Sync and back up Claude Code settings, sessions, and memory across machines"
+    about = "Sync and back up Claude Code and Copilot CLI settings, sessions, and memory across machines"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -24,7 +26,8 @@ pub enum Command {
         remote: Option<String>,
     },
 
-    /// Build a sanitized snapshot of ~/.claude into the staging directory.
+    /// Build a sanitized snapshot of the enabled tool directories
+    /// (~/.claude, ~/.copilot) into the staging directory.
     Snapshot {
         /// Report what would be captured without writing anything.
         #[arg(long)]
@@ -32,10 +35,17 @@ pub enum Command {
         /// Include config files even if they look like they contain secrets.
         #[arg(long)]
         allow_secrets: bool,
+        /// Limit to one tool (repeatable). Default: all enabled tools.
+        #[arg(long, value_enum)]
+        tool: Vec<ToolId>,
     },
 
     /// Show what a snapshot would capture (alias for `snapshot --dry-run`).
-    Status,
+    Status {
+        /// Limit to one tool (repeatable). Default: all enabled tools.
+        #[arg(long, value_enum)]
+        tool: Vec<ToolId>,
+    },
 
     /// Publish the staged snapshot to a git remote (default) or an archive.
     Push {
@@ -57,7 +67,8 @@ pub enum Command {
         remote: Option<String>,
     },
 
-    /// Apply the staged snapshot to the local ~/.claude (backs up first).
+    /// Apply the staged snapshot to the local tool directories (backs each
+    /// one up first).
     Restore {
         /// Show what would change without writing anything.
         #[arg(long)]
@@ -68,6 +79,9 @@ pub enum Command {
         /// Replace config files wholesale instead of deep-merging JSON.
         #[arg(long)]
         overwrite: bool,
+        /// Limit to one tool (repeatable). Default: every tool in the snapshot.
+        #[arg(long, value_enum)]
+        tool: Vec<ToolId>,
     },
 
     /// One-shot: snapshot ~/.claude and write an encrypted archive.
@@ -96,6 +110,9 @@ pub enum Command {
         /// stop without snapshotting or pushing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Limit to one tool (repeatable). Default: all enabled tools.
+        #[arg(long, value_enum)]
+        tool: Vec<ToolId>,
     },
 
     /// Copy this binary into a `bin` directory on your PATH and exit.
