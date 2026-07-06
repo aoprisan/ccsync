@@ -1,15 +1,15 @@
 # ccsync
 
-Sync and back up your **Claude Code** settings, sessions, and memory across
-machines.
+Sync and back up your **Claude Code** (and **GitHub Copilot CLI**) settings,
+sessions, and memory across machines.
 
-Claude Code keeps its state in `~/.claude/` (and `~/.claude.json`). Some of it
-is portable (settings, `CLAUDE.md`, skills, agents, commands), some is
-machine-specific (session transcripts whose directory names encode absolute
-working-directory paths), and some is **sensitive and must never leave the
-machine** (`~/.claude/.credentials.json`, OAuth tokens). A plain `rsync` of
-`~/.claude` either leaks credentials or produces sessions that don't resolve on
-the target machine.
+Claude Code keeps its state in `~/.claude/` (and `~/.claude.json`); Copilot CLI
+keeps its state in `~/.copilot/`. Some of it is portable (settings, `CLAUDE.md`,
+skills, agents, commands), some is machine-specific (session state that embeds
+absolute working-directory paths), and some is **sensitive and must never leave
+the machine** (`~/.claude/.credentials.json`, `~/.copilot/config.json`, OAuth
+tokens). A plain `rsync` of these directories either leaks credentials or
+produces sessions that don't resolve on the target machine.
 
 `ccsync` solves this by taking a **sanitized, manifested snapshot**, transporting
 it over a **git remote** or an **encrypted archive**, and **remapping absolute
@@ -63,6 +63,31 @@ is rewritten to `[REDACTED:ccsync]` **in the staged copy only** — the files in
 `~/.claude` are never modified. Set `transcript_secrets = "abort"` for the
 config-file behavior or `"ignore"` to capture transcripts verbatim. The
 scanner is best-effort pattern matching, not a guarantee.
+
+### GitHub Copilot CLI (`~/.copilot`)
+
+When `~/.copilot` exists, snapshots also carry the Copilot CLI tree under the
+reserved `ccsync-copilot/` component (disable with `enabled = false` under
+`[copilot]`; the `COPILOT_HOME` override is honored). On restore it is routed
+back into `~/.copilot` — after backing the existing directory up to a
+timestamped `~/.copilot.ccsync-backup-<ts>` sibling — and `restore --only
+copilot` selects just this tree.
+
+**Included:** `settings.json`, `mcp-config.json`, `copilot-instructions.md`,
+`lsp-config.json`, `permissions-config.json`, and the `instructions/`,
+`agents/`, `skills/`, `extensions/`, `hooks/` directories, plus session
+history (`session-state/`, `command-history-state/`, gated by the table's own
+`include_sessions`). Copilot keys session directories by session ID, so
+remapping rewrites absolute-path prefixes inside the JSON content (including
+`permissions-config.json`'s per-project keys) without renaming directories.
+Copilot's `settings.json` is JSONC; merge mode restores it as a verbatim copy
+rather than attempting a JSON merge.
+
+**Never synced (hard-blocked):** `config.json` at the root of `~/.copilot`
+(auth tokens — a nested `skills/*/config.json` is fine), and the
+keychain-fallback `mcp-oauth-config/` and `mcp-secrets/` stores. Also excluded
+as machine-local: `logs/`, `ide/`, `installed-plugins/`, `plugin-data/`, and
+the rebuildable `session-store.db`.
 
 ## Install
 
@@ -323,8 +348,10 @@ transcripts verbatim on a same-path machine.
 
 ## Safety
 
-- **Credentials never leave the machine** — `.credentials.json` is hard-blocked
-  in the capture path regardless of configuration (including profile stores).
+- **Credentials never leave the machine** — Claude's `.credentials.json` and
+  Copilot's root `config.json`, `mcp-oauth-config/`, and `mcp-secrets/` are
+  hard-blocked in the capture path regardless of configuration (including
+  profile stores).
 - **Snapshots are integrity-checked** — every captured file's SHA-256 is
   recorded in the manifest, and `restore` verifies the staged data against it
   (both directions, plus path-safety checks) before touching anything. Archive
@@ -342,7 +369,8 @@ transcripts verbatim on a same-path machine.
   replace; scalar arrays like `permissions.allow` are unioned so locally-added
   entries survive). When MCP servers are bundled, `~/.claude.json` is likewise
   copied to a timestamped `~/.claude.json.ccsync-backup-<ts>` before its
-  `mcpServers` are merged.
+  `mcpServers` are merged, and a bundled Copilot tree likewise backs
+  `~/.copilot` up to `~/.copilot.ccsync-backup-<ts>` first.
 - **Git remotes are restricted to real transports** (ssh/https/http/file) —
   exotic schemes like `ext::` that execute commands are refused.
 
@@ -353,9 +381,11 @@ transcripts verbatim on a same-path machine.
 `transcript_secrets` (`"redact"` default / `"abort"` / `"ignore"`),
 `confirm_hooks`, the git `remote`, `machine_id`, the `[remap]` table, the
 `[service]` table (see [Background service](#background-service)), the
-`[profiles]` table (see [Profiles](#profiles)), per-machine `[machines.<id>]`
-overrides, and `[[layers]]` entries (see [Shared layers](#shared-layers)).
-`CLAUDE_CONFIG_DIR` is honored when locating the source directory.
+`[profiles]` table (see [Profiles](#profiles)), the `[copilot]` table (the
+Copilot CLI's `enabled` flag and its own `include`/`exclude`/`include_sessions`
+lists), per-machine `[machines.<id>]` overrides, and `[[layers]]` entries (see
+[Shared layers](#shared-layers)). `CLAUDE_CONFIG_DIR` and `COPILOT_HOME` are
+honored when locating the source directories.
 
 > **Where is `<config>`?** All of ccsync's own files (config, staging,
 > backups, repo cache, daemon pid/log) live under your platform config

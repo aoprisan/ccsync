@@ -31,6 +31,20 @@ pub fn claude_dir() -> Result<PathBuf, CcError> {
     Ok(home.join(".claude"))
 }
 
+/// Locate the GitHub Copilot CLI directory.
+///
+/// Honors `COPILOT_HOME` (which replaces the whole path, mirroring
+/// `CLAUDE_CONFIG_DIR`) first, then falls back to `~/.copilot`.
+pub fn copilot_dir() -> Result<PathBuf, CcError> {
+    if let Ok(dir) = std::env::var("COPILOT_HOME") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    let home = dirs::home_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(home.join(".copilot"))
+}
+
 /// The user's home directory, used as the default remap source/target.
 pub fn home_dir() -> Result<PathBuf, CcError> {
     dirs::home_dir().ok_or(CcError::ClaudeDirNotFound)
@@ -160,6 +174,21 @@ pub fn resolve_encoded_on_disk(encoded: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_dir_honors_copilot_home() {
+        let prev = std::env::var("COPILOT_HOME").ok();
+        std::env::set_var("COPILOT_HOME", "/custom/copilot-home");
+        assert_eq!(
+            copilot_dir().unwrap(),
+            PathBuf::from("/custom/copilot-home")
+        );
+        std::env::remove_var("COPILOT_HOME");
+        assert!(copilot_dir().unwrap().ends_with(".copilot"));
+        if let Some(p) = prev {
+            std::env::set_var("COPILOT_HOME", p);
+        }
+    }
 
     #[test]
     fn encode_roundtrip_unix() {

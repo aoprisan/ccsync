@@ -161,6 +161,9 @@ pub fn apply(
             merge: MergeMode::Merge,
             components: Some(&layer.components),
             profiles_root: None,
+            // Layers are `~/.claude` component sources; a layer repo never
+            // carries a Copilot tree.
+            copilot_root: None,
         },
     )
 }

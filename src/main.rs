@@ -1,7 +1,9 @@
-//! ccsync — sync and back up Claude Code settings, sessions, and memory.
+//! ccsync — sync and back up Claude Code (and GitHub Copilot CLI) settings,
+//! sessions, and memory.
 //!
 //! See `README.md` for the full workflow. In short: `snapshot` captures a
-//! sanitized copy of `~/.claude` into a staging area, `push`/`export` transport
+//! sanitized copy of `~/.claude` (plus `~/.copilot` under the reserved
+//! `ccsync-copilot/` component) into a staging area, `push`/`export` transport
 //! it (git remote or encrypted archive), and on another machine `pull`/`import`
 //! followed by `restore` applies it with absolute-path remapping.
 
@@ -9,6 +11,7 @@ mod archive;
 mod backups;
 mod cli;
 mod config;
+mod copilot;
 mod diff;
 mod error;
 mod git;
@@ -403,14 +406,30 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
         snapshot::build(&claude, &staging, config, &opts)?
     };
 
+    let copilot_prefix = format!("{}/", copilot::COMPONENT);
+    let (copilot_count, copilot_bytes) = m
+        .files
+        .iter()
+        .filter(|f| f.rel_path.starts_with(&copilot_prefix))
+        .fold((0usize, 0u64), |(c, s), f| (c + 1, s + f.size));
     let total: u64 = m.files.iter().map(|f| f.size).sum();
     println!(
         "{} {} files ({}) from {}",
         if dry_run { "would capture" } else { "captured" },
-        m.files.len(),
-        human_size(total),
+        m.files.len() - copilot_count,
+        human_size(total - copilot_bytes),
         claude.display()
     );
+    if copilot_count > 0 {
+        if let Some(root) = &opts.copilot_dir {
+            println!(
+                "{} {copilot_count} files ({}) from {}",
+                if dry_run { "would capture" } else { "captured" },
+                human_size(copilot_bytes),
+                root.display()
+            );
+        }
+    }
     // In dry-run, enumerate each file and the copy it implies so you can see
     // exactly what the backup will carry before anything leaves the machine.
     if dry_run {
@@ -442,6 +461,16 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
             unclassified.join(", ")
         );
         println!("    add them to `include` or `exclude` in the config to silence this");
+    }
+    if let Some(root) = opts.copilot_dir.as_deref().filter(|r| r.is_dir()) {
+        let unclassified = copilot::unclassified_top_level(root, config);
+        if !unclassified.is_empty() {
+            println!(
+                "  warning: not classified by [copilot] include/exclude (never synced): {}",
+                unclassified.join(", ")
+            );
+            println!("    add them to the `[copilot]` lists in the config to silence this");
+        }
     }
     if let Some(claude_json) = &opts.claude_json {
         if let Some(doc) = mcp::extract(claude_json)? {
@@ -578,6 +607,17 @@ fn cmd_restore(
 ) -> Result<()> {
     let claude = paths::claude_dir()?;
     let staging = paths::staging_dir()?;
+    // Accept `--only copilot` as an alias for the reserved component name.
+    let only: Vec<String> = only
+        .into_iter()
+        .map(|c| {
+            if c == copilot::ONLY_ALIAS {
+                copilot::COMPONENT.to_string()
+            } else {
+                c
+            }
+        })
+        .collect();
     let opts = RestoreOptions {
         dry_run,
         remap: !no_remap,
@@ -595,6 +635,11 @@ fn cmd_restore(
         components: if only.is_empty() { None } else { Some(only) },
         profiles_root: if config.profiles.sync {
             paths::profiles_dir().ok()
+        } else {
+            None
+        },
+        copilot_root: if config.copilot.enabled {
+            paths::copilot_dir().ok()
         } else {
             None
         },
@@ -617,12 +662,29 @@ fn cmd_restore(
     if let Some(backup) = &report.claude_json_backup {
         println!("backed up existing ~/.claude.json to {}", backup.display());
     }
+    if let Some(backup) = &report.copilot_backup {
+        println!("backed up existing ~/.copilot to {}", backup.display());
+    }
+    let copilot_prefix = format!("{}/", copilot::COMPONENT);
+    let copilot_count = report
+        .files_written
+        .iter()
+        .filter(|f| f.starts_with(&copilot_prefix))
+        .count();
     println!(
         "{} {} files to {}",
         if dry_run { "would restore" } else { "restored" },
-        report.files_written.len(),
+        report.files_written.len() - copilot_count,
         claude.display()
     );
+    if copilot_count > 0 {
+        let copilot_dir = paths::copilot_dir()?;
+        println!(
+            "{} {copilot_count} files to {}",
+            if dry_run { "would restore" } else { "restored" },
+            copilot_dir.display()
+        );
+    }
     if report.mcp_servers_restored > 0 {
         println!(
             "{} {} local MCP server(s) into ~/.claude.json",
@@ -642,6 +704,11 @@ fn cmd_diff(config: &Config, remote: bool, from: Option<String>) -> Result<()> {
     } else {
         None
     };
+    let copilot_dir = if config.copilot.enabled {
+        paths::copilot_dir().ok()
+    } else {
+        None
+    };
     let (entries, other_label) = if remote {
         let url = git::resolve_remote(None, config.remote.as_deref())?;
         let manifest = git::remote_manifest(&url, from.as_deref(), &config.effective_machine_id())?;
@@ -649,13 +716,20 @@ fn cmd_diff(config: &Config, remote: bool, from: Option<String>) -> Result<()> {
             .map(|m| format!("remote snapshot of {m:?}"))
             .unwrap_or_else(|| "remote snapshot".to_string());
         (
-            diff::against_manifest(&claude, &staging, config, claude_json, &manifest)?,
+            diff::against_manifest(
+                &claude,
+                &staging,
+                config,
+                claude_json,
+                copilot_dir,
+                &manifest,
+            )?,
             label,
         )
     } else {
         snapshot::require_staged(&staging)?;
         (
-            diff::against_staged(&claude, &staging, config, claude_json)?,
+            diff::against_staged(&claude, &staging, config, claude_json, copilot_dir)?,
             "staged snapshot".to_string(),
         )
     };

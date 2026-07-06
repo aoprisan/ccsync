@@ -743,8 +743,10 @@ mod tests {
     #[test]
     fn launchd_plist_runs_daemon() {
         let plist = launchd_plist(Path::new("/usr/local/bin/ccsync"));
-        assert!(plist.contains("<string>/usr/local/bin/ccsync</string>"));
-        assert!(plist.contains("<string>daemon</string>"));
+        // The agent runs through /bin/sh so it can source service.env first;
+        // the daemon exec lives inside that shell command string.
+        assert!(plist.contains("<string>/bin/sh</string>"));
+        assert!(plist.contains("exec '/usr/local/bin/ccsync' daemon"));
         assert!(plist.contains("com.ccsync.daemon"));
     }
 

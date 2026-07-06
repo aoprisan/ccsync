@@ -40,19 +40,31 @@ pub fn against_staged(
     staging: &Path,
     config: &Config,
     claude_json: Option<std::path::PathBuf>,
+    copilot_dir: Option<std::path::PathBuf>,
 ) -> Result<Vec<DiffEntry>> {
     let staged = Manifest::read_from(staging)?;
-    against_manifest(claude_dir, staging, config, claude_json, &staged)
+    against_manifest(
+        claude_dir,
+        staging,
+        config,
+        claude_json,
+        copilot_dir,
+        &staged,
+    )
 }
 
 /// Diff the local `~/.claude` (as a snapshot would capture it) against an
 /// arbitrary manifest — e.g. one read from the remote, so `diff --remote`
-/// needs no data transfer beyond the manifest itself.
+/// needs no data transfer beyond the manifest itself. `copilot_dir` includes
+/// the local Copilot tree in the local side, so a snapshot that carries
+/// `ccsync-copilot/` diffs against the live `~/.copilot` instead of reporting
+/// the whole component as missing locally.
 pub fn against_manifest(
     claude_dir: &Path,
     staging: &Path,
     config: &Config,
     claude_json: Option<std::path::PathBuf>,
+    copilot_dir: Option<std::path::PathBuf>,
     other: &Manifest,
 ) -> Result<Vec<DiffEntry>> {
     let opts = SnapshotOptions {
@@ -60,6 +72,7 @@ pub fn against_manifest(
         allow_secrets: false,
         claude_json,
         profiles_root: None,
+        copilot_dir,
     };
     let local = snapshot::build(claude_dir, staging, config, &opts)?;
     Ok(diff_manifest_maps(
@@ -183,6 +196,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            copilot_dir: None,
         };
         snapshot::build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -191,7 +205,7 @@ mod tests {
         write(&claude.join("skills/new/SKILL.md"), "# new");
         std::fs::remove_file(claude.join("CLAUDE.md")).unwrap();
 
-        let entries = against_staged(&claude, &staging, &cfg, None).unwrap();
+        let entries = against_staged(&claude, &staging, &cfg, None, None).unwrap();
         let find = |rel: &str| entries.iter().find(|e| e.rel == rel).unwrap();
         assert_eq!(find("settings.json").state, DiffState::Changed);
         assert_eq!(find("skills/new/SKILL.md").state, DiffState::LocalOnly);

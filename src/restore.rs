@@ -46,6 +46,10 @@ pub struct RestoreOptions {
     /// Local profile store to route the snapshot's bundled `ccsync-profiles/`
     /// tree into. `None` drops bundled profiles instead of restoring them.
     pub profiles_root: Option<PathBuf>,
+    /// Local Copilot CLI directory to route the snapshot's bundled
+    /// `ccsync-copilot/` tree into. `None` drops the bundled Copilot tree
+    /// instead of restoring it.
+    pub copilot_root: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -57,6 +61,9 @@ pub struct RestoreReport {
     pub mcp_servers_restored: usize,
     /// Backup copy of `~/.claude.json` taken before merging MCP servers in.
     pub claude_json_backup: Option<PathBuf>,
+    /// Backup copy of `~/.copilot` taken before the bundled Copilot tree was
+    /// restored into it.
+    pub copilot_backup: Option<PathBuf>,
 }
 
 /// Apply the staged snapshot to `claude_dir`.
@@ -93,24 +100,20 @@ pub fn run(
 
     // Back up the existing claude dir.
     let backup_dir = if !opts.dry_run && claude_dir.exists() {
-        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-        let backup = claude_dir.with_file_name(format!(
-            "{}.ccsync-backup-{ts}",
-            claude_dir
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| ".claude".to_string())
-        ));
-        copy_dir(claude_dir, &backup).with_context(|| {
-            format!(
-                "backing up {} to {}",
-                claude_dir.display(),
-                backup.display()
-            )
-        })?;
-        Some(backup)
+        Some(backup_sibling(claude_dir, ".claude")?)
     } else {
         None
+    };
+
+    // The bundled Copilot tree restores into `~/.copilot`, which the claude
+    // backup above does not cover — give it its own pre-restore backup.
+    let restoring_copilot = data_root.join(crate::copilot::COMPONENT).is_dir()
+        && in_scope(components, crate::copilot::COMPONENT);
+    let copilot_backup = match opts.copilot_root.as_deref() {
+        Some(root) if restoring_copilot && !opts.dry_run && root.exists() => {
+            Some(backup_sibling(root, ".copilot")?)
+        }
+        _ => None,
     };
 
     // Remap operates on a temporary copy of the staged data (the "apply set")
@@ -127,6 +130,9 @@ pub fn run(
             .context("creating remap apply-set dir")?;
         copy_dir(&data_root, tmp.path()).context("copying staged data to apply set")?;
         remap::apply(tmp.path(), &mappings, &manifest.project_roots)?;
+        // Copilot state embeds absolute paths in file contents only (session
+        // dirs are keyed by ID, not cwd), so its remap is a pure content pass.
+        remap::rewrite_tree_contents(&tmp.path().join(crate::copilot::COMPONENT), &mappings)?;
         let root = tmp.path().to_path_buf();
         _apply_tmp = Some(tmp);
         root
@@ -143,6 +149,7 @@ pub fn run(
             merge: opts.merge,
             components,
             profiles_root: opts.profiles_root.as_deref(),
+            copilot_root: opts.copilot_root.as_deref(),
         },
     )?;
 
@@ -189,7 +196,23 @@ pub fn run(
         mappings,
         mcp_servers_restored,
         claude_json_backup,
+        copilot_backup,
     })
+}
+
+/// Copy `dir` to a timestamped `<dir>.ccsync-backup-<ts>` sibling and return
+/// the backup path.
+fn backup_sibling(dir: &Path, fallback_name: &str) -> Result<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let backup = dir.with_file_name(format!(
+        "{}.ccsync-backup-{ts}",
+        dir.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| fallback_name.to_string())
+    ));
+    copy_dir(dir, &backup)
+        .with_context(|| format!("backing up {} to {}", dir.display(), backup.display()))?;
+    Ok(backup)
 }
 
 /// Options for [`apply_tree`], the component-aware copy core shared by full
@@ -203,6 +226,9 @@ pub struct ApplyOptions<'a> {
     /// Where the reserved `ccsync-profiles/` component is routed (the local
     /// profile store, not `~/.claude`). `None` skips it.
     pub profiles_root: Option<&'a Path>,
+    /// Where the reserved `ccsync-copilot/` component is routed (the local
+    /// Copilot CLI directory, not `~/.claude`). `None` skips it.
+    pub copilot_root: Option<&'a Path>,
 }
 
 /// True when `name` (a top-level component) is selected by `components`.
@@ -247,6 +273,16 @@ pub fn apply_tree(src_root: &Path, dest_dir: &Path, opts: &ApplyOptions) -> Resu
                 .strip_prefix(crate::profile::PROFILES_COMPONENT)
                 .expect("rel starts with the profiles component");
             (profiles_root.join(inner), true)
+        } else if top == crate::copilot::COMPONENT {
+            // The bundled Copilot tree is routed into `~/.copilot`, merging
+            // JSON configs like the `~/.claude` files below.
+            let Some(copilot_root) = opts.copilot_root else {
+                continue;
+            };
+            let inner = rel
+                .strip_prefix(crate::copilot::COMPONENT)
+                .expect("rel starts with the copilot component");
+            (copilot_root.join(inner), false)
         } else {
             (dest_dir.join(rel), false)
         };
@@ -399,10 +435,15 @@ fn verify_integrity(data_root: &Path, manifest: &Manifest) -> Result<()> {
 
 /// Deep-merge the JSON in `incoming` into the JSON at `existing`, writing the
 /// merged result back to `existing`. Objects merge key-by-key, scalar arrays
-/// union, everything else from `incoming` wins.
+/// union, everything else from `incoming` wins. Incoming content that is not
+/// strict JSON — Copilot's `settings.json` is JSONC (comments) — falls back to
+/// a verbatim overwrite copy instead of aborting the restore mid-way.
 fn merge_json_file(incoming: &Path, existing: &Path) -> Result<()> {
-    let inc: serde_json::Value = serde_json::from_str(&fs::read_to_string(incoming)?)
-        .with_context(|| format!("parsing {}", incoming.display()))?;
+    let incoming_text = fs::read_to_string(incoming)?;
+    let Ok(inc) = serde_json::from_str::<serde_json::Value>(&incoming_text) else {
+        fs::copy(incoming, existing).with_context(|| format!("writing {}", existing.display()))?;
+        return Ok(());
+    };
     let mut base: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(existing)?).unwrap_or(serde_json::Value::Null);
     merge_value(&mut base, inc);
@@ -513,6 +554,7 @@ mod tests {
                 allow_secrets: false,
                 claude_json: None,
                 profiles_root: None,
+                copilot_dir: None,
             },
         )
         .unwrap();
@@ -536,6 +578,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         let report = run(&dst_claude, &staging, &cfg, &opts).unwrap();
 
@@ -588,6 +631,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         let dst1 = tmp.path().join("claude-1");
         run(&dst1, &staging, &Config::default(), &opts).unwrap();
@@ -644,6 +688,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -676,6 +721,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         let claude = tmp.path().join("claude");
 
@@ -727,6 +773,7 @@ mod tests {
                 allow_secrets: false,
                 claude_json: None,
                 profiles_root: Some(profiles_a),
+                copilot_dir: None,
             },
         )
         .unwrap();
@@ -751,6 +798,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: Some(profiles_b.clone()),
+            copilot_root: None,
         };
         run(&claude_b, &staging, &cfg, &opts).unwrap();
         assert!(claude_b.join("settings.json").exists());
@@ -794,6 +842,7 @@ mod tests {
             confirm_hooks: false,
             components: Some(vec!["skills".into()]),
             profiles_root: None,
+            copilot_root: None,
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -820,6 +869,7 @@ mod tests {
             confirm_hooks: false,
             components: Some(vec![crate::mcp::MCP_FILE.into()]),
             profiles_root: None,
+            copilot_root: None,
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
         assert_eq!(report.mcp_servers_restored, 1);
@@ -853,6 +903,7 @@ mod tests {
             confirm_hooks: true,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
         assert!(err.to_string().contains("hooks"), "got: {err:#}");
@@ -871,6 +922,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
         let local: serde_json::Value =
@@ -888,6 +940,7 @@ mod tests {
             confirm_hooks: true,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
     }
@@ -921,6 +974,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -971,6 +1025,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            copilot_root: None,
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -987,5 +1042,168 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(root["mcpServers"]["fetch"]["command"], "uvx");
         assert_eq!(root["oauthAccount"]["accessToken"], "keep-me");
+    }
+
+    #[test]
+    fn copilot_component_routes_to_copilot_root_with_backup_and_remap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write(&staging.join("data/settings.json"), r#"{"theme":"dark"}"#);
+        write(
+            &staging.join("data/ccsync-copilot/settings.json"),
+            r#"{"banner":"never"}"#,
+        );
+        write(
+            &staging.join("data/ccsync-copilot/session-state/abc/events.jsonl"),
+            "{\"cwd\":\"/Users/alice/proj\",\"file\":\"/Users/alice/proj/main.rs\"}\n",
+        );
+        write(
+            &staging.join("data/ccsync-copilot/permissions-config.json"),
+            r#"{"/Users/alice/proj":{"allow":["shell"]}}"#,
+        );
+        let mut m = Manifest::new("h".into(), "/Users/alice".into());
+        record_files(&mut m, &staging);
+        m.write_to(&staging).unwrap();
+
+        let fake_home = tmp.path().join("home-bob");
+        fs::create_dir_all(&fake_home).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        let dst_claude = tmp.path().join("dst-claude");
+        let dst_copilot = tmp.path().join("dst-copilot");
+        write(&dst_copilot.join("old.txt"), "existing");
+
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: true,
+            merge: MergeMode::Overwrite,
+            claude_json: None,
+            confirm_hooks: false,
+            components: None,
+            profiles_root: None,
+            copilot_root: Some(dst_copilot.clone()),
+        };
+        let report = run(&dst_claude, &staging, &Config::default(), &opts).unwrap();
+
+        // Copilot got its own pre-restore backup.
+        let copilot_backup = report.copilot_backup.expect("copilot backup taken");
+        assert!(copilot_backup.join("old.txt").exists());
+
+        // Routing: copilot files land in the copilot root, not ~/.claude.
+        assert!(dst_copilot.join("settings.json").exists());
+        assert!(!dst_claude.join("ccsync-copilot").exists());
+        assert!(dst_claude.join("settings.json").exists());
+
+        // Contents remapped; session dir name (keyed by ID) untouched.
+        let new_home = fake_home.to_string_lossy().to_string();
+        let events =
+            fs::read_to_string(dst_copilot.join("session-state/abc/events.jsonl")).unwrap();
+        assert!(events.contains(&format!("{new_home}/proj")));
+        assert!(!events.contains("/Users/alice"));
+        let perms = fs::read_to_string(dst_copilot.join("permissions-config.json")).unwrap();
+        assert!(perms.contains(&format!("\"{new_home}/proj\"")));
+        assert!(!perms.contains("/Users/alice"));
+
+        // Staging itself was never mutated (immutable-staging invariant).
+        let staged_events =
+            fs::read_to_string(staging.join("data/ccsync-copilot/session-state/abc/events.jsonl"))
+                .unwrap();
+        assert!(staged_events.contains("/Users/alice/proj"));
+    }
+
+    #[test]
+    fn copilot_component_dropped_without_copilot_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write(&staging.join("data/settings.json"), "{}");
+        write(&staging.join("data/ccsync-copilot/settings.json"), "{}");
+        let mut m = Manifest::new(
+            "h".into(),
+            paths::home_dir().unwrap().to_string_lossy().to_string(),
+        );
+        record_files(&mut m, &staging);
+        m.write_to(&staging).unwrap();
+
+        let dst_claude = tmp.path().join("dst-claude");
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Merge,
+            claude_json: None,
+            confirm_hooks: false,
+            components: None,
+            profiles_root: None,
+            copilot_root: None,
+        };
+        let report = run(&dst_claude, &staging, &Config::default(), &opts).unwrap();
+        assert!(report.copilot_backup.is_none());
+        assert!(dst_claude.join("settings.json").exists());
+        // Dropped, not misrouted into ~/.claude.
+        assert!(!dst_claude.join("ccsync-copilot").exists());
+    }
+
+    #[test]
+    fn only_copilot_component_restores_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write(&staging.join("data/settings.json"), "{}");
+        write(&staging.join("data/ccsync-copilot/settings.json"), "{}");
+        let mut m = Manifest::new(
+            "h".into(),
+            paths::home_dir().unwrap().to_string_lossy().to_string(),
+        );
+        record_files(&mut m, &staging);
+        m.write_to(&staging).unwrap();
+
+        let dst_claude = tmp.path().join("dst-claude");
+        let dst_copilot = tmp.path().join("dst-copilot");
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Merge,
+            claude_json: None,
+            confirm_hooks: false,
+            components: Some(vec![crate::copilot::COMPONENT.to_string()]),
+            profiles_root: None,
+            copilot_root: Some(dst_copilot.clone()),
+        };
+        run(&dst_claude, &staging, &Config::default(), &opts).unwrap();
+        assert!(dst_copilot.join("settings.json").exists());
+        assert!(!dst_claude.join("settings.json").exists());
+    }
+
+    #[test]
+    fn jsonc_settings_fall_back_to_overwrite_copy_in_merge_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let jsonc = "{\n  // banner is noisy\n  \"banner\": \"never\"\n}\n";
+        write(&staging.join("data/ccsync-copilot/settings.json"), jsonc);
+        let mut m = Manifest::new(
+            "h".into(),
+            paths::home_dir().unwrap().to_string_lossy().to_string(),
+        );
+        record_files(&mut m, &staging);
+        m.write_to(&staging).unwrap();
+
+        let dst_claude = tmp.path().join("dst-claude");
+        let dst_copilot = tmp.path().join("dst-copilot");
+        write(&dst_copilot.join("settings.json"), r#"{"theme":"dark"}"#);
+
+        let opts = RestoreOptions {
+            dry_run: false,
+            remap: false,
+            merge: MergeMode::Merge,
+            claude_json: None,
+            confirm_hooks: false,
+            components: None,
+            profiles_root: None,
+            copilot_root: Some(dst_copilot.clone()),
+        };
+        run(&dst_claude, &staging, &Config::default(), &opts).unwrap();
+
+        // Merge mode couldn't parse the JSONC, so it copied it verbatim
+        // instead of erroring out mid-restore.
+        let restored = fs::read_to_string(dst_copilot.join("settings.json")).unwrap();
+        assert_eq!(restored, jsonc);
     }
 }
