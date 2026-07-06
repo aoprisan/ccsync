@@ -5,12 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `ccsync` is a single-binary Rust CLI that syncs and backs up Claude Code state
-(`~/.claude` + the `mcpServers` slice of `~/.claude.json`) across machines. The
+(`~/.claude` + the `mcpServers` slice of `~/.claude.json`) — and, riding along
+under the reserved `ccsync-copilot/` snapshot component, the GitHub Copilot CLI
+tree (`~/.copilot`, honoring `COPILOT_HOME`) — across machines. The
 hard problems it solves — and the invariants you must not break — are:
 
 1. **Credentials never leave the machine.** `.credentials.json` is a *hard
    block* in the capture path (`redact::is_credential_file`), independent of
-   config, and also enforced when copying into profile stores. `~/.claude.json`
+   config, and also enforced when copying into profile stores. Copilot has its
+   own path-aware blocklist (`copilot::credential_block_match`): the root
+   `config.json` (auth tokens — nested `config.json`s are fine) and the
+   `mcp-oauth-config/`/`mcp-secrets/` dirs at any depth. `~/.claude.json`
    is never synced wholesale (OAuth tokens, trust decisions); only its
    `mcpServers` are extracted.
 2. **Best-effort secret scanning.** Text configs are regex-scanned before
@@ -28,7 +33,9 @@ hard problems it solves — and the invariants you must not break — are:
    authoritative decode table; never re-derive paths with `decode_path` when a
    manifest is available. Content rewrites must stay boundary-aware
    (`remap::replace_bounded`) so `/Users/alice2` survives an
-   `/Users/alice` remap.
+   `/Users/alice` remap. Copilot needs no dir renames (session dirs are keyed
+   by session ID): its remap is `remap::rewrite_tree_contents`, a content-only
+   pass over the `ccsync-copilot/` apply-set subtree.
 4. **Staging is immutable input; restores verify integrity.** Restore remaps a
    temp apply-set copy (never staging itself — snapshots are reusable) and
    first checks every staged file against the manifest's sha256 (both
@@ -91,13 +98,22 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
 - **`snapshot.rs`** — walks `~/.claude`, applies include/exclude + the credential
   hard-block + secret scan/redaction, copies survivors into `<staging>/data/`,
   and writes `manifest.json`. Also bundles the profile store under the reserved
-  `ccsync-profiles/` component (`profiles.sync`) and reports unclassified
-  top-level entries (`unclassified_top_level`). Staging is wiped and rebuilt
-  each run.
+  `ccsync-profiles/` component (`profiles.sync`) and the Copilot tree under
+  `ccsync-copilot/` (`[copilot] enabled`, via `plan_copilot` with the
+  `[copilot]` include/exclude policy), and reports unclassified top-level
+  entries (`unclassified_top_level`; `copilot::unclassified_top_level` for
+  `~/.copilot`). Staging is wiped and rebuilt each run.
+- **`copilot.rs`** — Copilot CLI specifics: the reserved component name, the
+  path-aware credential blocklist, and the unclassified-entry scan. Policy
+  lives in `config.copilot` (`CopilotConfig`); source-dir resolution in
+  `paths::copilot_dir`.
 - **`manifest.rs`** — `manifest.json` carried in every snapshot. Records
   `source_home`, per-file sha256 (verified on restore), and the decoded
   `project_roots` (authoritative dash-decoding); this is what makes remap
-  possible on the target machine. Versioned (`manifest_version`).
+  possible on the target machine. Versioned (`manifest_version`, currently 2 =
+  may carry `ccsync-copilot/`; schema unchanged from 1). `read_from` rejects
+  versions above `MAX_SUPPORTED_VERSION` so a future layout fails loudly
+  instead of mis-restoring.
 - **`redact.rs`** — the credential blocklist check, the secret-pattern regexes,
   and span-level redaction (`redact_secrets`) used for transcripts.
 - **`remap.rs`** — rewrites absolute-path prefixes inside a `data/` tree:
@@ -109,9 +125,12 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
   to a timestamped sibling (always reversible), remaps an apply-set copy,
   applies via the reusable `apply_tree` core (component filter powers
   `--only` and profile switching; deep-merges `*.json` unless `--overwrite`,
-  scalar arrays union), gates incoming hooks, then merges bundled MCP servers
-  into `~/.claude.json`. Routes the `ccsync-profiles/` component into the
-  local profile store.
+  scalar arrays union; non-strict-JSON like Copilot's JSONC `settings.json`
+  falls back to a verbatim copy), gates incoming hooks, then merges bundled
+  MCP servers into `~/.claude.json`. Routes the `ccsync-profiles/` component
+  into the local profile store and `ccsync-copilot/` into `~/.copilot` (with
+  its own timestamped backup); `--only copilot` is an alias resolved in
+  `main.rs`.
 - **`profile.rs`** — named profiles over the shared base state: store layout
   under `<config>/ccsync/profiles/`, the capture-back → confirm-hooks → backup
   → journal → swap switch protocol with automatic rollback, `active.json`

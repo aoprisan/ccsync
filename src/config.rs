@@ -64,6 +64,77 @@ pub struct Config {
     /// Skipped when empty so `[[layers]]` can be appended by hand.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<LayerConfig>,
+    /// Policy for the GitHub Copilot CLI tree (`~/.copilot`), captured under
+    /// the reserved `ccsync-copilot/` snapshot component.
+    pub copilot: CopilotConfig,
+}
+
+/// Include/exclude policy for the GitHub Copilot CLI directory. Materialized
+/// from the `[copilot]` table in `config.toml`; absent keys fall back to these
+/// defaults, so configs written before the table existed keep loading.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CopilotConfig {
+    /// Whether to capture `~/.copilot` at all. A missing `~/.copilot` is
+    /// always skipped silently, so leaving this on is harmless for users who
+    /// don't run Copilot.
+    pub enabled: bool,
+    /// Relative paths under `~/.copilot` to include.
+    pub include: Vec<String>,
+    /// Relative paths (or path prefixes) under `~/.copilot` to always exclude.
+    pub exclude: Vec<String>,
+    /// Whether to capture session history (`session-state/`,
+    /// `command-history-state/`).
+    pub include_sessions: bool,
+}
+
+impl CopilotConfig {
+    /// True if `rel` (a path relative to `~/.copilot`) is excluded by any
+    /// configured exclude prefix.
+    pub fn is_excluded(&self, rel: &str) -> bool {
+        is_excluded_by(&self.exclude, rel)
+    }
+}
+
+impl Default for CopilotConfig {
+    fn default() -> Self {
+        CopilotConfig {
+            enabled: true,
+            include: vec![
+                "settings.json".into(),
+                "mcp-config.json".into(),
+                "copilot-instructions.md".into(),
+                "instructions".into(),
+                "agents".into(),
+                "skills".into(),
+                "extensions".into(),
+                "hooks".into(),
+                "lsp-config.json".into(),
+                "permissions-config.json".into(),
+                // Session history. Gated additionally by `include_sessions`.
+                "session-state".into(),
+                "command-history-state".into(),
+            ],
+            exclude: vec![
+                // Sensitive: never sync. These duplicate the hard block in
+                // `copilot::credential_block_match` so default runs skip them
+                // silently instead of aborting on the guard (same pattern as
+                // Claude's `.credentials.json` below).
+                "config.json".into(),
+                "mcp-oauth-config".into(),
+                "mcp-secrets".into(),
+                // Machine-local / cache / runtime state.
+                "logs".into(),
+                "ide".into(),
+                "installed-plugins".into(),
+                "plugin-data".into(),
+                // Binary SQLite checkpoint index; Copilot rebuilds it with
+                // `/chronicle reindex`, and merging it is hopeless anyway.
+                "session-store.db".into(),
+            ],
+            include_sessions: true,
+        }
+    }
 }
 
 /// One `[[layers]]` entry: a git repo whose declared top-level components are
@@ -243,6 +314,7 @@ impl Default for Config {
             profiles: ProfilesConfig::default(),
             machines: BTreeMap::new(),
             layers: Vec::new(),
+            copilot: CopilotConfig::default(),
         }
     }
 }
@@ -319,12 +391,17 @@ impl Config {
     /// True if `rel` (a path relative to `~/.claude`) is excluded by any
     /// configured exclude prefix.
     pub fn is_excluded(&self, rel: &str) -> bool {
-        let rel = rel.replace('\\', "/");
-        self.exclude.iter().any(|ex| {
-            let ex = ex.trim_end_matches('/');
-            rel == ex || rel.starts_with(&format!("{ex}/"))
-        })
+        is_excluded_by(&self.exclude, rel)
     }
+}
+
+/// Prefix-exclusion check shared by the Claude and Copilot policies.
+fn is_excluded_by(exclude: &[String], rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    exclude.iter().any(|ex| {
+        let ex = ex.trim_end_matches('/');
+        rel == ex || rel.starts_with(&format!("{ex}/"))
+    })
 }
 
 #[cfg(test)]
@@ -530,5 +607,43 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert!(!loaded.service.enabled);
         assert_eq!(loaded.service.destination, ServiceDestination::Git);
+    }
+
+    #[test]
+    fn copilot_defaults_are_safe_and_on() {
+        let c = CopilotConfig::default();
+        assert!(c.enabled);
+        assert!(c.include_sessions);
+        assert!(c.is_excluded("config.json"));
+        assert!(c.is_excluded("mcp-oauth-config/token.json"));
+        assert!(c.is_excluded("mcp-secrets/index.json"));
+        assert!(c.is_excluded("logs/process-1-2.log"));
+        assert!(c.is_excluded("session-store.db"));
+        assert!(!c.is_excluded("settings.json"));
+        assert!(!c.is_excluded("session-state/abc/events.jsonl"));
+    }
+
+    #[test]
+    fn config_without_copilot_table_loads_defaults() {
+        // A config file written before `[copilot]` existed must still load,
+        // picking up the current copilot defaults.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "include = [\"settings.json\"]\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.copilot.enabled);
+        assert!(!loaded.copilot.include.is_empty());
+    }
+
+    #[test]
+    fn partial_copilot_table_keeps_default_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[copilot]\nenabled = false\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(!loaded.copilot.enabled);
+        // Unspecified keys fall back to the defaults, not to empty.
+        assert_eq!(loaded.copilot.include, CopilotConfig::default().include);
+        assert!(loaded.copilot.include_sessions);
     }
 }

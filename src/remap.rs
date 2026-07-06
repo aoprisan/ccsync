@@ -49,7 +49,7 @@ pub fn build_mappings(
         });
     }
     // Longest source prefix first.
-    mappings.sort_by(|a, b| b.from.len().cmp(&a.from.len()));
+    mappings.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     mappings
 }
 
@@ -116,6 +116,44 @@ pub fn apply(data_root: &Path, mappings: &[Mapping], project_roots: &[ProjectRoo
         } else {
             fs::rename(&from, &to)
                 .with_context(|| format!("renaming {} -> {}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite absolute-path prefixes inside every `*.json`/`*.jsonl` under
+/// `root`, without renaming anything. This is the remap strategy for trees
+/// that embed machine paths in file *contents* only — the Copilot CLI keys
+/// its session dirs by session ID, but `session-state/**` events and
+/// `permissions-config.json`'s per-project keys carry absolute paths. Files
+/// that are not valid UTF-8 (e.g. binary workspace artifacts riding along in
+/// session state) are left untouched rather than erroring.
+pub fn rewrite_tree_contents(root: &Path, mappings: &[Mapping]) -> Result<()> {
+    if mappings.is_empty() || !root.is_dir() {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let ext = entry.path().extension().and_then(|e| e.to_str());
+        if !matches!(ext, Some("json") | Some("jsonl")) {
+            continue;
+        }
+        let bytes = fs::read(entry.path())?;
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let mut out = content.clone();
+        for m in mappings {
+            if let Some(replaced) = replace_bounded(&out, &m.from, &m.to, raw_boundary) {
+                out = replaced;
+            }
+        }
+        if out != content {
+            fs::write(entry.path(), out)
+                .with_context(|| format!("remapping {}", entry.path().display()))?;
         }
     }
     Ok(())
@@ -351,5 +389,47 @@ mod tests {
             remap_str("/home/alice/proj/x", &mappings).as_deref(),
             Some("/srv/proj/x")
         );
+    }
+
+    #[test]
+    fn rewrite_tree_contents_is_boundary_aware_and_renames_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("copilot");
+        write(
+            &root.join("session-state/abc123/events.jsonl"),
+            "{\"cwd\":\"/Users/alice/proj\",\"other\":\"/Users/alice2/proj\"}\n",
+        );
+        write(
+            &root.join("permissions-config.json"),
+            r#"{"/Users/alice/proj":{"allow":["shell"]}}"#,
+        );
+        // Prose is deliberately not rewritten.
+        write(
+            &root.join("copilot-instructions.md"),
+            "see /Users/alice/proj",
+        );
+        // Binary content must be skipped, not errored on.
+        fs::write(
+            root.join("session-state/abc123/artifact.json"),
+            [0xff, 0xfe, 0x00],
+        )
+        .unwrap();
+
+        let manifest = Manifest::new("h".into(), "/Users/alice".into());
+        let mappings = build_mappings(&manifest, "/home/bob", &Default::default());
+        rewrite_tree_contents(&root, &mappings).unwrap();
+
+        // Session dir name unchanged (keyed by ID, not cwd).
+        let events = fs::read_to_string(root.join("session-state/abc123/events.jsonl")).unwrap();
+        assert!(events.contains("/home/bob/proj"));
+        // The boundary check keeps the /Users/alice2 sibling intact.
+        assert!(events.contains("/Users/alice2/proj"));
+        // Absolute-path keys are plain strings in the text — rewritten too.
+        let perms = fs::read_to_string(root.join("permissions-config.json")).unwrap();
+        assert!(perms.contains("\"/home/bob/proj\""));
+        assert!(!perms.contains("/Users/alice/proj"));
+        // Markdown untouched.
+        let md = fs::read_to_string(root.join("copilot-instructions.md")).unwrap();
+        assert!(md.contains("/Users/alice/proj"));
     }
 }

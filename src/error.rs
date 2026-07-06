@@ -23,6 +23,9 @@ pub enum CcError {
     #[error("staged snapshot failed integrity check: {0}\n  the snapshot may be corrupt or tampered with; re-run `ccsync pull` or re-create it")]
     SnapshotIntegrity(String),
 
+    #[error("snapshot manifest version {found} is newer than this ccsync supports (max {max}); upgrade ccsync before restoring")]
+    ManifestTooNew { found: u32, max: u32 },
+
     #[error("git command failed: {0}")]
     Git(String),
 

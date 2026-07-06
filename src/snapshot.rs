@@ -35,6 +35,10 @@ pub struct SnapshotOptions {
     /// Profile store to bundle under `ccsync-profiles/` in the snapshot, when
     /// `config.profiles.sync` is set. `None` skips profile bundling.
     pub profiles_root: Option<PathBuf>,
+    /// Copilot CLI directory to bundle under `ccsync-copilot/` in the
+    /// snapshot, when `config.copilot.enabled` is set. `None` (or a missing
+    /// directory) skips Copilot capture.
+    pub copilot_dir: Option<PathBuf>,
 }
 
 impl SnapshotOptions {
@@ -52,11 +56,17 @@ impl SnapshotOptions {
         } else {
             None
         };
+        let copilot_dir = if config.copilot.enabled {
+            paths::copilot_dir().ok()
+        } else {
+            None
+        };
         SnapshotOptions {
             dry_run,
             allow_secrets,
             claude_json,
             profiles_root,
+            copilot_dir,
         }
     }
 }
@@ -156,6 +166,17 @@ fn build_inner(
                 )?;
                 let active = format!("{}/active.json", crate::profile::PROFILES_COMPONENT);
                 planned.retain(|p| p.rel != active);
+            }
+        }
+    }
+
+    // Capture the Copilot CLI tree under the reserved `ccsync-copilot/` name;
+    // restore routes it back into `~/.copilot`. A missing dir is skipped
+    // silently so the feature is inert for users who don't run Copilot.
+    if config.copilot.enabled {
+        if let Some(root) = opts.copilot_dir.as_deref() {
+            if root.is_dir() {
+                plan_copilot(root, config, &mut planned)?;
             }
         }
     }
@@ -330,6 +351,59 @@ fn plan_path(
             rel,
             size,
         });
+    }
+    Ok(())
+}
+
+/// Walk the Copilot CLI tree, applying the `[copilot]` include/exclude policy
+/// and Copilot's own credential hard-block, staging survivors under the
+/// reserved `ccsync-copilot/` component. Mirrors [`plan_path`] but checks
+/// copilot-root-relative paths against `copilot::credential_block_match`
+/// (Copilot's `config.json` holds auth tokens only at the tree root, so a
+/// bare-name check would be wrong in both directions).
+fn plan_copilot(root: &Path, config: &Config, out: &mut Vec<PlannedFile>) -> Result<()> {
+    for entry in &config.copilot.include {
+        if crate::copilot::SESSION_ENTRIES.contains(&entry.as_str())
+            && !config.copilot.include_sessions
+        {
+            continue;
+        }
+        let src = root.join(entry);
+        if !src.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(&src).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let abs = entry.path();
+            let rel = abs
+                .strip_prefix(root)
+                .expect("walked path is under the copilot root")
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            // Hard block: credentials never leave the machine.
+            if let Some(blocked) = crate::copilot::credential_block_match(&rel) {
+                return Err(CcError::CredentialBlocked(format!(
+                    "{}/{rel} ({blocked})",
+                    crate::copilot::COMPONENT
+                ))
+                .into());
+            }
+
+            if config.copilot.is_excluded(&rel) {
+                continue;
+            }
+
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(PlannedFile {
+                abs: abs.to_path_buf(),
+                rel: format!("{}/{rel}", crate::copilot::COMPONENT),
+                size,
+            });
+        }
     }
     Ok(())
 }
@@ -510,6 +584,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            copilot_dir: None,
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -542,6 +617,7 @@ mod tests {
             allow_secrets: true,
             claude_json: None,
             profiles_root: None,
+            copilot_dir: None,
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("credential"));
@@ -562,6 +638,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            copilot_dir: None,
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("secret"));
@@ -572,6 +649,7 @@ mod tests {
             allow_secrets: true,
             claude_json: None,
             profiles_root: None,
+            copilot_dir: None,
         };
         assert!(build(&claude, &staging, &cfg, &opts).is_ok());
     }
@@ -591,6 +669,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            copilot_dir: None,
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -648,6 +727,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            copilot_dir: None,
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("secret"), "got: {err:#}");
@@ -684,6 +764,7 @@ mod tests {
             allow_secrets: false,
             claude_json: Some(claude_json),
             profiles_root: None,
+            copilot_dir: None,
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -731,6 +812,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            copilot_dir: None,
         };
         let sink = CountingSink {
             files: Cell::new(0),
@@ -768,8 +850,186 @@ mod tests {
             allow_secrets: false,
             claude_json: Some(claude_json),
             profiles_root: None,
+            copilot_dir: None,
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
         assert!(!m.files.iter().any(|f| f.rel_path == crate::mcp::MCP_FILE));
+    }
+
+    fn copilot_opts(copilot: &Path) -> SnapshotOptions {
+        SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: None,
+            profiles_root: None,
+            copilot_dir: Some(copilot.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn captures_copilot_under_reserved_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let copilot = tmp.path().join("copilot");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), r#"{"theme":"dark"}"#);
+        write(&copilot.join("settings.json"), r#"{"banner":"never"}"#);
+        write(&copilot.join("mcp-config.json"), r#"{"mcpServers":{}}"#);
+        write(
+            &copilot.join("session-state/abc123/events.jsonl"),
+            "{\"cwd\":\"/home/alice/proj\"}\n",
+        );
+        write(&copilot.join("logs/process-1-2.log"), "noise");
+        write(&copilot.join("session-store.db"), "sqlite");
+        // Excluded credentials are skipped silently under the default config.
+        write(&copilot.join("config.json"), r#"{"tokens":"local-only"}"#);
+
+        let cfg = Config::default();
+        let m = build(&claude, &staging, &cfg, &copilot_opts(&copilot)).unwrap();
+
+        let rels: Vec<&str> = m.files.iter().map(|f| f.rel_path.as_str()).collect();
+        // Claude layout is untouched (flat), copilot rides under the component.
+        assert!(rels.contains(&"settings.json"));
+        assert!(rels.contains(&"ccsync-copilot/settings.json"));
+        assert!(rels.contains(&"ccsync-copilot/mcp-config.json"));
+        assert!(rels.contains(&"ccsync-copilot/session-state/abc123/events.jsonl"));
+        assert!(staging.join("data/ccsync-copilot/settings.json").exists());
+        // Machine-local noise and credentials never enter the snapshot.
+        assert!(!rels.iter().any(|r| r.contains("logs/")));
+        assert!(!rels.iter().any(|r| r.contains("session-store.db")));
+        assert!(!rels
+            .iter()
+            .any(|r| r.ends_with("config.json") && *r != "ccsync-copilot/mcp-config.json"));
+    }
+
+    #[test]
+    fn copilot_root_config_json_hard_blocks_when_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let copilot = tmp.path().join("copilot");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        write(&copilot.join("config.json"), r#"{"loggedInUsers":["x"]}"#);
+
+        // Force-include it and clear excludes to prove the hard block wins
+        // over configuration.
+        let mut cfg = Config::default();
+        cfg.copilot.include = vec!["config.json".into()];
+        cfg.copilot.exclude.clear();
+        let err = build(&claude, &staging, &cfg, &copilot_opts(&copilot)).unwrap_err();
+        assert!(err.to_string().contains("credential"));
+        assert!(err.to_string().contains("config.json"));
+    }
+
+    #[test]
+    fn nested_copilot_config_json_is_not_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let copilot = tmp.path().join("copilot");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        write(
+            &copilot.join("skills/my-skill/config.json"),
+            r#"{"option":true}"#,
+        );
+
+        let cfg = Config::default();
+        let m = build(&claude, &staging, &cfg, &copilot_opts(&copilot)).unwrap();
+        assert!(m
+            .files
+            .iter()
+            .any(|f| f.rel_path == "ccsync-copilot/skills/my-skill/config.json"));
+    }
+
+    #[test]
+    fn copilot_secret_dirs_hard_block_when_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let copilot = tmp.path().join("copilot");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        write(&copilot.join("mcp-secrets/index.json"), r#"{"k":"v"}"#);
+
+        let mut cfg = Config::default();
+        cfg.copilot.include = vec!["mcp-secrets".into()];
+        cfg.copilot.exclude.clear();
+        let err = build(&claude, &staging, &cfg, &copilot_opts(&copilot)).unwrap_err();
+        assert!(err.to_string().contains("credential"));
+    }
+
+    #[test]
+    fn copilot_sessions_gated_by_include_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let copilot = tmp.path().join("copilot");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        write(&copilot.join("settings.json"), "{}");
+        write(
+            &copilot.join("session-state/abc/events.jsonl"),
+            "{\"x\":1}\n",
+        );
+        write(&copilot.join("command-history-state/history.json"), "{}");
+
+        let mut cfg = Config::default();
+        cfg.copilot.include_sessions = false;
+        let m = build(&claude, &staging, &cfg, &copilot_opts(&copilot)).unwrap();
+        let copilot_rels: Vec<&str> = m
+            .files
+            .iter()
+            .filter(|f| f.rel_path.starts_with("ccsync-copilot/"))
+            .map(|f| f.rel_path.as_str())
+            .collect();
+        assert_eq!(copilot_rels, vec!["ccsync-copilot/settings.json"]);
+    }
+
+    #[test]
+    fn copilot_disabled_or_missing_is_inert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let copilot = tmp.path().join("copilot");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        write(&copilot.join("settings.json"), "{}");
+
+        // Disabled by config.
+        let mut cfg = Config::default();
+        cfg.copilot.enabled = false;
+        let m = build(&claude, &staging, &cfg, &copilot_opts(&copilot)).unwrap();
+        assert!(!m
+            .files
+            .iter()
+            .any(|f| f.rel_path.starts_with("ccsync-copilot/")));
+
+        // Missing directory.
+        let cfg = Config::default();
+        let m = build(
+            &claude,
+            &staging,
+            &cfg,
+            &copilot_opts(&tmp.path().join("no-such-copilot")),
+        )
+        .unwrap();
+        assert!(!m
+            .files
+            .iter()
+            .any(|f| f.rel_path.starts_with("ccsync-copilot/")));
+    }
+
+    #[test]
+    fn copilot_settings_secret_aborts_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let copilot = tmp.path().join("copilot");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        write(
+            &copilot.join("mcp-config.json"),
+            r#"{"mcpServers":{"x":{"env":{"KEY":"sk-abcdefghijklmnopqrstuvwx"}}}}"#,
+        );
+
+        let cfg = Config::default();
+        let err = build(&claude, &staging, &cfg, &copilot_opts(&copilot)).unwrap_err();
+        assert!(err.to_string().contains("secret"));
     }
 }

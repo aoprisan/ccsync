@@ -79,7 +79,8 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
         /// Restore only these top-level components (comma-separated), e.g.
-        /// `--only skills,commands` or `--only settings.json`.
+        /// `--only skills,commands` or `--only settings.json`. `copilot`
+        /// selects the bundled Copilot CLI tree (`~/.copilot`).
         #[arg(long, value_delimiter = ',', value_name = "COMPONENTS")]
         only: Vec<String>,
     },
