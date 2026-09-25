@@ -357,8 +357,8 @@ fn cmd_profile(config: &Config, action: cli::ProfileAction) -> Result<()> {
             println!("deleted profile {name:?}");
             Ok(())
         }
-        ProfileAction::Rollback => {
-            let msg = profile::rollback(&root, &live, config)?;
+        ProfileAction::Rollback { yes } => {
+            let msg = profile::rollback(&root, &live, config, config.confirm_hooks && !yes)?;
             println!("{msg}");
             Ok(())
         }
