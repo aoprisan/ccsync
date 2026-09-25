@@ -93,6 +93,45 @@ pub fn server_count(doc: &Value) -> usize {
     n
 }
 
+/// The launch command of every stdio server in an extracted MCP document, as
+/// `mcp <name>: <command> <args...>` (user scope) or `mcp <name> (<project>):
+/// ...` (local scope), with project keys remapped through `mappings` exactly
+/// as [`merge_into`] would. Restore diffs these against the local servers so
+/// a new command is confirmed like a new hook before it is installed.
+pub fn server_commands(doc: &Value, mappings: &[Mapping]) -> std::collections::BTreeSet<String> {
+    fn collect(servers: Option<&Value>, scope: &str, out: &mut std::collections::BTreeSet<String>) {
+        let Some(Value::Object(servers)) = servers else {
+            return;
+        };
+        for (name, def) in servers {
+            let Some(cmd) = def.get("command").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut line = format!("mcp {name}{scope}: {cmd}");
+            if let Some(Value::Array(args)) = def.get("args") {
+                for a in args {
+                    line.push(' ');
+                    line.push_str(
+                        &a.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| a.to_string()),
+                    );
+                }
+            }
+            out.insert(line);
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    collect(doc.get("mcpServers"), "", &mut out);
+    if let Some(Value::Object(projects)) = doc.get("projects") {
+        for (path, entry) in projects {
+            let mapped = remap::remap_path(path, mappings).unwrap_or_else(|| path.clone());
+            collect(entry.get("mcpServers"), &format!(" ({mapped})"), &mut out);
+        }
+    }
+    out
+}
+
 /// Merge an extracted MCP document into the local `~/.claude.json`, remapping
 /// project paths via `mappings`. Every other key of `~/.claude.json` is
 /// preserved. Returns the number of server definitions merged in.
