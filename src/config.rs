@@ -187,7 +187,12 @@ impl Default for ServiceConfig {
 
 /// File names that are credentials and must never be captured, regardless of
 /// configuration. Enforced in `snapshot`/`redact` as a hard block.
-pub const CREDENTIAL_BLOCKLIST: &[&str] = &[".credentials.json"];
+///
+/// `.claude.json` carries OAuth tokens and per-project trust decisions; only
+/// its `mcpServers` slice is ever synced (extracted by `mcp` and staged as
+/// `mcp-servers.json`), so the file itself must never be captured wholesale —
+/// e.g. under a `CLAUDE_CONFIG_DIR` layout that places it inside the claude dir.
+pub const CREDENTIAL_BLOCKLIST: &[&str] = &[".credentials.json", ".claude.json"];
 
 impl Default for Config {
     fn default() -> Self {

@@ -28,7 +28,7 @@ use crate::error::CcError;
 use crate::git;
 use crate::redact;
 use crate::restore::{self, ApplyOptions, MergeMode};
-use crate::snapshot::SCANNED_EXTS;
+use crate::snapshot::is_scanned_text;
 
 /// Look up a configured layer by name.
 pub fn find<'a>(config: &'a Config, name: &str) -> Result<&'a LayerConfig> {
@@ -116,13 +116,7 @@ pub fn apply(
                 ))
                 .into());
             }
-            let scanned = entry
-                .path()
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| SCANNED_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-                .unwrap_or(false);
-            if scanned && !allow_secrets {
+            if is_scanned_text(entry.path()) && !allow_secrets {
                 let bytes = std::fs::read(entry.path())?;
                 if let Some(hint) = redact::scan_for_secrets(&String::from_utf8_lossy(&bytes)) {
                     return Err(CcError::SecretDetected {
@@ -281,6 +275,22 @@ mod tests {
         let err = apply(&layer, &layers_root, &claude, true, false).unwrap_err();
         assert!(err.to_string().contains("secret"), "got: {err:#}");
         apply(&layer, &layers_root, &claude, true, true).unwrap();
+        std::fs::remove_file(layers_root.join("team/skills/setup.md")).unwrap();
+
+        // Extension-less dotenv files are scanned too.
+        for name in [".env", ".env.local"] {
+            let p = layers_root.join("team/skills/tool").join(name);
+            write(&p, "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx\n");
+            let err = apply(&layer, &layers_root, &claude, true, false).unwrap_err();
+            assert!(err.to_string().contains("secret"), "{name}: got {err:#}");
+            std::fs::remove_file(&p).unwrap();
+        }
+
+        // `.claude.json` (OAuth tokens) is hard-blocked like credentials.
+        write(&layers_root.join("team/skills/.claude.json"), "{}");
+        let err = apply(&layer, &layers_root, &claude, true, true).unwrap_err();
+        assert!(err.to_string().contains("credential"), "got: {err:#}");
+        std::fs::remove_file(layers_root.join("team/skills/.claude.json")).unwrap();
 
         // A layer settings.json with new hooks fails closed without a tty.
         let layer = layer_cfg("team", "unused", &["settings.json"]);
