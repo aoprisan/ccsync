@@ -245,7 +245,12 @@ pub enum ProfileAction {
     /// Delete a profile's store (refused while it is active).
     Delete { name: String },
     /// Revert the last switch.
-    Rollback,
+    Rollback {
+        /// Accept the restored profile's settings.json hook commands without
+        /// confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
