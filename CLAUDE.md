@@ -28,7 +28,10 @@ hard problems it solves — and the invariants you must not break — are:
    authoritative decode table; never re-derive paths with `decode_path` when a
    manifest is available. Content rewrites must stay boundary-aware
    (`remap::replace_bounded`) so `/Users/alice2` survives an
-   `/Users/alice` remap.
+   `/Users/alice` remap. Dashed siblings (`/Users/alice-2`) are only
+   distinguishable in encoded form via known paths: resolved roots plus
+   `manifest.source_home_siblings` get whole-path entries in
+   `remap::encoded_mappings`, sorted ahead of the shorter home prefix.
 4. **Staging is immutable input; restores verify integrity.** Restore remaps a
    temp apply-set copy (never staging itself — snapshots are reusable) and
    first checks every staged file against the manifest's sha256 (both
@@ -38,10 +41,14 @@ hard problems it solves — and the invariants you must not break — are:
    — and so can `statusLine.command`, the `*Helper`/`aws*` keys and `env`
    (`restore::executable_settings_in`), plus new stdio MCP servers
    (`mcp::new_server_commands`, diffed against the simulated merge so unioned
-   args don't re-prompt). Restore and layer apply gate on that full set;
-   profile switch/rollback gate on hooks only (`hook_commands_in`), since
-   profiles legitimately differ in `env` and every switch re-diffs. All fail
-   closed when non-interactive (`confirm_hooks`).
+   args don't re-prompt). Restore and layer apply gate on that full set.
+   Profile switch/rollback always gate new hooks (`hook_commands_in`), and
+   gate the rest of the set (plus the store's stdio MCP servers) only for
+   entries missing from the machine-local `profiles/trusted.json` — what this
+   machine captured or approved for that profile — since profiles legitimately
+   differ in `env` and every switch re-diffs. `trusted.json`, like
+   `active.json`, is in `profile::LOCAL_FILES`: never snapshotted, never
+   restored. All fail closed when non-interactive (`confirm_hooks`).
 6. **Never write through a symlink, never lose one.** Restore skips
    destinations under a symlink (`symlink_on_path`); backups and profile
    copies recreate links rather than following or dropping them.
@@ -140,8 +147,10 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
   (`log`), `machines`, `pull --at` (reset → copy → re-align), and
   `remote_manifest` for `diff --remote`. Read paths fetch strictly (a failed
   fetch is an error, never a stale cache); a remote URL change re-clones.
-  `pull`/`import` drop a `.ccsync-pulled` marker in staging that `push`
-  refuses; the next real snapshot clears it. **`archive.rs`** — `tar.gz` + `age`
+  `pull`/`import` build the incoming snapshot beside staging and swap it in
+  whole (`snapshot::replace_staging`), so a failed pull never wipes staging;
+  they drop a `.ccsync-pulled` marker that `push` refuses; the next real
+  snapshot clears it. **`archive.rs`** — `tar.gz` + `age`
   encryption, passphrase from `CCSYNC_PASSPHRASE` (no plaintext mode);
   extraction is per-entry and refuses unsafe paths/links.
 - **`layer.rs`** — read-only shared layers (`[[layers]]` config): `pull`
@@ -154,7 +163,8 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
 - **`service.rs`** — `daemon` (foreground loop; stages into its own
   `daemon-staging` dir so a tick never clobbers a pulled snapshot) + `service install/uninstall/
   start/stop/status`. `install` writes a systemd user unit / launchd agent
-  (both source `<config>/ccsync/service.env` for secrets); `start` runs
+  (both source `<config>/ccsync/service.env` for secrets; paths are escaped
+  for unit syntax / passed as `sh` positional args, never spliced into a script); `start` runs
   detached with an atomically-claimed pidfile, and stop/status verify the PID
   is really a ccsync process before trusting it. Pure orchestration over
   `snapshot`/`git`/`archive` — keep transport logic out of here.

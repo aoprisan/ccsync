@@ -96,48 +96,10 @@ pub fn extract(archive: &Path, staging: &Path, passphrase: &str) -> Result<()> {
     let mut tar_gz = Vec::new();
     reader.read_to_end(&mut tar_gz)?;
 
-    // Unpack into a fresh sibling of `staging` and swap it in only once the
-    // whole archive has validated: a corrupt or hostile archive must leave
-    // the existing staged snapshot untouched.
-    let parent = match staging.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => std::path::PathBuf::from("."),
-    };
-    std::fs::create_dir_all(&parent)?;
-    let tmp = tempfile::Builder::new()
-        .prefix(".ccsync-extract-")
-        .tempdir_in(&parent)
-        .with_context(|| format!("creating temp dir in {}", parent.display()))?;
-    unpack_checked(&tar_gz, tmp.path())?;
-    if !tmp.path().join(MANIFEST_NAME).is_file() {
-        return Err(anyhow!(
-            "archive has no {MANIFEST_NAME}; not a ccsync snapshot"
-        ));
-    }
-
-    // Swap: move the old staging aside, move the new one in, then drop the
-    // old. If the second rename fails, put the old staging back.
-    let old = parent.join(format!(".ccsync-staging-old-{}", std::process::id()));
-    let had_old = staging.exists();
-    if had_old {
-        if old.exists() {
-            std::fs::remove_dir_all(&old).ok();
-        }
-        std::fs::rename(staging, &old)
-            .with_context(|| format!("moving aside {}", staging.display()))?;
-    }
-    let fresh = tmp.keep();
-    if let Err(e) = std::fs::rename(&fresh, staging) {
-        if had_old {
-            std::fs::rename(&old, staging).ok();
-        }
-        std::fs::remove_dir_all(&fresh).ok();
-        return Err(e).with_context(|| format!("installing {}", staging.display()));
-    }
-    if had_old {
-        std::fs::remove_dir_all(&old).ok();
-    }
-    Ok(())
+    // Unpack beside `staging` and swap it in only once the whole archive has
+    // validated: a corrupt or hostile archive must leave the existing staged
+    // snapshot untouched.
+    crate::snapshot::replace_staging(staging, |fresh| unpack_checked(&tar_gz, fresh))
 }
 
 /// Unpack a gzip tarball into `dest` entry by entry so a hostile archive

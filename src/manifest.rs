@@ -35,6 +35,12 @@ pub struct Manifest {
     /// copy (informational; absent in pre-redaction manifests).
     #[serde(default)]
     pub redacted_spans: u64,
+    /// Directories next to `source_home` whose names extend it with a dash
+    /// (`/Users/alice-2` beside `/Users/alice`). Their dash-encoded forms are
+    /// indistinguishable from paths under the home (`-Users-alice-2-proj`),
+    /// so remap uses this list to leave them alone. Absent in older manifests.
+    #[serde(default)]
+    pub source_home_siblings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +74,7 @@ impl Manifest {
             files: Vec::new(),
             project_roots: Vec::new(),
             redacted_spans: 0,
+            source_home_siblings: Vec::new(),
         }
     }
 

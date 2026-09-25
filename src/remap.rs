@@ -49,7 +49,7 @@ pub fn build_mappings(
         });
     }
     // Longest source prefix first.
-    mappings.sort_by(|a, b| b.from.len().cmp(&a.from.len()));
+    mappings.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     mappings
 }
 
@@ -58,7 +58,19 @@ pub fn build_mappings(
 /// `project_roots` (from the manifest) is the authoritative encoded → decoded
 /// table recorded on the source machine, where the real paths were known.
 /// Falling back to `paths::decode_path` is lossy for paths containing dashes.
-pub fn apply(data_root: &Path, mappings: &[Mapping], project_roots: &[ProjectRoot]) -> Result<()> {
+///
+/// `home_siblings` (the manifest's `source_home_siblings`) together with the
+/// resolved `project_roots` are the source paths known to exist. Their
+/// dash-encoded forms are matched whole before any mapping prefix, so a
+/// sibling home like `/Users/alice-2` — encoded `-Users-alice-2`, which looks
+/// like a path under `/Users/alice` — is left alone unless a mapping covers
+/// it in raw form.
+pub fn apply(
+    data_root: &Path,
+    mappings: &[Mapping],
+    project_roots: &[ProjectRoot],
+    home_siblings: &[String],
+) -> Result<()> {
     if mappings.is_empty() {
         return Ok(());
     }
@@ -69,13 +81,7 @@ pub fn apply(data_root: &Path, mappings: &[Mapping], project_roots: &[ProjectRoo
 
     // Transcripts also reference project dirs by their encoded names, so each
     // mapping is applied in raw form and in dash-encoded form.
-    let encoded_mappings: Vec<Mapping> = mappings
-        .iter()
-        .map(|m| Mapping {
-            from: paths::encode_path(Path::new(&m.from)),
-            to: paths::encode_path(Path::new(&m.to)),
-        })
-        .collect();
+    let encoded_mappings = encoded_mappings(mappings, project_roots, home_siblings);
 
     // 1. Rewrite transcript contents.
     for entry in walkdir::WalkDir::new(&projects) {
@@ -102,14 +108,15 @@ pub fn apply(data_root: &Path, mappings: &[Mapping], project_roots: &[ProjectRoo
             .find(|r| r.encoded == encoded)
             .map(|r| r.decoded_path.clone())
             .unwrap_or_else(|| naive.clone());
-        let new_encoded = match remap_str(&decoded, mappings) {
-            Some(new_decoded) => Some(paths::encode_path(Path::new(&new_decoded))),
-            // An unresolved root (the snapshot fell back to the lossy decode)
-            // can't match a mapping whose path has dashes, e.g. a home of
-            // `/home/jean-luc`. Match its encoded form instead, the same
-            // way the transcript contents were rewritten.
-            None if decoded == naive => remap_encoded(&encoded, &encoded_mappings),
-            None => None,
+        let new_encoded = if decoded == naive {
+            // Unresolved (or dash-free) root: the naive decode can't tell
+            // `/Users/alice-2/proj` from `/Users/alice/2/proj`, and can't
+            // match a mapping whose path has dashes (`/home/jean-luc`). Match
+            // its encoded form instead, exactly as transcript contents are
+            // rewritten, so known siblings win over a shorter home prefix.
+            remap_encoded(&encoded, &encoded_mappings)
+        } else {
+            remap_str(&decoded, mappings).map(|d| paths::encode_path(Path::new(&d)))
         };
         if let Some(new_encoded) = new_encoded {
             if new_encoded != encoded {
@@ -138,6 +145,40 @@ pub fn apply(data_root: &Path, mappings: &[Mapping], project_roots: &[ProjectRoo
         }
     }
     Ok(())
+}
+
+/// The dash-encoded counterpart of `mappings`, longest `from` first. Every
+/// known source path (resolved project roots and the home's dashed siblings)
+/// gets an entry of its own: re-encoded through the raw mappings when one
+/// covers it, otherwise an identity entry that shields it from a shorter
+/// prefix whose encoding it happens to extend.
+fn encoded_mappings(
+    mappings: &[Mapping],
+    project_roots: &[ProjectRoot],
+    home_siblings: &[String],
+) -> Vec<Mapping> {
+    let resolved_roots = project_roots
+        .iter()
+        .filter(|r| paths::decode_path(&r.encoded).to_string_lossy() != r.decoded_path)
+        .map(|r| r.decoded_path.as_str());
+    let known = resolved_roots.chain(home_siblings.iter().map(String::as_str));
+    let mut out: Vec<Mapping> = known
+        .map(|path| {
+            let from = paths::encode_path(Path::new(path));
+            let to = remap_str(path, mappings)
+                .map(|p| paths::encode_path(Path::new(&p)))
+                .unwrap_or_else(|| from.clone());
+            Mapping { from, to }
+        })
+        .chain(mappings.iter().map(|m| Mapping {
+            from: paths::encode_path(Path::new(&m.from)),
+            to: paths::encode_path(Path::new(&m.to)),
+        }))
+        .collect();
+    // Stable, so for equal encodings the known path's entry (which already
+    // applied the raw mappings) comes first.
+    out.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
+    out
 }
 
 /// Apply the first matching dash-encoded prefix mapping to an encoded dir
@@ -297,7 +338,7 @@ mod tests {
         let mappings = build_mappings(&manifest, "/home/bob", &Default::default());
         // sanity: also exercise explicit override path
         let _ = &mut manifest;
-        apply(&data, &mappings, &[]).unwrap();
+        apply(&data, &mappings, &[], &[]).unwrap();
 
         // Directory renamed to the new home.
         let new_dir = data.join("projects/-home-bob-proj");
@@ -316,7 +357,7 @@ mod tests {
             &data.join("projects/-home-x-p/s.jsonl"),
             "{\"cwd\":\"/home/x/p\"}\n",
         );
-        apply(&data, &[], &[]).unwrap();
+        apply(&data, &[], &[], &[]).unwrap();
         assert!(data.join("projects/-home-x-p/s.jsonl").exists());
     }
 
@@ -338,7 +379,7 @@ mod tests {
 
         let manifest = Manifest::new("h".into(), "/Users/alice".into());
         let mappings = build_mappings(&manifest, "/home/bob", &Default::default());
-        apply(&data, &mappings, &[]).unwrap();
+        apply(&data, &mappings, &[], &[]).unwrap();
 
         let content = fs::read_to_string(data.join("projects/-home-bob-proj/s.jsonl")).unwrap();
         // The sibling user `/Users/alice2` (and its encoded form) is untouched.
@@ -369,7 +410,7 @@ mod tests {
             encoded: "-Users-alice-my-proj".into(),
             decoded_path: "/Users/alice/my-proj".into(),
         }];
-        apply(&data, &mappings, &roots).unwrap();
+        apply(&data, &mappings, &roots, &[]).unwrap();
 
         // Renamed using the authoritative decoded path, so dir name and the
         // rewritten cwd stay in sync.
@@ -414,7 +455,7 @@ mod tests {
         explicit.insert("/Users/alice/code/work".into(), "/Users/alice/work".into());
         let manifest = Manifest::new("h".into(), "/Users/alice".into());
         let mappings = build_mappings(&manifest, "/home/alice", &explicit);
-        apply(&data, &mappings, &[]).unwrap();
+        apply(&data, &mappings, &[], &[]).unwrap();
 
         let dir = data.join("projects/-Users-alice-work");
         assert!(dir.is_dir(), "dir should follow the explicit mapping");
@@ -432,7 +473,7 @@ mod tests {
         write(&data.join("projects/-work-a/s.jsonl"), "{}\n");
         write(&data.join("projects/-src-a/t.jsonl"), "{}\n");
         let mappings = [mapping("/work", "/src"), mapping("/src", "/archive/src")];
-        apply(&data, &mappings, &[]).unwrap();
+        apply(&data, &mappings, &[], &[]).unwrap();
 
         assert!(data.join("projects/-src-a/s.jsonl").exists());
         assert!(data.join("projects/-archive-src-a/t.jsonl").exists());
@@ -453,7 +494,13 @@ mod tests {
             encoded: "-home-jean-luc-old".into(),
             decoded_path: "/home/jean/luc/old".into(),
         }];
-        apply(&data, &[mapping("/home/jean-luc", "/home/bob")], &roots).unwrap();
+        apply(
+            &data,
+            &[mapping("/home/jean-luc", "/home/bob")],
+            &roots,
+            &[],
+        )
+        .unwrap();
 
         let dir = data.join("projects/-home-bob-old");
         assert!(dir.is_dir());
@@ -470,7 +517,112 @@ mod tests {
             encoded: "-Users-alice-2-proj".into(),
             decoded_path: "/Users/alice-2/proj".into(),
         }];
-        apply(&data, &[mapping("/Users/alice", "/home/bob")], &roots).unwrap();
+        apply(&data, &[mapping("/Users/alice", "/home/bob")], &roots, &[]).unwrap();
         assert!(data.join("projects/-Users-alice-2-proj").is_dir());
+    }
+
+    #[test]
+    fn sibling_home_survives_home_remap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        // One session under the home, one under the sibling `/Users/alice-2`
+        // whose root could not be resolved at snapshot time (deleted dir).
+        write(
+            &data.join("projects/-Users-alice-proj/s.jsonl"),
+            concat!(
+                "{\"cwd\":\"/Users/alice/proj\",",
+                "\"enc\":\"-Users-alice-proj\",",
+                "\"sib\":\"/Users/alice-2/proj\",",
+                "\"sib_enc\":\"-Users-alice-2-proj\",",
+                "\"sib_bare\":\"-Users-alice-2\"}\n",
+            ),
+        );
+        write(
+            &data.join("projects/-Users-alice-2-old/s.jsonl"),
+            "{\"cwd\":\"/Users/alice-2/old\"}\n",
+        );
+        let roots = [
+            ProjectRoot {
+                encoded: "-Users-alice-proj".into(),
+                decoded_path: "/Users/alice/proj".into(),
+            },
+            // Unresolved: the snapshot fell back to the naive decode.
+            ProjectRoot {
+                encoded: "-Users-alice-2-old".into(),
+                decoded_path: "/Users/alice/2/old".into(),
+            },
+        ];
+        let siblings = ["/Users/alice-2".to_string()];
+        apply(
+            &data,
+            &[mapping("/Users/alice", "/home/bob")],
+            &roots,
+            &siblings,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(data.join("projects/-home-bob-proj/s.jsonl")).unwrap();
+        assert!(content.contains("\"cwd\":\"/home/bob/proj\""), "{content}");
+        assert!(content.contains("\"enc\":\"-home-bob-proj\""), "{content}");
+        assert!(
+            content.contains("\"sib\":\"/Users/alice-2/proj\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("\"sib_enc\":\"-Users-alice-2-proj\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("\"sib_bare\":\"-Users-alice-2\""),
+            "{content}"
+        );
+        // The sibling's session dir keeps its name.
+        assert!(data.join("projects/-Users-alice-2-old").is_dir());
+        assert!(!data.join("projects/-home-bob-2-old").exists());
+    }
+
+    #[test]
+    fn explicitly_mapped_sibling_still_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(
+            &data.join("projects/-Users-alice-2-old/s.jsonl"),
+            "{\"enc\":\"-Users-alice-2-old\"}\n",
+        );
+        let roots = [ProjectRoot {
+            encoded: "-Users-alice-2-old".into(),
+            decoded_path: "/Users/alice/2/old".into(),
+        }];
+        let mappings = [
+            mapping("/Users/alice-2", "/srv/two"),
+            mapping("/Users/alice", "/home/bob"),
+        ];
+        let siblings = ["/Users/alice-2".to_string()];
+        apply(&data, &mappings, &roots, &siblings).unwrap();
+
+        let content = fs::read_to_string(data.join("projects/-srv-two-old/s.jsonl")).unwrap();
+        assert!(content.contains("\"enc\":\"-srv-two-old\""), "{content}");
+    }
+
+    #[test]
+    fn resolved_root_under_sibling_is_protected_without_sibling_list() {
+        // Pre-sibling manifests: a resolved root alone still shields itself.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(
+            &data.join("projects/-Users-alice-proj/s.jsonl"),
+            "{\"x\":\"-Users-alice-2-proj-sub\",\"y\":\"-Users-alice-proj\"}\n",
+        );
+        let roots = [ProjectRoot {
+            encoded: "-Users-alice-2-proj".into(),
+            decoded_path: "/Users/alice-2/proj".into(),
+        }];
+        apply(&data, &[mapping("/Users/alice", "/home/bob")], &roots, &[]).unwrap();
+        let content = fs::read_to_string(data.join("projects/-home-bob-proj/s.jsonl")).unwrap();
+        assert!(
+            content.contains("\"x\":\"-Users-alice-2-proj-sub\""),
+            "{content}"
+        );
+        assert!(content.contains("\"y\":\"-home-bob-proj\""), "{content}");
     }
 }
