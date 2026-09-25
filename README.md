@@ -342,7 +342,7 @@ transcripts verbatim on a same-path machine.
   code on this machine; bundled MCP servers are launched as commands too. New
   or changed ones are printed and must be confirmed; non-interactive runs fail
   closed (`--yes` to accept, `confirm_hooks = false` to disable the check).
-  `profile rollback` is gated the same way.
+  Profile switch and `profile rollback` gate new hook commands.
 - **Archives are always encrypted** with [age](https://age-encryption.org/)
   using `CCSYNC_PASSPHRASE`; there is no plaintext mode.
 - **`restore` is reversible** — it backs up the existing `~/.claude` to a

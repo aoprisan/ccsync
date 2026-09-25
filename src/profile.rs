@@ -175,12 +175,14 @@ pub fn read_meta(root: &Path, name: &str) -> Result<ProfileMeta> {
     if !path.exists() {
         return Ok(ProfileMeta::default());
     }
-    let meta: ProfileMeta = toml::from_str(&fs::read_to_string(&path)?)
+    let mut meta: ProfileMeta = toml::from_str(&fs::read_to_string(&path)?)
         .with_context(|| format!("parsing {}", path.display()))?;
     // `profile.toml` rides inside snapshots, so it is remote input: refuse a
     // component list that could reach outside the owned set on load.
-    if let Some(comps) = &meta.components {
-        validate_components(comps).with_context(|| format!("invalid {}", path.display()))?;
+    if let Some(comps) = meta.components.take() {
+        let comps = normalize_components(comps);
+        validate_components(&comps).with_context(|| format!("invalid {}", path.display()))?;
+        meta.components = Some(comps);
     }
     Ok(meta)
 }
@@ -215,15 +217,24 @@ fn validate_component(comp: &str) -> Result<()> {
     Ok(())
 }
 
+/// Drop a trailing `/` (`"skills/"`), which other component lists accept.
+fn normalize_components(comps: Vec<String>) -> Vec<String> {
+    comps
+        .into_iter()
+        .map(|c| c.trim_end_matches('/').to_string())
+        .collect()
+}
+
 fn validate_components(comps: &[String]) -> Result<()> {
     comps.iter().try_for_each(|c| validate_component(c))
 }
 
 /// The component set this profile owns (validated).
 pub fn components(root: &Path, name: &str, config: &Config) -> Result<Vec<String>> {
-    let comps = read_meta(root, name)?
-        .components
-        .unwrap_or_else(|| config.profiles.components.clone());
+    let comps = match read_meta(root, name)?.components {
+        Some(comps) => comps,
+        None => normalize_components(config.profiles.components.clone()),
+    };
     validate_components(&comps).with_context(|| format!("profile {name:?}"))?;
     Ok(comps)
 }
@@ -410,7 +421,7 @@ pub fn rollback(
         capture_into(root, &current.name, live, config)?;
         components(root, &current.name, config)?
     } else {
-        let comps = config.profiles.components.clone();
+        let comps = normalize_components(config.profiles.components.clone());
         validate_components(&comps)?;
         comps
     };
@@ -1021,6 +1032,23 @@ mod tests {
         let mut bad_cfg = Config::default();
         bad_cfg.profiles.components = vec!["todos".into()];
         assert!(components(&f.root, "work", &bad_cfg).is_err());
+    }
+
+    #[test]
+    fn trailing_slash_components_are_accepted() {
+        let f = Fixture::new();
+        let mut cfg = Config::default();
+        cfg.profiles.components = vec!["skills/".into(), "settings.json".into()];
+        create(&f.root, "work", None, &cfg, Some(&f.live())).unwrap();
+        assert_eq!(
+            components(&f.root, "work", &cfg).unwrap(),
+            vec!["skills".to_string(), "settings.json".to_string()]
+        );
+        fs::write(meta_path(&f.root, "work"), "components = [\"agents/\"]\n").unwrap();
+        assert_eq!(
+            components(&f.root, "work", &cfg).unwrap(),
+            vec!["agents".to_string()]
+        );
     }
 
     #[test]

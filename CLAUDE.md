@@ -36,10 +36,12 @@ hard problems it solves — and the invariants you must not break — are:
    these checks.
 5. **Hooks are code.** An incoming `settings.json` can install hook commands
    — and so can `statusLine.command`, the `*Helper`/`aws*` keys and `env`
-   (`restore::hook_commands_in` collects all of them), plus new stdio MCP
-   servers (`mcp::server_commands`); restore, profile switch/rollback and
-   layer apply must surface new ones and fail closed when non-interactive
-   (`confirm_hooks`).
+   (`restore::executable_settings_in`), plus new stdio MCP servers
+   (`mcp::new_server_commands`, diffed against the simulated merge so unioned
+   args don't re-prompt). Restore and layer apply gate on that full set;
+   profile switch/rollback gate on hooks only (`hook_commands_in`), since
+   profiles legitimately differ in `env` and every switch re-diffs. All fail
+   closed when non-interactive (`confirm_hooks`).
 6. **Never write through a symlink, never lose one.** Restore skips
    destinations under a symlink (`symlink_on_path`); backups and profile
    copies recreate links rather than following or dropping them.

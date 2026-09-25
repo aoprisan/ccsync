@@ -136,8 +136,8 @@ pub fn apply(
             .iter()
             .any(|c| c.trim_end_matches('/') == "settings.json")
     {
-        let incoming = restore::hook_commands_in(&checkout.join("settings.json"))?;
-        let existing = restore::hook_commands_in(&claude_dir.join("settings.json"))?;
+        let incoming = restore::executable_settings_in(&checkout.join("settings.json"))?;
+        let existing = restore::executable_settings_in(&claude_dir.join("settings.json"))?;
         let new_hooks: std::collections::BTreeSet<String> =
             incoming.difference(&existing).cloned().collect();
         if !new_hooks.is_empty() {

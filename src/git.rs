@@ -92,10 +92,25 @@ fn configured_origin(cache: &Path) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Whether two remote URLs name the same repo. `git clone ./r.git` records an
+/// absolute path, so local paths compare by their canonical form; without
+/// that a relative remote would re-clone the cache on every command.
+fn same_remote(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Ensure the local cache is a clone of `remote`, aligned with the remote tip
 /// if it already exists.
 fn ensure_clone(remote: &str, cache: &Path, mode: Sync) -> Result<()> {
-    if cache.join(".git").exists() && configured_origin(cache).as_deref() != Some(remote) {
+    if cache.join(".git").exists()
+        && !configured_origin(cache).is_some_and(|origin| same_remote(&origin, remote))
+    {
         // The cache was cloned from a different remote (a --remote override
         // or a changed config). Its `origin/*` refs and local history belong
         // to the old remote: re-pointing the URL and fetching would leave
