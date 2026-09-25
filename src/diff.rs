@@ -89,6 +89,10 @@ fn local_manifest(
                     Some(CcError::SecretDetected { .. })
                 ) =>
         {
+            eprintln!(
+                "note: {e:#}; diffing as `--allow-secrets` would \
+                 (a real snapshot aborts without it, and redacted transcripts may show as changed)"
+            );
             opts.allow_secrets = true;
             snapshot::build(claude_dir, staging, config, &opts)
         }

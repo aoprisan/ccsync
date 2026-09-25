@@ -368,7 +368,15 @@ fn plan_path(
     out: &mut Vec<PlannedFile>,
     symlinks: &mut Vec<String>,
 ) -> Result<()> {
-    for entry in WalkDir::new(src).follow_links(false) {
+    // Nested git metadata (a skill cloned from its own repo) is skipped
+    // wholesale: it can't be committed inside the sync repo (it would become
+    // a gitlink and the snapshot would fail integrity on every pull), and the
+    // history already lives in that skill's own remote.
+    let walk = WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || e.file_name() != ".git");
+    for entry in walk {
         let entry = entry?;
         let file_type = entry.file_type();
         if !file_type.is_file() && !file_type.is_symlink() {
@@ -957,5 +965,34 @@ mod tests {
 
         let skipped = skipped_symlinks(&claude, &cfg).unwrap();
         assert_eq!(skipped, vec!["skills/linked", "skills/note.md"]);
+    }
+    #[test]
+    fn skips_nested_git_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        write(&claude.join("skills/x/SKILL.md"), "skill");
+        write(&claude.join("skills/x/.git/HEAD"), "ref: refs/heads/main");
+        write(&claude.join("skills/x/.git/objects/ab/cd"), "blob");
+        write(&claude.join("skills/y/.git"), "gitdir: ../../elsewhere");
+        write(&claude.join("skills/y/SKILL.md"), "skill");
+        std::env::set_var("HOME", tmp.path());
+        let staging = tmp.path().join("staging");
+        let m = build(
+            &claude,
+            &staging,
+            &Config::default(),
+            &SnapshotOptions {
+                dry_run: false,
+                allow_secrets: false,
+                claude_json: None,
+                profiles_root: None,
+            },
+        )
+        .unwrap();
+        let rels: Vec<&str> = m.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(rels.contains(&"skills/x/SKILL.md"));
+        assert!(rels.contains(&"skills/y/SKILL.md"));
+        assert!(!rels.iter().any(|r| r.contains(".git")), "{rels:?}");
+        assert!(!staging.join("data/skills/x/.git").exists());
     }
 }
