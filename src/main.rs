@@ -443,6 +443,14 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
         );
         println!("    add them to `include` or `exclude` in the config to silence this");
     }
+    let symlinks = snapshot::skipped_symlinks(&claude, config)?;
+    if !symlinks.is_empty() {
+        println!(
+            "  warning: {} symlink(s) skipped (links are never followed, so their targets are not synced): {}",
+            symlinks.len(),
+            symlinks.join(", ")
+        );
+    }
     if let Some(claude_json) = &opts.claude_json {
         if let Some(doc) = mcp::extract(claude_json)? {
             println!(

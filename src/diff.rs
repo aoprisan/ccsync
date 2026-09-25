@@ -12,6 +12,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::Config;
+use crate::error::CcError;
 use crate::manifest::Manifest;
 use crate::snapshot::{self, SnapshotOptions};
 
@@ -55,17 +56,44 @@ pub fn against_manifest(
     claude_json: Option<std::path::PathBuf>,
     other: &Manifest,
 ) -> Result<Vec<DiffEntry>> {
-    let opts = SnapshotOptions {
-        dry_run: true,
-        allow_secrets: false,
-        claude_json,
-        profiles_root: None,
-    };
-    let local = snapshot::build(claude_dir, staging, config, &opts)?;
+    // Same options a real snapshot resolves (profile store bundling when
+    // `profiles.sync` is on, the daemon's allow-secrets setting), as a dry run.
+    // `claude_json` stays caller-supplied.
+    let mut opts = SnapshotOptions::new(true, config.service.allow_secrets, config);
+    opts.claude_json = claude_json;
+    let local = local_manifest(claude_dir, staging, config, opts)?;
     Ok(diff_manifest_maps(
         &hash_map_of(&local),
         &hash_map_of(other),
     ))
+}
+
+/// Dry-run snapshot of the local side. A diff reads only hashes and nothing
+/// leaves the machine, so a secret-scan hit must not abort it: a setup
+/// snapshotted with `--allow-secrets` would otherwise be un-diffable. On a hit
+/// the capture is retried as `--allow-secrets` would run it (which also skips
+/// transcript redaction, matching what such a snapshot staged).
+fn local_manifest(
+    claude_dir: &Path,
+    staging: &Path,
+    config: &Config,
+    mut opts: SnapshotOptions,
+) -> Result<Manifest> {
+    debug_assert!(opts.dry_run, "diff must never write staging");
+    opts.dry_run = true;
+    match snapshot::build(claude_dir, staging, config, &opts) {
+        Err(e)
+            if !opts.allow_secrets
+                && matches!(
+                    e.downcast_ref::<CcError>(),
+                    Some(CcError::SecretDetected { .. })
+                ) =>
+        {
+            opts.allow_secrets = true;
+            snapshot::build(claude_dir, staging, config, &opts)
+        }
+        other => other,
+    }
 }
 
 fn hash_map_of(m: &Manifest) -> BTreeMap<String, String> {
@@ -197,5 +225,60 @@ mod tests {
         assert_eq!(find("skills/new/SKILL.md").state, DiffState::LocalOnly);
         assert_eq!(find("CLAUDE.md").state, DiffState::OtherOnly);
         assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn diff_includes_bundled_profiles_like_a_real_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        let profiles = tmp.path().join("profiles");
+        write(&claude.join("settings.json"), r#"{"theme":"dark"}"#);
+        write(&profiles.join("work/CLAUDE.md"), "# work profile");
+        let mut cfg = Config::default();
+        cfg.profiles.sync = true;
+        let opts = |dry_run| SnapshotOptions {
+            dry_run,
+            allow_secrets: false,
+            claude_json: None,
+            profiles_root: Some(profiles.clone()),
+        };
+        let staged = snapshot::build(&claude, &staging, &cfg, &opts(false)).unwrap();
+        assert!(staged
+            .files
+            .iter()
+            .any(|f| f.rel_path.starts_with("ccsync-profiles/")));
+
+        let local = local_manifest(&claude, &staging, &cfg, opts(true)).unwrap();
+        let entries = diff_manifest_maps(&hash_map_of(&local), &hash_map_of(&staged));
+        assert!(
+            entries.is_empty(),
+            "profile files must not show as other-only"
+        );
+    }
+
+    #[test]
+    fn diff_does_not_abort_on_allowed_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        write(
+            &claude.join("settings.json"),
+            r#"{"env":{"KEY":"sk-abcdefghijklmnopqrstuvwx"}}"#,
+        );
+        let cfg = Config::default();
+        // The user snapshotted with --allow-secrets.
+        let opts = SnapshotOptions {
+            dry_run: false,
+            allow_secrets: true,
+            claude_json: None,
+            profiles_root: None,
+        };
+        snapshot::build(&claude, &staging, &cfg, &opts).unwrap();
+
+        let entries = against_staged(&claude, &staging, &cfg, None).unwrap();
+        assert!(entries.is_empty(), "got {} entries", entries.len());
+        // The dry-run never touched staging.
+        assert!(staging.join("data/settings.json").exists());
     }
 }
