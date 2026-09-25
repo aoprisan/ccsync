@@ -67,10 +67,14 @@ scanner is best-effort pattern matching, not a guarantee.
 ## Install
 
 ```sh
+cargo install claude-sync   # from crates.io; installs the `ccsync` command
+# or, from a checkout:
 cargo install --path .
-# or
-cargo build --release   # binary at target/release/ccsync
+cargo build --release       # binary at target/release/ccsync
 ```
+
+The crates.io package is named `claude-sync` because `ccsync` there is an
+unrelated project — `cargo install ccsync` installs *that* tool, not this one.
 
 ## Quickstart
 
