@@ -34,6 +34,16 @@ pub fn repo_cache() -> Result<PathBuf> {
     Ok(base.join("ccsync").join("repo"))
 }
 
+/// The repo cache plus an exclusive lock on it, held until the guard drops,
+/// so a daemon tick and an interactive push/pull never interleave
+/// `reset --hard`/`add`/`commit` on the same checkout. Each public entry
+/// point takes it exactly once; none of them calls another.
+fn locked_cache() -> Result<(PathBuf, std::fs::File)> {
+    let cache = repo_cache()?;
+    let lock = crate::lock::exclusive(&cache.with_extension("lock"))?;
+    Ok((cache, lock))
+}
+
 fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut cmd = Command::new("git");
     // The remote URL is user- or config-supplied: restrict git to real
@@ -55,38 +65,124 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// How a cache refresh treats fetch/reset failures.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sync {
+    /// Read paths (pull, history, machines, diff --remote, layers): a failed
+    /// fetch must surface, never serve the stale cache as if it were current.
+    Strict,
+    /// Push: offline or brand-new remotes still stage a local commit, and the
+    /// push itself (plus its one re-align retry) reports connectivity errors.
+    BestEffort,
+}
+
+/// Attribute rules that pin every path to raw bytes: no eol conversion, no
+/// clean/smudge filters, no `$Id$` expansion, no re-encoding.
+const RAW_ATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding\n";
+
+/// Committed at the repo root so other clones (and other tools) also treat
+/// every file as opaque bytes.
+const ROOT_GITATTRIBUTES: &str = "* -text\n";
+
+/// The URL `origin` is configured with, verbatim (unlike `remote get-url`,
+/// which applies `insteadOf` rewrites).
+fn configured_origin(cache: &Path) -> Option<String> {
+    run_git(&["config", "--get", "remote.origin.url"], Some(cache))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Whether two remote URLs name the same repo. `git clone ./r.git` records an
+/// absolute path, so local paths compare by their canonical form; without
+/// that a relative remote would re-clone the cache on every command.
+fn same_remote(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Ensure the local cache is a clone of `remote`, aligned with the remote tip
 /// if it already exists.
-fn ensure_clone(remote: &str, cache: &Path) -> Result<()> {
+fn ensure_clone(remote: &str, cache: &Path, mode: Sync) -> Result<()> {
+    if cache.join(".git").exists()
+        && !configured_origin(cache).is_some_and(|origin| same_remote(&origin, remote))
+    {
+        // The cache was cloned from a different remote (a --remote override
+        // or a changed config). Its `origin/*` refs and local history belong
+        // to the old remote: re-pointing the URL and fetching would leave
+        // those stale refs in place, so an empty new remote would get the old
+        // remote's history pushed into it. The cache is disposable — re-clone.
+        std::fs::remove_dir_all(cache)
+            .with_context(|| format!("removing stale repo cache {}", cache.display()))?;
+    }
     if cache.join(".git").exists() {
-        // The cache may have been cloned from a different remote; keep origin
-        // pointed at what the caller asked for so a --remote override is
-        // honored instead of silently syncing with the old URL.
-        run_git(&["remote", "set-url", "origin", remote], Some(cache))?;
-        align_with_remote(cache);
+        pin_raw_attributes(cache)?;
+        align_with_remote(cache, mode)?;
     } else {
         if let Some(parent) = cache.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        run_git(&["clone", "--", remote, &cache.to_string_lossy()], None)?;
+        // Check out only after pinning attributes, so even the first
+        // checkout writes bytes exactly as committed.
+        run_git(
+            &[
+                "clone",
+                "--no-checkout",
+                "--",
+                remote,
+                &cache.to_string_lossy(),
+            ],
+            None,
+        )?;
+        pin_raw_attributes(cache)?;
+        if run_git(&["rev-parse", "--verify", "--quiet", "HEAD"], Some(cache)).is_ok() {
+            run_git(&["reset", "--hard", "HEAD"], Some(cache))?;
+        }
     }
     Ok(())
 }
 
-/// Best-effort: move the cache's branch to the remote tip. Snapshots replace
-/// the whole repo state on every push (last writer wins), so the cache's own
-/// history is disposable — `reset --hard` instead of merge/ff means a cache
-/// that diverged from the remote (two machines pushing) can always recover.
-/// Errors are ignored: a brand-new remote has no commits yet, and offline
-/// operation should still be able to stage local commits.
-fn align_with_remote(cache: &Path) {
-    let _ = run_git(&["fetch", "origin"], Some(cache));
+/// Write the raw-bytes attribute rules into `.git/info/attributes`, which
+/// outranks every in-tree `.gitattributes` (including ones inside captured
+/// skill dirs) and the user's global `core.attributesFile`, so neither
+/// checkout nor add can alter file bytes.
+fn pin_raw_attributes(cache: &Path) -> Result<()> {
+    let info = cache.join(".git").join("info");
+    std::fs::create_dir_all(&info)?;
+    std::fs::write(info.join("attributes"), RAW_ATTRIBUTES)?;
+    Ok(())
+}
+
+/// Move the cache's branch to the remote tip. Snapshots replace the whole
+/// repo state on every push (last writer wins), so the cache's own history is
+/// disposable — `reset --hard` instead of merge/ff means a cache that diverged
+/// from the remote (two machines pushing) can always recover. A remote with no
+/// commits yet leaves the cache as is. In [`Sync::BestEffort`] mode fetch and
+/// reset failures are ignored so offline pushes can still stage a commit; in
+/// [`Sync::Strict`] mode they propagate.
+fn align_with_remote(cache: &Path, mode: Sync) -> Result<()> {
+    let strict = mode == Sync::Strict;
+    // --prune drops remote-tracking refs for branches the remote no longer has.
+    if let Err(e) = run_git(&["fetch", "--prune", "origin"], Some(cache)) {
+        if strict {
+            return Err(e.context("refreshing the repo cache from the remote"));
+        }
+        return Ok(());
+    }
     if let Ok(branch) = run_git(&["symbolic-ref", "--short", "HEAD"], Some(cache)) {
         let remote_ref = format!("origin/{}", branch.trim());
         if run_git(&["rev-parse", "--verify", &remote_ref], Some(cache)).is_ok() {
-            let _ = run_git(&["reset", "--hard", &remote_ref], Some(cache));
+            let reset = run_git(&["reset", "--hard", &remote_ref], Some(cache));
+            if strict {
+                reset?;
+            }
         }
     }
+    Ok(())
 }
 
 /// Move a legacy root-level snapshot (pre-machines layout) into
@@ -117,20 +213,37 @@ fn migrate_legacy_root(cache: &Path) -> Result<()> {
 /// no-op against an up-to-date remote, or publishes the existing history to a
 /// remote that does not have it yet.
 fn overlay_and_commit(staging: &Path, cache: &Path, machine_id: &str) -> Result<()> {
+    let staged_data = staging.join("data");
+    reject_nested_git(&staged_data)?;
+    let manifest = Manifest::read_from(staging)?;
+
     migrate_legacy_root(cache)?;
 
     let subtree = cache.join(MACHINES_DIR).join(machine_id);
     let _ = std::fs::remove_dir_all(&subtree);
     copy_tree(&staging.join(MANIFEST_NAME), &subtree.join(MANIFEST_NAME))?;
-    let staged_data = staging.join("data");
     if staged_data.exists() {
         copy_tree(&staged_data, &subtree.join("data"))?;
     }
 
-    run_git(&["add", "-A"], Some(cache))?;
+    let attrs = cache.join(".gitattributes");
+    if std::fs::read_to_string(&attrs).ok().as_deref() != Some(ROOT_GITATTRIBUTES) {
+        std::fs::write(&attrs, ROOT_GITATTRIBUTES)?;
+    }
+
+    // Captured trees (skills especially) can carry their own `.gitignore`
+    // files, and the user's global excludes file applies to every repo:
+    // either would silently drop snapshot files. Point core.excludesFile at
+    // an empty file (portable, unlike /dev/null vs NUL) and --force the add
+    // so no ignore rule of any origin can exclude a staged file.
+    let empty_excludes = cache.join(".git").join("ccsync-empty-excludes");
+    std::fs::write(&empty_excludes, "")?;
+    let excludes_opt = format!("core.excludesFile={}", empty_excludes.display());
+    run_git(&["-c", &excludes_opt, "add", "-A", "--force"], Some(cache))?;
+
     let status = run_git(&["status", "--porcelain"], Some(cache))?;
     if status.trim().is_empty() {
-        return Ok(());
+        return verify_tracked(cache, machine_id, &manifest);
     }
     let msg = format!(
         "ccsync snapshot [{machine_id}] {}",
@@ -145,17 +258,80 @@ fn overlay_and_commit(staging: &Path, cache: &Path, machine_id: &str) -> Result<
             "-c",
             "user.email=ccsync@localhost",
             "commit",
+            "--no-verify",
             "-m",
             &msg,
         ],
         Some(cache),
     )?;
+    verify_tracked(cache, machine_id, &manifest)
+}
+
+/// Refuse staged data containing a `.git` path component. Git cannot store
+/// such paths: a nested repository becomes an empty gitlink (or is refused),
+/// so its files would vanish from the remote while the manifest still lists
+/// them, and every later restore would fail integrity verification. Silently
+/// skipping them here would produce the same broken snapshot, so fail loudly
+/// and name the path the user needs to exclude.
+fn reject_nested_git(staged_data: &Path) -> Result<()> {
+    if !staged_data.exists() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(staged_data).follow_links(false) {
+        let entry = entry?;
+        let rel = entry
+            .path()
+            .strip_prefix(staged_data)
+            .unwrap_or(entry.path());
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(".git"))
+        {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            return Err(CcError::Git(format!(
+                "snapshot contains a nested git repository at `{rel}`; git cannot store \
+                 `.git` paths, so it would be silently dropped from the backup. Add `{rel}` \
+                 to `exclude` in the ccsync config (or use --archive) and re-run `ccsync snapshot`"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Confirm every file the manifest promises is actually tracked in this
+/// machine's subtree, so nothing (ignore rules, gitlinks, git refusing a
+/// path) can silently thin the backup.
+fn verify_tracked(cache: &Path, machine_id: &str, manifest: &Manifest) -> Result<()> {
+    let prefix = format!("{MACHINES_DIR}/{machine_id}/data/");
+    let listed = run_git(&["ls-files", "-z", "--", &prefix], Some(cache))?;
+    let tracked: std::collections::HashSet<&str> = listed
+        .split('\0')
+        .filter_map(|p| p.strip_prefix(prefix.as_str()))
+        .collect();
+    let missing: Vec<&str> = manifest
+        .files
+        .iter()
+        .map(|f| f.rel_path.as_str())
+        .filter(|p| !tracked.contains(p))
+        .collect();
+    if !missing.is_empty() {
+        let shown: Vec<&str> = missing.iter().take(10).copied().collect();
+        return Err(CcError::Git(format!(
+            "{} manifest file(s) were not committed to the repo (e.g. {}); \
+             the pushed snapshot would be incomplete",
+            missing.len(),
+            shown.join(", ")
+        ))
+        .into());
+    }
     Ok(())
 }
 
 /// Push the staged snapshot to this machine's subtree on the git `remote`.
 pub fn push(remote: &str, staging: &Path, machine_id: &str) -> Result<()> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     push_with_cache(remote, staging, &cache, machine_id)
 }
 
@@ -165,7 +341,7 @@ pub(crate) fn push_with_cache(
     cache: &Path,
     machine_id: &str,
 ) -> Result<()> {
-    ensure_clone(remote, cache)?;
+    ensure_clone(remote, cache, Sync::BestEffort)?;
     overlay_and_commit(staging, cache, machine_id)?;
     if run_git(&["push", "-u", "origin", "HEAD"], Some(cache)).is_ok() {
         return Ok(());
@@ -174,7 +350,7 @@ pub(crate) fn push_with_cache(
     // to the new remote tip, re-overlay the snapshot, and retry exactly once;
     // a second rejection is surfaced to the caller. Each machine writes only
     // its own subtree, so the re-overlay cannot lose the other machine's push.
-    align_with_remote(cache);
+    align_with_remote(cache, Sync::BestEffort)?;
     overlay_and_commit(staging, cache, machine_id)?;
     run_git(&["push", "-u", "origin", "HEAD"], Some(cache))?;
     Ok(())
@@ -243,7 +419,7 @@ fn select_subtree(cache: &Path, from: Option<&str>, own_id: &str) -> Result<Path
 /// `from` selects another machine's subtree; default is this machine's own
 /// (or the only one present).
 pub fn pull(remote: &str, staging: &Path, from: Option<&str>, own_id: &str) -> Result<()> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     pull_with_cache(remote, staging, &cache, from, own_id)
 }
 
@@ -254,7 +430,7 @@ pub(crate) fn pull_with_cache(
     from: Option<&str>,
     own_id: &str,
 ) -> Result<()> {
-    ensure_clone(remote, cache)?;
+    ensure_clone(remote, cache, Sync::Strict)?;
     let subtree = select_subtree(cache, from, own_id)?;
     copy_snapshot(&subtree, staging)
 }
@@ -268,7 +444,7 @@ pub fn pull_at(
     from: Option<&str>,
     own_id: &str,
 ) -> Result<()> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     pull_at_with_cache(remote, commit, staging, &cache, from, own_id)
 }
 
@@ -285,14 +461,15 @@ pub(crate) fn pull_at_with_cache(
     if commit.is_empty() || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!("invalid commit {commit:?}: pass a hash from `ccsync history`");
     }
-    ensure_clone(remote, cache)?;
+    ensure_clone(remote, cache, Sync::Strict)?;
     run_git(&["rev-parse", "--verify", "--quiet", commit], Some(cache))
         .map_err(|_| anyhow::anyhow!("commit {commit} not found; see `ccsync history`"))?;
     run_git(&["reset", "--hard", commit], Some(cache))?;
     let result =
         select_subtree(cache, from, own_id).and_then(|subtree| copy_snapshot(&subtree, staging));
-    // Whatever happened, put the cache back on the remote tip.
-    align_with_remote(cache);
+    // Whatever happened, put the cache back on the remote tip. Best-effort:
+    // the snapshot is already copied, and the next strict read re-aligns.
+    let _ = align_with_remote(cache, Sync::BestEffort);
     result
 }
 
@@ -313,21 +490,21 @@ fn copy_snapshot(subtree: &Path, staging: &Path) -> Result<()> {
 /// Refresh the local cache from `remote` (cloning it if needed) without
 /// copying anything into staging. Used before reading history/manifests.
 pub fn refresh_cache(remote: &str) -> Result<()> {
-    let cache = repo_cache()?;
-    ensure_clone(remote, &cache)
+    let (cache, _lock) = locked_cache()?;
+    ensure_clone(remote, &cache, Sync::Strict)
 }
 
 /// Clone `remote` into `dest` or fast-forward an existing checkout to the
 /// remote tip. Used for read-only layer checkouts, which are plain repos
 /// rather than snapshot stores.
 pub fn clone_or_update(remote: &str, dest: &Path) -> Result<()> {
-    ensure_clone(remote, dest)
+    ensure_clone(remote, dest, Sync::Strict)
 }
 
 /// Read a machine's manifest from the remote without transferring snapshot
 /// data into staging. Backs `ccsync diff --remote`.
 pub fn remote_manifest(remote: &str, from: Option<&str>, own_id: &str) -> Result<Manifest> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     remote_manifest_with_cache(remote, &cache, from, own_id)
 }
 
@@ -337,7 +514,7 @@ pub(crate) fn remote_manifest_with_cache(
     from: Option<&str>,
     own_id: &str,
 ) -> Result<Manifest> {
-    ensure_clone(remote, cache)?;
+    ensure_clone(remote, cache, Sync::Strict)?;
     let subtree = select_subtree(cache, from, own_id)?;
     Manifest::read_from(&subtree)
 }
@@ -345,12 +522,12 @@ pub(crate) fn remote_manifest_with_cache(
 /// Every machine with a snapshot on the remote, with its manifest (source
 /// host, timestamp, file count, producing version).
 pub fn machines(remote: &str) -> Result<Vec<(String, Manifest)>> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     machines_with_cache(remote, &cache)
 }
 
 pub(crate) fn machines_with_cache(remote: &str, cache: &Path) -> Result<Vec<(String, Manifest)>> {
-    ensure_clone(remote, cache)?;
+    ensure_clone(remote, cache, Sync::Strict)?;
     let mut out = Vec::new();
     for (name, dir) in subtrees_in(cache) {
         if let Ok(manifest) = Manifest::read_from(&dir) {
@@ -395,7 +572,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 /// `(short_hash, committer_date_iso8601, subject)`. Returns an empty list when
 /// the cache has no commits yet; errors only if `git log` itself fails.
 pub fn log(limit: usize) -> Result<Vec<(String, String, String)>> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     log_with_cache(&cache, limit)
 }
 
@@ -678,5 +855,108 @@ mod tests {
             std::fs::read_to_string(pulled.join("data/settings.json")).unwrap(),
             "for-b"
         );
+    }
+
+    /// Add `rel` (under `data/`) with `content` to staging and its manifest.
+    fn stage_file(staging: &Path, rel: &str, content: &[u8]) {
+        use sha2::{Digest, Sha256};
+        let path = staging.join("data").join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        let mut m = Manifest::read_from(staging).unwrap();
+        m.files.push(crate::manifest::FileEntry {
+            rel_path: rel.to_string(),
+            sha256: format!("{:x}", Sha256::digest(content)),
+            size: content.len() as u64,
+        });
+        m.write_to(staging).unwrap();
+    }
+
+    #[test]
+    fn nested_gitignore_and_crlf_files_still_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&tmp.path().join("remote.git"));
+        let staging = tmp.path().join("staging");
+        write_staging(&staging, "{}");
+        // A captured skill whose own ignore/attribute rules would drop or
+        // rewrite files if git honored them inside the snapshot.
+        stage_file(&staging, "skills/tool/.gitignore", b"*.log\nbuild/\n");
+        stage_file(&staging, "skills/tool/.gitattributes", b"* text eol=lf\n");
+        stage_file(&staging, "skills/tool/run.log", b"kept\n");
+        stage_file(&staging, "skills/tool/build/out.txt", b"also kept\n");
+        stage_file(&staging, "skills/tool/crlf.txt", b"a\r\nb\r\n");
+
+        push_with_cache(&remote, &staging, &tmp.path().join("cache-a"), "m").unwrap();
+        let pulled = tmp.path().join("pulled");
+        pull_with_cache(&remote, &pulled, &tmp.path().join("cache-b"), None, "m").unwrap();
+
+        let data = pulled.join("data/skills/tool");
+        assert_eq!(std::fs::read(data.join("run.log")).unwrap(), b"kept\n");
+        assert_eq!(
+            std::fs::read(data.join("build/out.txt")).unwrap(),
+            b"also kept\n"
+        );
+        assert_eq!(std::fs::read(data.join("crlf.txt")).unwrap(), b"a\r\nb\r\n");
+        assert!(pulled.join("data/skills/tool/.gitignore").exists());
+    }
+
+    #[test]
+    fn nested_git_dir_is_refused_with_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&tmp.path().join("remote.git"));
+        let staging = tmp.path().join("staging");
+        write_staging(&staging, "{}");
+        stage_file(&staging, "skills/tool/.git/HEAD", b"ref: refs/heads/main\n");
+        let err = push_with_cache(&remote, &staging, &tmp.path().join("cache"), "m").unwrap_err();
+        assert!(err.to_string().contains("skills/tool/.git"), "got: {err:#}");
+    }
+
+    #[test]
+    fn switching_to_empty_remote_does_not_push_old_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote_a = init_bare(&tmp.path().join("a.git"));
+        let remote_b = init_bare(&tmp.path().join("b.git"));
+        let cache = tmp.path().join("cache");
+
+        let staging = tmp.path().join("staging");
+        write_staging(&staging, "a1");
+        push_with_cache(&remote_a, &staging, &cache, "m").unwrap();
+        write_staging(&staging, "a2");
+        push_with_cache(&remote_a, &staging, &cache, "m").unwrap();
+
+        write_staging(&staging, "for-b");
+        push_with_cache(&remote_b, &staging, &cache, "m").unwrap();
+
+        // B holds exactly one commit: none of A's history leaked into it.
+        let count = run_git(
+            &["rev-list", "--all", "--count"],
+            Some(&tmp.path().join("b.git")),
+        )
+        .unwrap();
+        assert_eq!(count.trim(), "1");
+        let a_head = run_git(&["rev-parse", "HEAD"], Some(&tmp.path().join("a.git"))).unwrap();
+        assert!(run_git(
+            &["cat-file", "-e", a_head.trim()],
+            Some(&tmp.path().join("b.git"))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn read_paths_fail_instead_of_serving_stale_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote_dir = tmp.path().join("remote.git");
+        let remote = init_bare(&remote_dir);
+        let staging = tmp.path().join("staging");
+        write_staging(&staging, "v1");
+        let cache = tmp.path().join("cache");
+        push_with_cache(&remote, &staging, &cache, "m").unwrap();
+
+        // The remote becomes unreachable: reads must error, not return v1.
+        std::fs::remove_dir_all(&remote_dir).unwrap();
+        let pulled = tmp.path().join("pulled");
+        assert!(pull_with_cache(&remote, &pulled, &cache, None, "m").is_err());
+        assert!(machines_with_cache(&remote, &cache).is_err());
+        assert!(remote_manifest_with_cache(&remote, &cache, None, "m").is_err());
     }
 }

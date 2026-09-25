@@ -27,7 +27,9 @@ use crate::snapshot::{self, SnapshotOptions};
 /// Run a single snapshot+publish cycle and return a one-line human summary.
 pub fn run_once(config: &Config) -> Result<String> {
     let claude = paths::claude_dir()?;
-    let staging = paths::staging_dir()?;
+    // The daemon stages into its own dir: sharing the interactive staging
+    // would let a tick replace a pulled snapshot the user is about to restore.
+    let staging = paths::daemon_staging_dir()?;
     let opts = SnapshotOptions::new(false, config.service.allow_secrets, config);
     let manifest = snapshot::build(&claude, &staging, config, &opts)?;
     let files = manifest.files.len();
@@ -443,17 +445,29 @@ enum PidfileClaim {
 /// Atomically claim the pidfile: `create_new` is the lock, so two concurrent
 /// `service start` invocations cannot both proceed. A pidfile naming a dead
 /// or non-ccsync process is stale and gets cleared (one retry).
+///
+/// The whole check-clear-create sequence runs under an exclusive `flock` on a
+/// sibling `.lock` file (so one start can't delete another's fresh claim as
+/// "stale"), and the claim is written with our own PID right away (so it
+/// never reads as an empty, stale file before the child's PID replaces it).
 fn claim_pidfile(path: &Path) -> Result<PidfileClaim> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let _lock = crate::lock::exclusive(&path.with_extension("pid.lock"))?;
     for _ in 0..2 {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
         {
-            Ok(_) => return Ok(PidfileClaim::Claimed),
+            Ok(mut f) => {
+                f.write_all(std::process::id().to_string().as_bytes())
+                    .with_context(|| format!("writing {}", path.display()))?;
+                return Ok(PidfileClaim::Claimed);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let pid = std::fs::read_to_string(path)
                     .ok()
@@ -705,6 +719,12 @@ mod tests {
             PidfileClaim::Claimed
         ));
         assert!(path.exists());
+        // The claim already names a live ccsync process (us), so a racing
+        // start sees a running daemon instead of an empty "stale" file.
+        assert!(matches!(
+            claim_pidfile(&path).unwrap(),
+            PidfileClaim::Running(_)
+        ));
 
         // A pidfile naming a dead process is stale: cleared and re-claimed.
         std::fs::write(&path, "2147483646").unwrap();

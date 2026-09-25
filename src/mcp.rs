@@ -93,6 +93,42 @@ pub fn server_count(doc: &Value) -> usize {
     n
 }
 
+/// The launch command of every stdio server in an MCP document (an extracted
+/// one or a whole `~/.claude.json`), as `mcp <name>: <command> <args...>`
+/// (user scope) or `mcp <name> (<project>): ...` (local scope).
+pub fn server_commands(doc: &Value) -> std::collections::BTreeSet<String> {
+    fn collect(servers: Option<&Value>, scope: &str, out: &mut std::collections::BTreeSet<String>) {
+        let Some(Value::Object(servers)) = servers else {
+            return;
+        };
+        for (name, def) in servers {
+            let Some(cmd) = def.get("command").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut line = format!("mcp {name}{scope}: {cmd}");
+            if let Some(Value::Array(args)) = def.get("args") {
+                for a in args {
+                    line.push(' ');
+                    line.push_str(
+                        &a.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| a.to_string()),
+                    );
+                }
+            }
+            out.insert(line);
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    collect(doc.get("mcpServers"), "", &mut out);
+    if let Some(Value::Object(projects)) = doc.get("projects") {
+        for (path, entry) in projects {
+            collect(entry.get("mcpServers"), &format!(" ({path})"), &mut out);
+        }
+    }
+    out
+}
+
 /// Merge an extracted MCP document into the local `~/.claude.json`, remapping
 /// project paths via `mappings`. Every other key of `~/.claude.json` is
 /// preserved. Returns the number of server definitions merged in.
@@ -106,16 +142,54 @@ pub fn merge_into(
     mappings: &[Mapping],
     overwrite: bool,
 ) -> Result<usize> {
-    let mut root: Value = if claude_json.exists() {
+    let mut root = read_root(claude_json)?;
+    let merged = merge_doc(&mut root, doc, mappings, overwrite);
+    let serialized =
+        serde_json::to_string_pretty(&root).context("serializing merged ~/.claude.json")?;
+    std::fs::write(claude_json, serialized)
+        .with_context(|| format!("writing {}", claude_json.display()))?;
+    Ok(merged)
+}
+
+/// Server launch commands that [`merge_into`] with the same arguments would
+/// newly install or change, as [`server_commands`] lines. Computed by merging
+/// in memory and diffing against the current file, so a server whose merged
+/// definition is already in place (e.g. `args` unioned by a previous merge)
+/// is not flagged again.
+pub fn new_server_commands(
+    claude_json: &Path,
+    doc: &Value,
+    mappings: &[Mapping],
+    overwrite: bool,
+) -> Result<std::collections::BTreeSet<String>> {
+    let before = read_root(claude_json)?;
+    let mut after = before.clone();
+    merge_doc(&mut after, doc, mappings, overwrite);
+    let existing = server_commands(&before);
+    Ok(server_commands(&after)
+        .difference(&existing)
+        .cloned()
+        .collect())
+}
+
+/// The parsed `~/.claude.json` (an empty object when absent or not one).
+fn read_root(claude_json: &Path) -> Result<Value> {
+    let root: Value = if claude_json.exists() {
         let text = std::fs::read_to_string(claude_json)
             .with_context(|| format!("reading {}", claude_json.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parsing {}", claude_json.display()))?
     } else {
         Value::Object(Map::new())
     };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
+    Ok(if root.is_object() {
+        root
+    } else {
+        Value::Object(Map::new())
+    })
+}
+
+/// Merge `doc`'s servers into the parsed `~/.claude.json` `root` (an object).
+fn merge_doc(root: &mut Value, doc: &Value, mappings: &[Mapping], overwrite: bool) -> usize {
     let root_obj = root.as_object_mut().expect("root is an object");
     let mut merged = 0usize;
 
@@ -145,11 +219,7 @@ pub fn merge_into(
         }
     }
 
-    let serialized =
-        serde_json::to_string_pretty(&root).context("serializing merged ~/.claude.json")?;
-    std::fs::write(claude_json, serialized)
-        .with_context(|| format!("writing {}", claude_json.display()))?;
-    Ok(merged)
+    merged
 }
 
 /// Replace the user-scope `mcpServers` object of `claude_json` wholesale,

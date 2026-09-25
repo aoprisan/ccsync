@@ -96,19 +96,38 @@ pub fn apply(data_root: &Path, mappings: &[Mapping], project_roots: &[ProjectRoo
             continue;
         }
         let encoded = child.file_name().to_string_lossy().to_string();
+        let naive = paths::decode_path(&encoded).to_string_lossy().to_string();
         let decoded = project_roots
             .iter()
             .find(|r| r.encoded == encoded)
             .map(|r| r.decoded_path.clone())
-            .unwrap_or_else(|| paths::decode_path(&encoded).to_string_lossy().to_string());
-        if let Some(new_decoded) = remap_str(&decoded, mappings) {
-            let new_encoded = paths::encode_path(Path::new(&new_decoded));
+            .unwrap_or_else(|| naive.clone());
+        let new_encoded = match remap_str(&decoded, mappings) {
+            Some(new_decoded) => Some(paths::encode_path(Path::new(&new_decoded))),
+            // An unresolved root (the snapshot fell back to the lossy decode)
+            // can't match a mapping whose path has dashes, e.g. a home of
+            // `/home/jean-luc`. Match its encoded form instead, the same
+            // way the transcript contents were rewritten.
+            None if decoded == naive => remap_encoded(&encoded, &encoded_mappings),
+            None => None,
+        };
+        if let Some(new_encoded) = new_encoded {
             if new_encoded != encoded {
                 renames.push((projects.join(&encoded), projects.join(&new_encoded)));
             }
         }
     }
-    for (from, to) in renames {
+    // Move every renamed dir aside first so a chain (`a` -> `b` while `b` ->
+    // `c`) can't merge into a target that is itself about to move: the
+    // result must not depend on `read_dir` order.
+    let mut parked = Vec::with_capacity(renames.len());
+    for (i, (from, to)) in renames.into_iter().enumerate() {
+        let tmp = projects.join(format!(".ccsync-remap-{i}"));
+        fs::rename(&from, &tmp)
+            .with_context(|| format!("renaming {} -> {}", from.display(), tmp.display()))?;
+        parked.push((tmp, to));
+    }
+    for (from, to) in parked {
         if to.exists() {
             // Merge into an existing target dir rather than clobbering it.
             merge_dir(&from, &to)?;
@@ -121,21 +140,31 @@ pub fn apply(data_root: &Path, mappings: &[Mapping], project_roots: &[ProjectRoo
     Ok(())
 }
 
+/// Apply the first matching dash-encoded prefix mapping to an encoded dir
+/// name.
+fn remap_encoded(encoded: &str, encoded_mappings: &[Mapping]) -> Option<String> {
+    encoded_mappings.iter().find_map(|m| {
+        let rest = encoded.strip_prefix(&m.from)?;
+        (rest.is_empty() || rest.starts_with('-')).then(|| format!("{}{rest}", m.to))
+    })
+}
+
 /// Rewrite every mapped prefix occurrence in a file's text content. Matches
 /// must end at a path boundary so remapping `/Users/alice` leaves the sibling
 /// `/Users/alice2` (and `-Users-alice2` in encoded form) untouched.
+///
+/// Each form is rewritten in a single pass where the first (longest) matching
+/// mapping wins and replaced text is never rescanned — the same semantics as
+/// [`remap_str`], which renames the session dirs, so a transcript's `cwd`
+/// always agrees with the dir it lands in.
 fn rewrite_file(path: &Path, raw: &[Mapping], encoded: &[Mapping]) -> Result<()> {
     let content = fs::read_to_string(path)?;
     let mut out = content.clone();
-    for m in raw {
-        if let Some(replaced) = replace_bounded(&out, &m.from, &m.to, raw_boundary) {
-            out = replaced;
-        }
+    if let Some(replaced) = replace_bounded(&out, raw, raw_boundary) {
+        out = replaced;
     }
-    for m in encoded {
-        if let Some(replaced) = replace_bounded(&out, &m.from, &m.to, encoded_boundary) {
-            out = replaced;
-        }
+    if let Some(replaced) = replace_bounded(&out, encoded, encoded_boundary) {
+        out = replaced;
     }
     if out != content {
         fs::write(path, out)?;
@@ -160,35 +189,45 @@ fn component_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '.')
 }
 
-/// Replace occurrences of `from` with `to` where the match is not preceded by
-/// a component character and is followed by a boundary character (or ends the
-/// text). Returns `None` when nothing matched.
+/// Replace every occurrence of a mapping's `from` with its `to`, where the
+/// match is not preceded by a component character and is followed by a
+/// boundary character (or ends the text). At each position the first mapping
+/// in `mappings` order that matches wins, and scanning resumes after the
+/// replaced text. Returns `None` when nothing matched.
 fn replace_bounded(
     text: &str,
-    from: &str,
-    to: &str,
+    mappings: &[Mapping],
     boundary: impl Fn(char) -> bool,
 ) -> Option<String> {
-    if from.is_empty() {
+    let mappings: Vec<&Mapping> = mappings.iter().filter(|m| !m.from.is_empty()).collect();
+    if mappings.is_empty() {
         return None;
     }
     let mut out = String::new();
     let mut last = 0;
-    let mut search = 0;
-    while let Some(pos) = text[search..].find(from) {
-        let start = search + pos;
-        let end = start + from.len();
-        let prev_ok = !text[..start]
-            .chars()
-            .next_back()
-            .is_some_and(component_char);
-        let next_ok = text[end..].chars().next().map(&boundary).unwrap_or(true);
-        if prev_ok && next_ok {
-            out.push_str(&text[last..start]);
-            out.push_str(to);
-            last = end;
+    let mut i = 0;
+    let mut prev: Option<char> = None;
+    while i < text.len() {
+        let rest = &text[i..];
+        let hit = if prev.is_some_and(component_char) {
+            None
+        } else {
+            mappings.iter().find(|m| {
+                rest.starts_with(m.from.as_str())
+                    && rest[m.from.len()..].chars().next().is_none_or(&boundary)
+            })
+        };
+        if let Some(m) = hit {
+            out.push_str(&text[last..i]);
+            out.push_str(&m.to);
+            i += m.from.len();
+            last = i;
+            prev = m.from.chars().next_back();
+        } else {
+            let c = rest.chars().next().expect("i is inside text");
+            i += c.len_utf8();
+            prev = Some(c);
         }
-        search = end;
     }
     if last == 0 {
         return None;
@@ -351,5 +390,87 @@ mod tests {
             remap_str("/home/alice/proj/x", &mappings).as_deref(),
             Some("/srv/proj/x")
         );
+    }
+
+    fn mapping(from: &str, to: &str) -> Mapping {
+        Mapping {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+
+    #[test]
+    fn content_and_dir_agree_when_mappings_overlap() {
+        // Explicit `/Users/alice/code/work -> /Users/alice/work` plus the
+        // automatic home mapping: first match wins everywhere, so the rewritten
+        // cwd is not fed through the home mapping a second time.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(
+            &data.join("projects/-Users-alice-code-work/s.jsonl"),
+            "{\"cwd\":\"/Users/alice/code/work\"}\n",
+        );
+        let mut explicit = std::collections::BTreeMap::new();
+        explicit.insert("/Users/alice/code/work".into(), "/Users/alice/work".into());
+        let manifest = Manifest::new("h".into(), "/Users/alice".into());
+        let mappings = build_mappings(&manifest, "/home/alice", &explicit);
+        apply(&data, &mappings, &[]).unwrap();
+
+        let dir = data.join("projects/-Users-alice-work");
+        assert!(dir.is_dir(), "dir should follow the explicit mapping");
+        let content = fs::read_to_string(dir.join("s.jsonl")).unwrap();
+        assert!(
+            content.contains("\"cwd\":\"/Users/alice/work\""),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn chained_renames_do_not_depend_on_dir_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(&data.join("projects/-work-a/s.jsonl"), "{}\n");
+        write(&data.join("projects/-src-a/t.jsonl"), "{}\n");
+        let mappings = [mapping("/work", "/src"), mapping("/src", "/archive/src")];
+        apply(&data, &mappings, &[]).unwrap();
+
+        assert!(data.join("projects/-src-a/s.jsonl").exists());
+        assert!(data.join("projects/-archive-src-a/t.jsonl").exists());
+        assert!(!data.join("projects/-archive-src-a/s.jsonl").exists());
+        assert!(!data.join("projects/-work-a").exists());
+    }
+
+    #[test]
+    fn unresolved_roots_under_a_dashed_home_are_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(
+            &data.join("projects/-home-jean-luc-old/s.jsonl"),
+            "{\"cwd\":\"/home/jean-luc/old\"}\n",
+        );
+        // What snapshot records when it can't resolve the root: the naive decode.
+        let roots = [ProjectRoot {
+            encoded: "-home-jean-luc-old".into(),
+            decoded_path: "/home/jean/luc/old".into(),
+        }];
+        apply(&data, &[mapping("/home/jean-luc", "/home/bob")], &roots).unwrap();
+
+        let dir = data.join("projects/-home-bob-old");
+        assert!(dir.is_dir());
+        let content = fs::read_to_string(dir.join("s.jsonl")).unwrap();
+        assert!(content.contains("\"cwd\":\"/home/bob/old\""));
+    }
+
+    #[test]
+    fn resolved_sibling_roots_are_not_renamed_by_the_encoded_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(&data.join("projects/-Users-alice-2-proj/s.jsonl"), "{}\n");
+        let roots = [ProjectRoot {
+            encoded: "-Users-alice-2-proj".into(),
+            decoded_path: "/Users/alice-2/proj".into(),
+        }];
+        apply(&data, &[mapping("/Users/alice", "/home/bob")], &roots).unwrap();
+        assert!(data.join("projects/-Users-alice-2-proj").is_dir());
     }
 }

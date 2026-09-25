@@ -112,7 +112,7 @@ ccsync restore
 | `ccsync init [--remote URL]` | Write the default config to `~/.config/ccsync/config.toml`. |
 | `ccsync snapshot [--dry-run] [--allow-secrets]` | Capture a sanitized snapshot into the staging dir. |
 | `ccsync status` | Show what a snapshot would capture (dry run). |
-| `ccsync push [--remote URL] [--archive FILE]` | Publish the staged snapshot (git by default). |
+| `ccsync push [--remote URL] [--archive FILE]` | Publish the staged snapshot (git by default). Refuses a snapshot that was pulled/imported rather than taken here. |
 | `ccsync pull [--remote URL] [--archive FILE] [--from MACHINE] [--at COMMIT]` | Fetch a snapshot into staging (another machine's, or a past commit's). |
 | `ccsync restore [--dry-run] [--no-remap] [--overwrite] [--only COMPONENTS] [--yes]` | Apply the staged snapshot to `~/.claude` (optionally only named components). |
 | `ccsync diff [--remote [--from MACHINE]]` | Show how local `~/.claude` differs from the staged snapshot (or the remote's, manifest-only). |
@@ -323,17 +323,26 @@ transcripts verbatim on a same-path machine.
 
 ## Safety
 
-- **Credentials never leave the machine** — `.credentials.json` is hard-blocked
-  in the capture path regardless of configuration (including profile stores).
+- **Credentials never leave the machine** — `.credentials.json` (and a stray
+  `.claude.json`) is hard-blocked in the capture path regardless of
+  configuration (including profile stores), and `restore` likewise refuses to
+  write one from an incoming snapshot.
+- **Symlinks are never written through** — `restore` skips any file whose
+  destination is (or sits under) a symlink in `~/.claude`, e.g. a
+  dotfiles-managed `CLAUDE.md`, and backups keep links as links. Snapshots
+  don't follow symlinks (they are listed as skipped) and leave out nested
+  `.git` directories of cloned skills.
 - **Snapshots are integrity-checked** — every captured file's SHA-256 is
   recorded in the manifest, and `restore` verifies the staged data against it
   (both directions, plus path-safety checks) before touching anything. Archive
   extraction refuses absolute paths, `..`, and link entries.
-- **Incoming hooks require confirmation** — a restored or profile-switched
-  `settings.json` can carry `hooks`, which are arbitrary shell commands Claude
-  Code will execute on this machine. New or changed hook commands are printed
-  and must be confirmed; non-interactive runs fail closed (`--yes` to accept,
-  `confirm_hooks = false` to disable the check).
+- **Incoming commands require confirmation** — a restored or profile-switched
+  `settings.json` can carry `hooks`, a `statusLine` command, credential helpers
+  (`apiKeyHelper`, `awsAuthRefresh`, …) and `env` variables, all of which run
+  code on this machine; bundled MCP servers are launched as commands too. New
+  or changed ones are printed and must be confirmed; non-interactive runs fail
+  closed (`--yes` to accept, `confirm_hooks = false` to disable the check).
+  Profile switch and `profile rollback` gate new hook commands.
 - **Archives are always encrypted** with [age](https://age-encryption.org/)
   using `CCSYNC_PASSPHRASE`; there is no plaintext mode.
 - **`restore` is reversible** — it backs up the existing `~/.claude` to a

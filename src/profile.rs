@@ -30,7 +30,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -175,15 +175,68 @@ pub fn read_meta(root: &Path, name: &str) -> Result<ProfileMeta> {
     if !path.exists() {
         return Ok(ProfileMeta::default());
     }
-    toml::from_str(&fs::read_to_string(&path)?)
-        .with_context(|| format!("parsing {}", path.display()))
+    let mut meta: ProfileMeta = toml::from_str(&fs::read_to_string(&path)?)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    // `profile.toml` rides inside snapshots, so it is remote input: refuse a
+    // component list that could reach outside the owned set on load.
+    if let Some(comps) = meta.components.take() {
+        let comps = normalize_components(comps);
+        validate_components(&comps).with_context(|| format!("invalid {}", path.display()))?;
+        meta.components = Some(comps);
+    }
+    Ok(meta)
 }
 
-/// The component set this profile owns.
+/// Top-level entries that are shared base state (or ccsync-internal) and must
+/// never be owned -- and thus wholesale swapped/deleted -- by a profile.
+const RESERVED_COMPONENTS: &[&str] = &["projects", "todos", PROFILES_COMPONENT];
+
+/// Every owned component must be a single plain top-level name under the
+/// claude dir: no separators, `..`, absolute paths, credential files, or
+/// shared base state. Owned components are removed and replaced wholesale, so
+/// anything else would let a (synced, untrusted) `profile.toml` delete or
+/// overwrite arbitrary files.
+fn validate_component(comp: &str) -> Result<()> {
+    let mut parts = Path::new(comp).components();
+    let single = match (parts.next(), parts.next()) {
+        (Some(Component::Normal(n)), None) => n.to_str() == Some(comp),
+        _ => false,
+    };
+    if !single || comp.contains(['/', '\\']) {
+        bail!("invalid profile component {comp:?}: must be a single top-level name");
+    }
+    if RESERVED_COMPONENTS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(comp))
+    {
+        bail!("invalid profile component {comp:?}: shared base state cannot be owned by a profile");
+    }
+    if redact::is_credential_file(comp) {
+        bail!("invalid profile component {comp:?}: credential files cannot be owned by a profile");
+    }
+    Ok(())
+}
+
+/// Drop a trailing `/` (`"skills/"`), which other component lists accept.
+fn normalize_components(comps: Vec<String>) -> Vec<String> {
+    comps
+        .into_iter()
+        .map(|c| c.trim_end_matches('/').to_string())
+        .collect()
+}
+
+fn validate_components(comps: &[String]) -> Result<()> {
+    comps.iter().try_for_each(|c| validate_component(c))
+}
+
+/// The component set this profile owns (validated).
 pub fn components(root: &Path, name: &str, config: &Config) -> Result<Vec<String>> {
-    Ok(read_meta(root, name)?
-        .components
-        .unwrap_or_else(|| config.profiles.components.clone()))
+    let comps = match read_meta(root, name)?.components {
+        Some(comps) => comps,
+        None => normalize_components(config.profiles.components.clone()),
+    };
+    validate_components(&comps).with_context(|| format!("profile {name:?}"))?;
+    Ok(comps)
 }
 
 /// Create an empty profile, optionally capturing the current live state into
@@ -226,7 +279,7 @@ pub fn capture_into(root: &Path, name: &str, live: &LiveState, config: &Config) 
         let src = live.claude_dir.join(&comp);
         let dst = data.join(&comp);
         remove_path(&dst)?;
-        if src.exists() {
+        if entry_exists(&src) {
             captured += copy_path(&src, &dst)?;
         }
     }
@@ -344,19 +397,34 @@ pub fn switch(
 }
 
 /// Revert the last switch: switch back to `previous`, or — when the journal
-/// has no previous profile — restore the pre-switch backup and clear the
-/// active marker.
-pub fn rollback(root: &Path, live: &LiveState, config: &Config) -> Result<String> {
+/// has no previous profile — capture the current profile back into its store,
+/// restore the pre-switch backup, and clear the active marker.
+///
+/// `confirm_hooks` gates hooks exactly like `switch`: the previous profile's
+/// store may have been replaced by a pull/restore since it was last active.
+pub fn rollback(
+    root: &Path,
+    live: &LiveState,
+    config: &Config,
+    confirm_hooks: bool,
+) -> Result<String> {
     let Some(current) = active(root)? else {
         bail!("no active profile to roll back from");
     };
     if let Some(previous) = &current.previous {
-        // Hooks were already accepted when `previous` was last active.
-        switch(root, previous, live, config, false)?;
+        switch(root, previous, live, config, confirm_hooks)?;
         return Ok(format!("switched back to {previous:?}"));
     }
-    let comps = components(root, &current.name, config)
-        .unwrap_or_else(|_| config.profiles.components.clone());
+    let comps = if exists(root, &current.name) {
+        // Capture-back first so edits made while `current` was active are
+        // not lost when the backup replaces them.
+        capture_into(root, &current.name, live, config)?;
+        components(root, &current.name, config)?
+    } else {
+        let comps = normalize_components(config.profiles.components.clone());
+        validate_components(&comps)?;
+        comps
+    };
     restore_backup(live, current.backup_dir.as_deref(), &comps, config)?;
     write_active(root, None)?;
     Ok(format!(
@@ -449,7 +517,7 @@ fn apply_profile(
         // Owned components are swapped wholesale: absent in the store means
         // absent live (the outgoing state was captured back already).
         remove_path(&dst)?;
-        if src.exists() {
+        if entry_exists(&src) {
             applied += copy_path(&src, &dst)?;
         }
     }
@@ -485,31 +553,64 @@ fn backup_components(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| ".claude".into());
-    let backup = live
-        .claude_dir
-        .with_file_name(format!("{dir_name}.ccsync-profile-backup-{ts}"));
+    let base = format!("{dir_name}.ccsync-profile-backup-{ts}");
+    let backup = claim_backup_dir(live.claude_dir, &base)?;
 
-    let mut any = false;
-    for comp in comps {
-        let src = live.claude_dir.join(comp);
-        if src.exists() {
-            copy_path(&src, &backup.join(comp))?;
-            any = true;
-        }
-    }
-    if config.profiles.include_user_mcp {
-        if let Some(cj) = live.claude_json {
-            if cj.exists() {
-                fs::create_dir_all(&backup)?;
-                fs::copy(cj, backup.join("claude.json.bak"))?;
+    let result = (|| -> Result<bool> {
+        let mut any = false;
+        for comp in comps {
+            let src = live.claude_dir.join(comp);
+            if entry_exists(&src) {
+                copy_path(&src, &backup.join(comp))?;
                 any = true;
             }
         }
+        if config.profiles.include_user_mcp {
+            if let Some(cj) = live.claude_json {
+                if cj.exists() {
+                    fs::copy(cj, backup.join("claude.json.bak"))?;
+                    any = true;
+                }
+            }
+        }
+        Ok(any)
+    })();
+    match result {
+        Ok(true) => Ok(Some(backup)),
+        Ok(false) => {
+            let _ = fs::remove_dir(&backup);
+            Ok(None)
+        }
+        Err(e) => Err(e.context(format!("backing up into {}", backup.display()))),
     }
-    Ok(any.then_some(backup))
 }
 
-/// Put the backed-up components (and `~/.claude.json`) back.
+/// Atomically claim a fresh backup directory next to `claude_dir`. Switches
+/// within the same second get a numeric suffix instead of layering into one
+/// directory.
+fn claim_backup_dir(claude_dir: &Path, base: &str) -> Result<PathBuf> {
+    for n in 0u32..10_000 {
+        let name = if n == 0 {
+            base.to_string()
+        } else {
+            format!("{base}-{n}")
+        };
+        let candidate = claude_dir.with_file_name(name);
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating {}", candidate.display()));
+            }
+        }
+    }
+    bail!("could not claim a unique backup directory for {base}")
+}
+
+/// Put the backed-up components back, plus the user-scope `mcpServers` of
+/// `~/.claude.json`. The rest of `~/.claude.json` (OAuth tokens refreshed
+/// since the backup, trust decisions, history) is left live, never
+/// overwritten with the stale copy.
 fn restore_backup(
     live: &LiveState,
     backup: Option<&Path>,
@@ -521,50 +622,103 @@ fn restore_backup(
         remove_path(&dst)?;
         if let Some(backup) = backup {
             let src = backup.join(comp);
-            if src.exists() {
+            if entry_exists(&src) {
                 copy_path(&src, &dst)?;
             }
         }
     }
     if config.profiles.include_user_mcp {
-        if let (Some(cj), Some(backup)) = (live.claude_json, backup) {
-            let saved = backup.join("claude.json.bak");
-            if saved.exists() {
-                fs::copy(&saved, cj)?;
+        if let Some(cj) = live.claude_json {
+            let saved = backup.map(|b| b.join("claude.json.bak"));
+            let servers = match saved.filter(|p| p.exists()) {
+                Some(saved) => {
+                    let doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&saved)?)
+                        .with_context(|| format!("parsing {}", saved.display()))?;
+                    doc.get("mcpServers").cloned()
+                }
+                // No ~/.claude.json existed before the switch: no user-scope
+                // servers to restore.
+                None => None,
+            };
+            if cj.exists() || servers.is_some() {
+                mcp::replace_user_scope(cj, servers.as_ref())?;
             }
         }
     }
     Ok(())
 }
 
-/// Copy a file or directory tree, skipping symlinks and hard-blocking
-/// credential files (they must never enter a profile store, which can sync).
+/// Copy a file, symlink, or directory tree, hard-blocking credential files
+/// (they must never enter a profile store, which can sync).
+///
+/// Symlinks are preserved as symlinks (never followed), so a dotfile-managed
+/// `skills/foo -> ~/dotfiles/...` link survives a capture/apply round trip.
+/// `dst` is removed first and every entry is created fresh, so nothing is
+/// ever written *through* a pre-existing symlink at the destination.
 fn copy_path(src: &Path, dst: &Path) -> Result<usize> {
-    let mut copied = 0;
-    if src.is_file() {
+    let meta = fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
+    if !meta.is_dir() {
         check_credential(src)?;
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
-        return Ok(1);
+        remove_path(dst)?;
+        return Ok(usize::from(copy_entry(src, dst, &meta)?));
     }
+    remove_path(dst)?;
+    let mut copied = 0;
     for entry in WalkDir::new(src).follow_links(false) {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        let rel = entry.path().strip_prefix(src).expect("under src");
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)
+                .with_context(|| format!("creating {}", target.display()))?;
             continue;
         }
         check_credential(entry.path())?;
-        let rel = entry.path().strip_prefix(src).expect("under src");
-        let target = dst.join(rel);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(entry.path(), &target)
-            .with_context(|| format!("copying {}", entry.path().display()))?;
-        copied += 1;
+        let meta = fs::symlink_metadata(entry.path())?;
+        if copy_entry(entry.path(), &target, &meta)? {
+            copied += 1;
+        }
     }
     Ok(copied)
+}
+
+/// Copy one non-directory entry into a fresh `dst`. Symlinks are recreated
+/// (not followed); special files (sockets, fifos) are skipped (`false`).
+fn copy_entry(src: &Path, dst: &Path, meta: &fs::Metadata) -> Result<bool> {
+    if meta.file_type().is_symlink() {
+        let target =
+            fs::read_link(src).with_context(|| format!("reading link {}", src.display()))?;
+        return make_symlink(&target, dst)
+            .with_context(|| format!("recreating link {}", dst.display()));
+    }
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn make_symlink(target: &Path, link: &Path) -> std::io::Result<bool> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(true)
+}
+
+/// Symlinks are not preserved off unix; skip rather than follow them.
+#[cfg(not(unix))]
+fn make_symlink(_target: &Path, _link: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// `exists()` without following symlinks (a dangling link still exists).
+fn entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
 }
 
 fn check_credential(path: &Path) -> Result<()> {
@@ -581,10 +735,15 @@ fn check_credential(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove a file, directory tree, or symlink. Never follows a symlink: a link
+/// to a directory removes only the link, and a dangling link is removed too.
 fn remove_path(path: &Path) -> Result<()> {
-    if path.is_dir() {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if meta.is_dir() {
         fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
-    } else if path.exists() {
+    } else {
         fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
@@ -787,7 +946,7 @@ mod tests {
         );
         switch(&f.root, "personal", &f.live(), &cfg, false).unwrap();
 
-        let msg = rollback(&f.root, &f.live(), &cfg).unwrap();
+        let msg = rollback(&f.root, &f.live(), &cfg, false).unwrap();
         assert!(msg.contains("work"), "got: {msg}");
         assert_eq!(active(&f.root).unwrap().unwrap().name, "work");
         assert!(fs::read_to_string(f.claude.join("settings.json"))
@@ -822,5 +981,286 @@ mod tests {
         let find = |rel: &str| entries.iter().find(|e| e.rel == rel).unwrap();
         assert_eq!(find("settings.json").state, DiffState::Changed);
         assert_eq!(find("skills/extra/SKILL.md").state, DiffState::LocalOnly);
+    }
+
+    #[test]
+    fn rejects_escaping_or_shared_components() {
+        let f = Fixture::new();
+        let cfg = Config::default();
+        create(&f.root, "work", None, &cfg, Some(&f.live())).unwrap();
+        switch(&f.root, "work", &f.live(), &cfg, false).unwrap();
+        // A victim file outside ~/.claude that an escaping entry would hit.
+        let victim = f.claude.parent().unwrap().join(".bashrc");
+        write(&victim, "keep me");
+
+        for bad in [
+            "../.bashrc",
+            "/etc/passwd",
+            "projects",
+            "Projects",
+            "todos",
+            PROFILES_COMPONENT,
+            ".credentials.json",
+            "skills/../../x",
+            "a/b",
+            ".",
+            "..",
+            "",
+        ] {
+            assert!(validate_component(bad).is_err(), "accepted {bad:?}");
+        }
+        for good in ["settings.json", "skills", "CLAUDE.md", "output-styles"] {
+            validate_component(good).unwrap();
+        }
+
+        // A synced profile.toml with an escaping entry fails loudly on load
+        // and on switch, and nothing is touched.
+        create(&f.root, "evil", None, &cfg, None).unwrap();
+        fs::write(
+            meta_path(&f.root, "evil"),
+            "components = [\"settings.json\", \"../.bashrc\", \"projects\"]\n",
+        )
+        .unwrap();
+        assert!(read_meta(&f.root, "evil").is_err());
+        assert!(components(&f.root, "evil", &cfg).is_err());
+        assert!(switch(&f.root, "evil", &f.live(), &cfg, false).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(f.claude.join("projects/-home-x-p/s.jsonl").exists());
+        assert_eq!(active(&f.root).unwrap().unwrap().name, "work");
+
+        // A bad config default is refused too.
+        let mut bad_cfg = Config::default();
+        bad_cfg.profiles.components = vec!["todos".into()];
+        assert!(components(&f.root, "work", &bad_cfg).is_err());
+    }
+
+    #[test]
+    fn trailing_slash_components_are_accepted() {
+        let f = Fixture::new();
+        let mut cfg = Config::default();
+        cfg.profiles.components = vec!["skills/".into(), "settings.json".into()];
+        create(&f.root, "work", None, &cfg, Some(&f.live())).unwrap();
+        assert_eq!(
+            components(&f.root, "work", &cfg).unwrap(),
+            vec!["skills".to_string(), "settings.json".to_string()]
+        );
+        fs::write(meta_path(&f.root, "work"), "components = [\"agents/\"]\n").unwrap();
+        assert_eq!(
+            components(&f.root, "work", &cfg).unwrap(),
+            vec!["agents".to_string()]
+        );
+    }
+
+    #[test]
+    fn rollback_gates_hooks_of_replaced_previous_store() {
+        let f = Fixture::new();
+        let cfg = Config::default();
+        create(&f.root, "work", None, &cfg, Some(&f.live())).unwrap();
+        switch(&f.root, "work", &f.live(), &cfg, true).unwrap();
+        create(&f.root, "personal", None, &cfg, None).unwrap();
+        switch(&f.root, "personal", &f.live(), &cfg, true).unwrap();
+
+        // A later pull replaced work's store with one that installs a hook.
+        write(
+            &data_dir(&f.root, "work").join("settings.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"evil"}]}]}}"#,
+        );
+        let err = rollback(&f.root, &f.live(), &cfg, true).unwrap_err();
+        assert!(err.to_string().contains("hooks"), "got: {err:#}");
+        assert_eq!(active(&f.root).unwrap().unwrap().name, "personal");
+        assert!(!fs::read_to_string(f.claude.join("settings.json"))
+            .map(|s| s.contains("evil"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn rollback_without_previous_captures_back_and_keeps_claude_json() {
+        let f = Fixture::new();
+        let cfg = Config::default();
+        create(&f.root, "work", None, &cfg, None).unwrap();
+        write(
+            &data_dir(&f.root, "work").join("settings.json"),
+            r#"{"theme":"work"}"#,
+        );
+        write(
+            &mcp_path(&f.root, "work"),
+            r#"{"mcpServers":{"jira":{"command":"jira-mcp"}}}"#,
+        );
+        // First switch: no previous profile, pre-switch state is backed up.
+        let report = switch(&f.root, "work", &f.live(), &cfg, false).unwrap();
+        assert!(report.backup_dir.is_some());
+
+        // Edit live while `work` is active; Claude Code refreshes OAuth.
+        write(&f.claude.join("settings.json"), r#"{"theme":"edited"}"#);
+        let mut cj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&f.claude_json).unwrap()).unwrap();
+        cj["oauthAccount"]["t"] = "refreshed".into();
+        fs::write(&f.claude_json, serde_json::to_string(&cj).unwrap()).unwrap();
+
+        let msg = rollback(&f.root, &f.live(), &cfg, false).unwrap();
+        assert!(msg.contains("restored"), "got: {msg}");
+        assert!(active(&f.root).unwrap().is_none());
+
+        // Pre-switch components are back.
+        let settings = fs::read_to_string(f.claude.join("settings.json")).unwrap();
+        assert!(settings.contains("dark"), "got: {settings}");
+        // The edit was captured back into work's store, not lost.
+        let stored = fs::read_to_string(data_dir(&f.root, "work").join("settings.json")).unwrap();
+        assert!(stored.contains("edited"), "got: {stored}");
+        // Only user-scope MCP servers were restored; refreshed OAuth survives.
+        let cj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&f.claude_json).unwrap()).unwrap();
+        assert_eq!(cj["oauthAccount"]["t"], "refreshed");
+        assert_eq!(cj["mcpServers"]["fetch"]["command"], "uvx");
+        assert!(cj["mcpServers"].get("jira").is_none());
+    }
+
+    #[test]
+    fn failed_switch_restores_only_mcp_servers_from_backup() {
+        let f = Fixture::new();
+        let cfg = Config::default();
+        create(&f.root, "work", None, &cfg, Some(&f.live())).unwrap();
+        switch(&f.root, "work", &f.live(), &cfg, false).unwrap();
+        create(&f.root, "broken", None, &cfg, None).unwrap();
+        write(
+            &data_dir(&f.root, "broken").join("skills/.credentials.json"),
+            "{}",
+        );
+        let backup = live_backup_state(&f);
+        // Simulate a concurrent token refresh right after the backup would be
+        // taken: restore_backup must not revert unrelated keys.
+        let mut cj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&f.claude_json).unwrap()).unwrap();
+        cj["oauthAccount"]["t"] = "refreshed".into();
+        cj["mcpServers"] = serde_json::json!({"other": {"command": "x"}});
+        fs::write(&f.claude_json, serde_json::to_string(&cj).unwrap()).unwrap();
+        restore_backup(&f.live(), Some(&backup), &["settings.json".into()], &cfg).unwrap();
+        let cj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&f.claude_json).unwrap()).unwrap();
+        assert_eq!(cj["oauthAccount"]["t"], "refreshed");
+        assert_eq!(cj["mcpServers"]["fetch"]["command"], "uvx");
+        assert!(cj["mcpServers"].get("other").is_none());
+
+        // And the real failed-switch path still rolls back cleanly.
+        assert!(switch(&f.root, "broken", &f.live(), &cfg, false).is_err());
+        let cj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&f.claude_json).unwrap()).unwrap();
+        assert_eq!(cj["oauthAccount"]["t"], "refreshed");
+        assert_eq!(cj["mcpServers"]["fetch"]["command"], "uvx");
+    }
+
+    fn live_backup_state(f: &Fixture) -> PathBuf {
+        backup_components(&f.live(), &["settings.json".into()], &Config::default())
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn backups_in_same_second_get_distinct_dirs() {
+        let f = Fixture::new();
+        let cfg = Config::default();
+        let comps = vec!["settings.json".to_string()];
+        let a = backup_components(&f.live(), &comps, &cfg).unwrap().unwrap();
+        write(&f.claude.join("settings.json"), r#"{"theme":"second"}"#);
+        let b = backup_components(&f.live(), &comps, &cfg).unwrap().unwrap();
+        let c = backup_components(&f.live(), &comps, &cfg).unwrap().unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        // The first backup is not layered over by the later ones.
+        assert!(fs::read_to_string(a.join("settings.json"))
+            .unwrap()
+            .contains("dark"));
+        assert!(fs::read_to_string(b.join("settings.json"))
+            .unwrap()
+            .contains("second"));
+
+        // Nothing to back up -> no stray empty dir left behind.
+        let empty = LiveState {
+            claude_dir: &f.claude,
+            claude_json: None,
+        };
+        assert!(backup_components(&empty, &["nope".into()], &cfg)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_in_owned_components_survive_switch_round_trip() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        let cfg = Config::default();
+        let dotfiles = f.claude.parent().unwrap().join("dotfiles/foo");
+        write(&dotfiles.join("SKILL.md"), "# foo from dotfiles");
+        symlink(&dotfiles, f.claude.join("skills/foo")).unwrap();
+        // A dangling link is preserved too.
+        symlink(
+            "/nonexistent/ccsync-target",
+            f.claude.join("skills/dangling"),
+        )
+        .unwrap();
+
+        create(&f.root, "work", None, &cfg, Some(&f.live())).unwrap();
+        let stored = data_dir(&f.root, "work").join("skills/foo");
+        assert!(fs::symlink_metadata(&stored)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        switch(&f.root, "work", &f.live(), &cfg, false).unwrap();
+
+        create(&f.root, "personal", None, &cfg, None).unwrap();
+        let report = switch(&f.root, "personal", &f.live(), &cfg, false).unwrap();
+        // Switching away removed the link, never the dotfiles target.
+        assert!(!entry_exists(&f.claude.join("skills/foo")));
+        assert_eq!(
+            fs::read_to_string(dotfiles.join("SKILL.md")).unwrap(),
+            "# foo from dotfiles"
+        );
+        // The backup preserved it as a link as well.
+        let backup = report.backup_dir.unwrap();
+        assert!(fs::symlink_metadata(backup.join("skills/foo"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        switch(&f.root, "work", &f.live(), &cfg, false).unwrap();
+        let live_link = f.claude.join("skills/foo");
+        assert!(fs::symlink_metadata(&live_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&live_link).unwrap(), dotfiles);
+        assert_eq!(
+            fs::read_link(f.claude.join("skills/dangling")).unwrap(),
+            PathBuf::from("/nonexistent/ccsync-target")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_never_writes_through_live_symlink() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        let cfg = Config::default();
+        create(&f.root, "work", None, &cfg, None).unwrap();
+        write(
+            &data_dir(&f.root, "work").join("settings.json"),
+            r#"{"theme":"work"}"#,
+        );
+        // Live settings.json is a symlink to a file outside ~/.claude.
+        let outside = f.claude.parent().unwrap().join("outside.json");
+        write(&outside, "original");
+        fs::remove_file(f.claude.join("settings.json")).unwrap();
+        symlink(&outside, f.claude.join("settings.json")).unwrap();
+
+        switch(&f.root, "work", &f.live(), &cfg, false).unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
+        let live = f.claude.join("settings.json");
+        assert!(!fs::symlink_metadata(&live)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::read_to_string(&live).unwrap().contains("work"));
     }
 }

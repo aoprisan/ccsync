@@ -64,6 +64,82 @@ impl SnapshotOptions {
 /// File extensions we treat as text and therefore scan for secrets.
 pub(crate) const SCANNED_EXTS: &[&str] = &["json", "toml", "md", "yaml", "yml", "env"];
 
+/// True if `path` is a text config that must be secret-scanned before it is
+/// captured or applied: a [`SCANNED_EXTS`] extension, or a dotenv file. The
+/// latter need a name check because `.env` / `.env.local` have no extension
+/// (`Path::extension` treats a leading dot as part of the stem). Shared by
+/// snapshot capture and layer vetting so the two can never drift apart.
+pub(crate) fn is_scanned_text(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| SCANNED_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Reject include entries that could escape the claude dir. An include must
+/// be a relative path made only of normal components: an absolute entry would
+/// make `claude_dir.join` discard the base, and `..` could reach e.g.
+/// `~/.claude.json` (OAuth tokens) from outside the captured tree.
+fn validate_include(entry: &str) -> Result<()> {
+    let path = Path::new(entry);
+    let ok = path.components().next().is_some()
+        && path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !ok {
+        anyhow::bail!(
+            "invalid include entry {entry:?}: must be a relative path inside the \
+             claude dir (no absolute paths, `.` or `..` components)"
+        );
+    }
+    Ok(())
+}
+
+/// Plan every configured include entry under `claude_dir`, validating each
+/// entry first. Symlinks encountered below an entry are never followed; their
+/// rel paths are appended to `symlinks` so callers can report them.
+fn plan_includes(
+    claude_dir: &Path,
+    config: &Config,
+    planned: &mut Vec<PlannedFile>,
+    symlinks: &mut Vec<String>,
+) -> Result<()> {
+    for entry in &config.include {
+        validate_include(entry)?;
+    }
+    for entry in &config.include {
+        // `todos` is per-session state, gated together with the sessions.
+        if (entry == "projects" || entry == "todos") && !config.include_sessions {
+            continue;
+        }
+        let src = claude_dir.join(entry);
+        if !src.exists() {
+            continue;
+        }
+        plan_path(&src, claude_dir, "", config, planned, symlinks)?;
+    }
+    Ok(())
+}
+
+/// Symlinks inside the included parts of `claude_dir` that a snapshot skips.
+/// Links are never followed (a link could point anywhere, including at
+/// credentials), so the linked content is not synced; surfacing them lets the
+/// user notice instead of losing that state silently. Sorted rel paths.
+pub fn skipped_symlinks(claude_dir: &Path, config: &Config) -> Result<Vec<String>> {
+    let mut planned = Vec::new();
+    let mut symlinks = Vec::new();
+    plan_includes(claude_dir, config, &mut planned, &mut symlinks)?;
+    symlinks.sort();
+    Ok(symlinks)
+}
+
 /// Reports copy progress while a snapshot is built. Implemented by the CLI to
 /// drive a progress bar; `snapshot::build` itself stays UI-agnostic.
 pub trait ProgressSink {
@@ -123,23 +199,17 @@ fn build_inner(
                 .with_context(|| format!("clearing staging dir {}", data_root.display()))?;
         }
         fs::create_dir_all(&data_root)?;
+        // Staging now holds this machine's own state again.
+        let _ = fs::remove_file(paths::pulled_marker(staging));
     }
 
     // Plan first: resolve the complete file list (applying include/exclude and
     // the credential hard-block) so progress has an accurate total before any
     // bytes are read or copied.
     let mut planned = Vec::new();
-    for entry in &config.include {
-        // `todos` is per-session state, gated together with the sessions.
-        if (entry == "projects" || entry == "todos") && !config.include_sessions {
-            continue;
-        }
-        let src = claude_dir.join(entry);
-        if !src.exists() {
-            continue;
-        }
-        plan_path(&src, claude_dir, "", config, &mut planned)?;
-    }
+    // Skipped symlinks are reported separately via `skipped_symlinks`.
+    let mut symlinks = Vec::new();
+    plan_includes(claude_dir, config, &mut planned, &mut symlinks)?;
 
     // Bundle the profile store under the reserved `ccsync-profiles/` name so
     // profiles ride along in snapshots; restore routes it back into the local
@@ -153,6 +223,7 @@ fn build_inner(
                     crate::profile::PROFILES_COMPONENT,
                     config,
                     &mut planned,
+                    &mut symlinks,
                 )?;
                 let active = format!("{}/active.json", crate::profile::PROFILES_COMPONENT);
                 planned.retain(|p| p.rel != active);
@@ -288,26 +359,47 @@ fn capture_mcp_servers(
 /// `base` and prefixed by `rel_prefix` (empty for the `~/.claude` walk;
 /// `ccsync-profiles` for the bundled profile store). The credential
 /// hard-block aborts the whole snapshot here, before any bytes are read.
+/// Symlinks are never followed; non-excluded ones are recorded in `symlinks`.
 fn plan_path(
     src: &Path,
     base: &Path,
     rel_prefix: &str,
     config: &Config,
     out: &mut Vec<PlannedFile>,
+    symlinks: &mut Vec<String>,
 ) -> Result<()> {
-    for entry in WalkDir::new(src).follow_links(false) {
+    // Nested git metadata (a skill cloned from its own repo) is skipped
+    // wholesale: it can't be committed inside the sync repo (it would become
+    // a gitlink and the snapshot would fail integrity on every pull), and the
+    // history already lives in that skill's own remote.
+    let walk = WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || e.file_name() != ".git");
+    for entry in walk {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        let file_type = entry.file_type();
+        if !file_type.is_file() && !file_type.is_symlink() {
             continue;
         }
         let abs = entry.path();
-        let mut rel = abs
-            .strip_prefix(base)
-            .expect("walked path is under its base")
-            .to_string_lossy()
-            .replace('\\', "/");
+        let stripped = abs.strip_prefix(base).with_context(|| {
+            format!(
+                "{} is outside the snapshot base {}",
+                abs.display(),
+                base.display()
+            )
+        })?;
+        let mut rel = stripped.to_string_lossy().replace('\\', "/");
         if !rel_prefix.is_empty() {
             rel = format!("{rel_prefix}/{rel}");
+        }
+
+        if file_type.is_symlink() {
+            if !config.is_excluded(&rel) {
+                symlinks.push(rel);
+            }
+            continue;
         }
 
         let file_name = abs
@@ -374,7 +466,7 @@ fn capture_file(
                     }
                 }
             }
-        } else if is_scanned(abs) {
+        } else if is_scanned_text(abs) {
             if let Some(hint) = redact::scan_for_secrets(&String::from_utf8_lossy(&bytes)) {
                 return Err(CcError::SecretDetected {
                     file: rel.clone(),
@@ -402,13 +494,6 @@ fn capture_file(
         fs::write(&dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
     }
     Ok(())
-}
-
-fn is_scanned(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| SCANNED_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
 }
 
 /// Session transcripts get the redact-don't-abort policy.
@@ -771,5 +856,143 @@ mod tests {
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
         assert!(!m.files.iter().any(|f| f.rel_path == crate::mcp::MCP_FILE));
+    }
+
+    fn plain_opts() -> SnapshotOptions {
+        SnapshotOptions {
+            dry_run: false,
+            allow_secrets: false,
+            claude_json: None,
+            profiles_root: None,
+        }
+    }
+
+    #[test]
+    fn scans_extensionless_dotenv_files() {
+        assert!(is_scanned_text(Path::new("a/.env")));
+        assert!(is_scanned_text(Path::new("a/.env.local")));
+        assert!(is_scanned_text(Path::new("a/prod.env")));
+        assert!(is_scanned_text(Path::new("settings.json")));
+        assert!(!is_scanned_text(Path::new("a/.envrc")));
+        assert!(!is_scanned_text(Path::new("a/bin.dat")));
+
+        for name in [".env", ".env.local"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let claude = tmp.path().join("claude");
+            let staging = tmp.path().join("staging");
+            write(
+                &claude.join("skills/tool").join(name),
+                "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx\n",
+            );
+            let err = build(&claude, &staging, &Config::default(), &plain_opts()).unwrap_err();
+            assert!(err.to_string().contains("secret"), "{name}: got {err:#}");
+        }
+    }
+
+    #[test]
+    fn rejects_include_entries_escaping_claude_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("home/.claude");
+        let staging = tmp.path().join("staging");
+        write(&claude.join("settings.json"), "{}");
+        // A sibling `~/.claude.json` with OAuth tokens must stay unreachable.
+        write(
+            &tmp.path().join("home/.claude.json"),
+            r#"{"oauthAccount":{"accessToken":"x"}}"#,
+        );
+        let abs = tmp.path().join("home/.claude.json");
+        for bad in [
+            "../.claude.json".to_string(),
+            "skills/../../.claude.json".to_string(),
+            abs.to_string_lossy().to_string(),
+            "/etc".to_string(),
+            "./settings.json".to_string(),
+            String::new(),
+        ] {
+            let mut cfg = Config::default();
+            cfg.include.push(bad.clone());
+            let err = build(&claude, &staging, &cfg, &plain_opts()).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid include entry"),
+                "{bad:?}: got {err:#}"
+            );
+            assert!(skipped_symlinks(&claude, &cfg).is_err());
+        }
+        // Nested relative entries remain fine.
+        let mut cfg = Config::default();
+        cfg.include.push("plugins/config".into());
+        cfg.include.push("rules/".into());
+        build(&claude, &staging, &cfg, &plain_opts()).unwrap();
+    }
+
+    #[test]
+    fn hard_blocks_claude_json_inside_claude_dir() {
+        // e.g. CLAUDE_CONFIG_DIR puts `.claude.json` inside the claude dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        write(&claude.join(".claude.json"), r#"{"oauthAccount":{}}"#);
+        let mut cfg = Config::default();
+        cfg.include.push(".claude.json".into());
+        let mut opts = plain_opts();
+        opts.allow_secrets = true;
+        let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
+        assert!(err.to_string().contains("credential"), "got: {err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_skipped_symlinks_without_following_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        let staging = tmp.path().join("staging");
+        let outside = tmp.path().join("outside");
+        write(&claude.join("skills/real/SKILL.md"), "# real");
+        write(&outside.join("SKILL.md"), "# linked");
+        write(&outside.join("note.md"), "linked file");
+        std::os::unix::fs::symlink(&outside, claude.join("skills/linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("note.md"), claude.join("skills/note.md")).unwrap();
+        // Excluded links are not reported.
+        write(&claude.join("plugins/config.json"), "{}");
+        std::os::unix::fs::symlink(&outside, claude.join("plugins/cache")).unwrap();
+
+        let cfg = Config::default();
+        let m = build(&claude, &staging, &cfg, &plain_opts()).unwrap();
+        let rels: Vec<&str> = m.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(rels.contains(&"skills/real/SKILL.md"));
+        assert!(!rels.iter().any(|r| r.starts_with("skills/linked")));
+        assert!(!rels.contains(&"skills/note.md"));
+
+        let skipped = skipped_symlinks(&claude, &cfg).unwrap();
+        assert_eq!(skipped, vec!["skills/linked", "skills/note.md"]);
+    }
+    #[test]
+    fn skips_nested_git_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        write(&claude.join("skills/x/SKILL.md"), "skill");
+        write(&claude.join("skills/x/.git/HEAD"), "ref: refs/heads/main");
+        write(&claude.join("skills/x/.git/objects/ab/cd"), "blob");
+        write(&claude.join("skills/y/.git"), "gitdir: ../../elsewhere");
+        write(&claude.join("skills/y/SKILL.md"), "skill");
+        std::env::set_var("HOME", tmp.path());
+        let staging = tmp.path().join("staging");
+        let m = build(
+            &claude,
+            &staging,
+            &Config::default(),
+            &SnapshotOptions {
+                dry_run: false,
+                allow_secrets: false,
+                claude_json: None,
+                profiles_root: None,
+            },
+        )
+        .unwrap();
+        let rels: Vec<&str> = m.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(rels.contains(&"skills/x/SKILL.md"));
+        assert!(rels.contains(&"skills/y/SKILL.md"));
+        assert!(!rels.iter().any(|r| r.contains(".git")), "{rels:?}");
+        assert!(!staging.join("data/skills/x/.git").exists());
     }
 }

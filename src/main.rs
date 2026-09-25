@@ -14,6 +14,7 @@ mod error;
 mod git;
 mod install;
 mod layer;
+mod lock;
 mod manifest;
 mod mcp;
 mod paths;
@@ -28,7 +29,7 @@ mod tui;
 
 use std::io::IsTerminal;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -138,8 +139,16 @@ fn run() -> Result<()> {
             }
         }
         Command::Install => install::install(),
-        Command::Tui => tui::run(&config),
-        Command::Daemon => service::run_daemon(&config),
+        Command::Tui => {
+            pin_machine_id(&config_path, &config);
+            tui::run(&config)
+        }
+        Command::Daemon => {
+            if config.service.enabled {
+                pin_machine_id(&config_path, &config);
+            }
+            service::run_daemon(&config)
+        }
         Command::Service { action } => match action {
             cli::ServiceAction::Install => service::install(&config),
             cli::ServiceAction::Uninstall => service::uninstall(),
@@ -357,8 +366,8 @@ fn cmd_profile(config: &Config, action: cli::ProfileAction) -> Result<()> {
             println!("deleted profile {name:?}");
             Ok(())
         }
-        ProfileAction::Rollback => {
-            let msg = profile::rollback(&root, &live, config)?;
+        ProfileAction::Rollback { yes } => {
+            let msg = profile::rollback(&root, &live, config, config.confirm_hooks && !yes)?;
             println!("{msg}");
             Ok(())
         }
@@ -443,6 +452,14 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
         );
         println!("    add them to `include` or `exclude` in the config to silence this");
     }
+    let symlinks = snapshot::skipped_symlinks(&claude, config)?;
+    if !symlinks.is_empty() {
+        println!(
+            "  warning: {} symlink(s) skipped (links are never followed, so their targets are not synced): {}",
+            symlinks.len(),
+            symlinks.join(", ")
+        );
+    }
     if let Some(claude_json) = &opts.claude_json {
         if let Some(doc) = mcp::extract(claude_json)? {
             println!(
@@ -456,6 +473,24 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
         println!("  staged at {}", staging.display());
     }
     Ok(())
+}
+
+/// Persist the machine identity the first time anything publishes to the
+/// repo (CLI push, TUI, daemon), so a later hostname change (common on macOS
+/// with DHCP) doesn't fork this machine's history under a new subtree.
+/// Saved from a freshly-loaded config: `config` has machine overrides folded
+/// in and must never be written back. Returns the effective id.
+fn pin_machine_id(config_path: &std::path::Path, config: &Config) -> String {
+    let machine_id = config.effective_machine_id();
+    if config.machine_id.is_none() {
+        if let Ok(mut fresh) = Config::load(config_path) {
+            fresh.machine_id = Some(machine_id.clone());
+            if fresh.save(config_path).is_ok() {
+                eprintln!("recorded machine_id = {machine_id:?} in the config");
+            }
+        }
+    }
+    machine_id
 }
 
 fn cmd_push(
@@ -472,24 +507,34 @@ fn cmd_push(
         archive::create(&staging, &out, &pass)?;
         println!("wrote encrypted archive to {}", out.display());
     } else {
-        // Persist the machine identity on first push so a later hostname
-        // change doesn't fork this machine's history under a new subtree.
-        // Saved from a freshly-loaded config: `config` has machine overrides
-        // folded in and must never be written back.
-        let machine_id = config.effective_machine_id();
-        if config.machine_id.is_none() {
-            if let Ok(mut fresh) = Config::load(config_path) {
-                fresh.machine_id = Some(machine_id.clone());
-                if fresh.save(config_path).is_ok() {
-                    println!("recorded machine_id = {machine_id:?} in the config");
-                }
-            }
-        }
+        let machine_id = pin_machine_id(config_path, &config);
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
+        if let Some(from) = pulled_from(&staging) {
+            anyhow::bail!(
+                "staging holds a pulled snapshot ({from}), not this machine's state; \
+                 pushing it would overwrite machines/{machine_id} with it. \
+                 Run `ccsync snapshot` (or `ccsync backup`) first"
+            );
+        }
         git::push(&remote, &staging, &machine_id)?;
         println!("pushed snapshot to {remote} (machine {machine_id})");
     }
     Ok(())
+}
+
+/// Record that `staging` now holds a pulled/imported snapshot (see
+/// [`paths::pulled_marker`]), naming where it came from.
+fn mark_pulled(staging: &std::path::Path, source: &str) -> Result<()> {
+    std::fs::write(paths::pulled_marker(staging), source)
+        .with_context(|| format!("marking {} as pulled", staging.display()))
+}
+
+/// Where the staged snapshot came from, when it was pulled rather than taken
+/// on this machine.
+fn pulled_from(staging: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(paths::pulled_marker(staging))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn cmd_pull(
@@ -507,6 +552,7 @@ fn cmd_pull(
         }
         let pass = archive::passphrase_from_env()?;
         archive::extract(&input, &staging, &pass)?;
+        mark_pulled(&staging, &format!("archive {}", input.display()))?;
         println!("imported snapshot from {}", input.display());
     } else {
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
@@ -514,10 +560,12 @@ fn cmd_pull(
         match &at {
             Some(commit) => {
                 git::pull_at(&remote, commit, &staging, from.as_deref(), &own_id)?;
+                mark_pulled(&staging, &format!("{remote} at {commit}"))?;
                 println!("pulled snapshot at {commit} from {remote}");
             }
             None => {
                 git::pull(&remote, &staging, from.as_deref(), &own_id)?;
+                mark_pulled(&staging, &remote)?;
                 println!("pulled snapshot from {remote}");
             }
         }
@@ -691,9 +739,51 @@ fn cmd_import(file: &std::path::Path) -> Result<()> {
     let pass = archive::passphrase_from_env()?;
     let staging = paths::staging_dir()?;
     archive::extract(file, &staging, &pass)?;
+    mark_pulled(&staging, &format!("archive {}", file.display()))?;
     println!(
         "imported snapshot to {} — run `ccsync restore` to apply",
         staging.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pulled_marker_is_cleared_by_the_next_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), "{}").unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let staging = tmp.path().join("staging");
+        let build = |dry_run| {
+            snapshot::build(
+                &claude,
+                &staging,
+                &Config::default(),
+                &SnapshotOptions {
+                    dry_run,
+                    allow_secrets: false,
+                    claude_json: None,
+                    profiles_root: None,
+                },
+            )
+            .unwrap()
+        };
+        build(false);
+
+        mark_pulled(&staging, "file:///remote at abc123").unwrap();
+        assert_eq!(
+            pulled_from(&staging).as_deref(),
+            Some("file:///remote at abc123")
+        );
+        // A dry run (`status`) leaves staging, and so the marker, alone.
+        build(true);
+        assert!(pulled_from(&staging).is_some());
+        build(false);
+        assert_eq!(pulled_from(&staging), None);
+    }
 }

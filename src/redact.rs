@@ -32,12 +32,23 @@ fn secret_patterns() -> &'static [Regex] {
             r"xox[baprs]-[A-Za-z0-9-]{10,}",
             // Google API keys.
             r"AIza[0-9A-Za-z_-]{35}",
-            // PEM private key headers.
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+            // PEM private key blocks. The header alone trips the scan, but
+            // redaction must also swallow the key body, so the match extends
+            // to the END marker when one is present. `.` (deliberately without
+            // `(?s)`) spans the literal `\n` escape sequences a JSONL
+            // transcript uses for embedded newlines, but never a real newline,
+            // so a match cannot run from one JSONL record into another. With
+            // no END marker on the line (a truncated paste), the match
+            // consumes everything that can be PEM body — base64, header
+            // fields, blanks, `\n`/`\r` escapes — and stops at the closing
+            // JSON quote so the redacted record stays valid JSON.
+            r#"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|(?:[A-Za-z0-9+/=\t \r:,._-]|\\[nrt])*)"#,
             // JWTs (three dot-separated base64url segments starting with eyJ).
             r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
-            // Generic "token"/"secret"/"password" assigned a long value.
-            r#"(?i)(api[_-]?key|secret|token|password)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+\-]{24,}"#,
+            // Generic "token"/"secret"/"password" assigned a long value. The
+            // optional `\` before each quote catches JSON-escaped text nested
+            // inside a transcript string (`{\"password\": \"...\"}`).
+            r#"(?i)(api[_-]?key|secret|token|password)\\?["']?\s*[:=]\s*\\?["']?[A-Za-z0-9/_+\-]{24,}"#,
         ]
         .iter()
         .map(|p| Regex::new(p).expect("static regex compiles"))
@@ -141,8 +152,56 @@ mod tests {
     }
 
     #[test]
+    fn redacts_whole_pem_block_in_jsonl_transcript() {
+        // JSONL: the key's newlines are literal `\n` escapes inside one line.
+        let body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun";
+        let line = format!(
+            r#"{{"type":"user","text":"-----BEGIN RSA PRIVATE KEY-----\n{body}\nAbCd+/==\n-----END RSA PRIVATE KEY-----\n","ok":"clean"}}"#
+        );
+        let (out, n) = redact_secrets(&line).expect("redacted");
+        assert_eq!(n, 1);
+        assert!(!out.contains(body), "key body survived: {out}");
+        assert!(!out.contains("AbCd+/=="));
+        assert!(!out.contains("END RSA"));
+        assert!(out.contains(r#""ok":"clean""#));
+        serde_json::from_str::<serde_json::Value>(&out).expect("still valid JSON");
+
+        // Truncated paste without an END marker: the body is still consumed,
+        // and redaction stops at the closing quote so the record stays JSON.
+        let trunc = format!(r#"{{"text":"-----BEGIN PRIVATE KEY-----\n{body}\nMore","n":1}}"#);
+        let (out, _) = redact_secrets(&trunc).expect("redacted");
+        assert!(!out.contains(body));
+        assert!(!out.contains("More"));
+        serde_json::from_str::<serde_json::Value>(&out).expect("still valid JSON");
+
+        // A header in one JSONL record never swallows the next record.
+        let two =
+            format!("{{\"a\":\"-----BEGIN PRIVATE KEY-----{body}\"}}\n{{\"b\":\"keep me\"}}\n");
+        let (out, _) = redact_secrets(&two).expect("redacted");
+        assert!(!out.contains(body));
+        assert!(out.contains(r#"{"b":"keep me"}"#));
+
+        // Scanning still trips on a bare header (raw PEM files abort).
+        assert!(scan_for_secrets("-----BEGIN OPENSSH PRIVATE KEY-----").is_some());
+        assert!(scan_for_secrets("-----BEGIN EC PRIVATE KEY-----\nMHcCAQEE\n").is_some());
+    }
+
+    #[test]
+    fn catches_json_escaped_assignments() {
+        let escaped = r#"{"text":"config: {\"password\": \"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\"}"}"#;
+        assert!(scan_for_secrets(escaped).is_some());
+        let (out, _) = redact_secrets(escaped).expect("redacted");
+        assert!(!out.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"));
+        serde_json::from_str::<serde_json::Value>(&out).expect("still valid JSON");
+
+        let escaped_key = r#"{\"api_key\":\"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\"}"#;
+        assert!(scan_for_secrets(escaped_key).is_some());
+    }
+
+    #[test]
     fn detects_credential_file_by_name() {
         assert!(is_credential_file(".credentials.json"));
+        assert!(is_credential_file(".claude.json"));
         assert!(!is_credential_file("settings.json"));
     }
 }

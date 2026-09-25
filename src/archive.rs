@@ -54,16 +54,28 @@ pub fn create(staging: &Path, out: &Path, passphrase: &str) -> Result<()> {
         enc.finish()?;
     }
 
-    // Encrypt the tarball with age.
+    // Encrypt the tarball with age into a temp file beside `out`, and only
+    // rename it into place once fully written: a failure midway must never
+    // truncate or half-overwrite an existing archive (possibly the only
+    // backup).
     let encryptor = age::Encryptor::with_user_passphrase(Secret::new(passphrase.to_owned()));
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".ccsync-archive-")
+        .tempfile_in(&parent)
+        .with_context(|| format!("creating temp archive in {}", parent.display()))?;
+    {
+        let mut writer = encryptor.wrap_output(tmp.as_file_mut())?;
+        writer.write_all(&tar_gz)?;
+        writer.finish()?;
     }
-    let out_file = std::fs::File::create(out)
-        .with_context(|| format!("creating archive {}", out.display()))?;
-    let mut writer = encryptor.wrap_output(out_file)?;
-    writer.write_all(&tar_gz)?;
-    writer.finish()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(out)
+        .map_err(|e| anyhow!("writing archive {}: {}", out.display(), e.error))?;
     Ok(())
 }
 
@@ -84,14 +96,56 @@ pub fn extract(archive: &Path, staging: &Path, passphrase: &str) -> Result<()> {
     let mut tar_gz = Vec::new();
     reader.read_to_end(&mut tar_gz)?;
 
-    // Clean and recreate staging, then unpack entry by entry so a hostile
-    // archive cannot escape the staging dir (absolute paths, `..`, or
-    // link entries pointing elsewhere).
-    if staging.exists() {
-        std::fs::remove_dir_all(staging).ok();
+    // Unpack into a fresh sibling of `staging` and swap it in only once the
+    // whole archive has validated: a corrupt or hostile archive must leave
+    // the existing staged snapshot untouched.
+    let parent = match staging.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent)?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".ccsync-extract-")
+        .tempdir_in(&parent)
+        .with_context(|| format!("creating temp dir in {}", parent.display()))?;
+    unpack_checked(&tar_gz, tmp.path())?;
+    if !tmp.path().join(MANIFEST_NAME).is_file() {
+        return Err(anyhow!(
+            "archive has no {MANIFEST_NAME}; not a ccsync snapshot"
+        ));
     }
-    std::fs::create_dir_all(staging)?;
-    let gz = GzDecoder::new(&tar_gz[..]);
+
+    // Swap: move the old staging aside, move the new one in, then drop the
+    // old. If the second rename fails, put the old staging back.
+    let old = parent.join(format!(".ccsync-staging-old-{}", std::process::id()));
+    let had_old = staging.exists();
+    if had_old {
+        if old.exists() {
+            std::fs::remove_dir_all(&old).ok();
+        }
+        std::fs::rename(staging, &old)
+            .with_context(|| format!("moving aside {}", staging.display()))?;
+    }
+    let fresh = tmp.keep();
+    if let Err(e) = std::fs::rename(&fresh, staging) {
+        if had_old {
+            std::fs::rename(&old, staging).ok();
+        }
+        std::fs::remove_dir_all(&fresh).ok();
+        return Err(e).with_context(|| format!("installing {}", staging.display()));
+    }
+    if had_old {
+        std::fs::remove_dir_all(&old).ok();
+    }
+    Ok(())
+}
+
+/// Unpack a gzip tarball into `dest` entry by entry so a hostile archive
+/// cannot escape it (absolute paths, `..`, or link entries pointing
+/// elsewhere).
+fn unpack_checked(tar_gz: &[u8], dest: &Path) -> Result<()> {
+    let staging = dest;
+    let gz = GzDecoder::new(tar_gz);
     let mut archive = tar::Archive::new(gz);
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -162,9 +216,85 @@ mod tests {
         writer.finish().unwrap();
 
         let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(MANIFEST_NAME), "existing").unwrap();
         let err = extract(&out, &staging, "hunter2").unwrap_err();
         assert!(err.to_string().contains("unsafe"), "got: {err:#}");
         assert!(!staging.join("data/evil").exists());
+        // The rejected archive left the previous staging in place.
+        assert_eq!(
+            std::fs::read_to_string(staging.join(MANIFEST_NAME)).unwrap(),
+            "existing"
+        );
+    }
+
+    /// Every entry in `dir` other than `keep`, to catch leaked temp files.
+    fn stray_entries(dir: &Path, keep: &[&str]) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| !keep.contains(&n.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn corrupt_archive_leaves_existing_staging_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("data")).unwrap();
+        std::fs::write(src.join(MANIFEST_NAME), r#"{"k":1}"#).unwrap();
+        std::fs::write(src.join("data/settings.json"), "good").unwrap();
+        let good = tmp.path().join("good.tar.gz.age");
+        create(&src, &good, "pw").unwrap();
+
+        let staging = tmp.path().join("staging");
+        extract(&good, &staging, "pw").unwrap();
+
+        // Truncated ciphertext: decryption/unpack fails partway.
+        let bytes = std::fs::read(&good).unwrap();
+        let bad = tmp.path().join("bad.tar.gz.age");
+        std::fs::write(&bad, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(extract(&bad, &staging, "pw").is_err());
+        // Wrong passphrase also fails without touching staging.
+        assert!(extract(&good, &staging, "nope").is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(staging.join("data/settings.json")).unwrap(),
+            "good"
+        );
+        assert!(stray_entries(
+            tmp.path(),
+            &["src", "staging", "good.tar.gz.age", "bad.tar.gz.age"]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn create_replaces_output_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let out = out_dir.join("snap.tar.gz.age");
+        std::fs::write(&out, "previous backup").unwrap();
+
+        // A failing create (no manifest to pack) leaves the old archive.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(create(&empty, &out, "pw").is_err());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "previous backup");
+
+        // A successful create replaces it and leaves no temp files behind.
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(MANIFEST_NAME), "{}").unwrap();
+        create(&staging, &out, "pw").unwrap();
+        let restored = tmp.path().join("restored");
+        extract(&out, &restored, "pw").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(restored.join(MANIFEST_NAME)).unwrap(),
+            "{}"
+        );
+        assert!(stray_entries(&out_dir, &["snap.tar.gz.age"]).is_empty());
     }
 
     #[test]
