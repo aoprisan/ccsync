@@ -14,6 +14,7 @@ mod error;
 mod git;
 mod install;
 mod layer;
+mod lock;
 mod manifest;
 mod mcp;
 mod paths;

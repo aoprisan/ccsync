@@ -34,6 +34,16 @@ pub fn repo_cache() -> Result<PathBuf> {
     Ok(base.join("ccsync").join("repo"))
 }
 
+/// The repo cache plus an exclusive lock on it, held until the guard drops,
+/// so a daemon tick and an interactive push/pull never interleave
+/// `reset --hard`/`add`/`commit` on the same checkout. Each public entry
+/// point takes it exactly once; none of them calls another.
+fn locked_cache() -> Result<(PathBuf, std::fs::File)> {
+    let cache = repo_cache()?;
+    let lock = crate::lock::exclusive(&cache.with_extension("lock"))?;
+    Ok((cache, lock))
+}
+
 fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut cmd = Command::new("git");
     // The remote URL is user- or config-supplied: restrict git to real
@@ -306,7 +316,7 @@ fn verify_tracked(cache: &Path, machine_id: &str, manifest: &Manifest) -> Result
 
 /// Push the staged snapshot to this machine's subtree on the git `remote`.
 pub fn push(remote: &str, staging: &Path, machine_id: &str) -> Result<()> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     push_with_cache(remote, staging, &cache, machine_id)
 }
 
@@ -394,7 +404,7 @@ fn select_subtree(cache: &Path, from: Option<&str>, own_id: &str) -> Result<Path
 /// `from` selects another machine's subtree; default is this machine's own
 /// (or the only one present).
 pub fn pull(remote: &str, staging: &Path, from: Option<&str>, own_id: &str) -> Result<()> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     pull_with_cache(remote, staging, &cache, from, own_id)
 }
 
@@ -419,7 +429,7 @@ pub fn pull_at(
     from: Option<&str>,
     own_id: &str,
 ) -> Result<()> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     pull_at_with_cache(remote, commit, staging, &cache, from, own_id)
 }
 
@@ -465,7 +475,7 @@ fn copy_snapshot(subtree: &Path, staging: &Path) -> Result<()> {
 /// Refresh the local cache from `remote` (cloning it if needed) without
 /// copying anything into staging. Used before reading history/manifests.
 pub fn refresh_cache(remote: &str) -> Result<()> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     ensure_clone(remote, &cache, Sync::Strict)
 }
 
@@ -479,7 +489,7 @@ pub fn clone_or_update(remote: &str, dest: &Path) -> Result<()> {
 /// Read a machine's manifest from the remote without transferring snapshot
 /// data into staging. Backs `ccsync diff --remote`.
 pub fn remote_manifest(remote: &str, from: Option<&str>, own_id: &str) -> Result<Manifest> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     remote_manifest_with_cache(remote, &cache, from, own_id)
 }
 
@@ -497,7 +507,7 @@ pub(crate) fn remote_manifest_with_cache(
 /// Every machine with a snapshot on the remote, with its manifest (source
 /// host, timestamp, file count, producing version).
 pub fn machines(remote: &str) -> Result<Vec<(String, Manifest)>> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     machines_with_cache(remote, &cache)
 }
 
@@ -547,7 +557,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 /// `(short_hash, committer_date_iso8601, subject)`. Returns an empty list when
 /// the cache has no commits yet; errors only if `git log` itself fails.
 pub fn log(limit: usize) -> Result<Vec<(String, String, String)>> {
-    let cache = repo_cache()?;
+    let (cache, _lock) = locked_cache()?;
     log_with_cache(&cache, limit)
 }
 

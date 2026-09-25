@@ -63,6 +63,14 @@ pub fn staging_dir() -> Result<PathBuf, CcError> {
     Ok(base.join("ccsync").join("staging"))
 }
 
+/// The background daemon's private staging dir,
+/// `<config>/ccsync/daemon-staging`, kept apart from [`staging_dir`] so a
+/// scheduled backup never clobbers a snapshot pulled for `restore`.
+pub fn daemon_staging_dir() -> Result<PathBuf, CcError> {
+    let base = dirs::config_dir().ok_or(CcError::ClaudeDirNotFound)?;
+    Ok(base.join("ccsync").join("daemon-staging"))
+}
+
 /// Marker file inside `staging` recording that it holds a snapshot brought
 /// in by `pull`/`import` rather than one taken on this machine. `push`
 /// refuses such staging (it would publish another machine's or an old

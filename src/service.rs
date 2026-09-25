@@ -27,7 +27,9 @@ use crate::snapshot::{self, SnapshotOptions};
 /// Run a single snapshot+publish cycle and return a one-line human summary.
 pub fn run_once(config: &Config) -> Result<String> {
     let claude = paths::claude_dir()?;
-    let staging = paths::staging_dir()?;
+    // The daemon stages into its own dir: sharing the interactive staging
+    // would let a tick replace a pulled snapshot the user is about to restore.
+    let staging = paths::daemon_staging_dir()?;
     let opts = SnapshotOptions::new(false, config.service.allow_secrets, config);
     let manifest = snapshot::build(&claude, &staging, config, &opts)?;
     let files = manifest.files.len();
@@ -454,7 +456,7 @@ fn claim_pidfile(path: &Path) -> Result<PidfileClaim> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _lock = lock_exclusive(&path.with_extension("pid.lock"))?;
+    let _lock = crate::lock::exclusive(&path.with_extension("pid.lock"))?;
     for _ in 0..2 {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -502,34 +504,6 @@ fn report_detached_status() {
         Some(pid) => println!("detached daemon: not running (stale pidfile, pid {pid})"),
         None => println!("detached daemon: not running"),
     }
-}
-
-/// Hold an exclusive advisory lock on `path` until the returned file drops.
-#[cfg(unix)]
-fn lock_exclusive(path: &Path) -> Result<std::fs::File> {
-    use std::os::unix::io::AsRawFd;
-
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("locking {}", path.display()));
-    }
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn lock_exclusive(path: &Path) -> Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))
 }
 
 /// Start the daemon detached in the background (nohup-style): redirect output to
