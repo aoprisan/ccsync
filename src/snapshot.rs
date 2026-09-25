@@ -123,6 +123,8 @@ fn build_inner(
                 .with_context(|| format!("clearing staging dir {}", data_root.display()))?;
         }
         fs::create_dir_all(&data_root)?;
+        // Staging now holds this machine's own state again.
+        let _ = fs::remove_file(paths::pulled_marker(staging));
     }
 
     // Plan first: resolve the complete file list (applying include/exclude and

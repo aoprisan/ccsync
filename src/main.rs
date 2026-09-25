@@ -28,7 +28,7 @@ mod tui;
 
 use std::io::IsTerminal;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -486,10 +486,32 @@ fn cmd_push(
             }
         }
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
+        if let Some(from) = pulled_from(&staging) {
+            anyhow::bail!(
+                "staging holds a pulled snapshot ({from}), not this machine's state; \
+                 pushing it would overwrite machines/{machine_id} with it. \
+                 Run `ccsync snapshot` (or `ccsync backup`) first"
+            );
+        }
         git::push(&remote, &staging, &machine_id)?;
         println!("pushed snapshot to {remote} (machine {machine_id})");
     }
     Ok(())
+}
+
+/// Record that `staging` now holds a pulled/imported snapshot (see
+/// [`paths::pulled_marker`]), naming where it came from.
+fn mark_pulled(staging: &std::path::Path, source: &str) -> Result<()> {
+    std::fs::write(paths::pulled_marker(staging), source)
+        .with_context(|| format!("marking {} as pulled", staging.display()))
+}
+
+/// Where the staged snapshot came from, when it was pulled rather than taken
+/// on this machine.
+fn pulled_from(staging: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(paths::pulled_marker(staging))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn cmd_pull(
@@ -507,6 +529,7 @@ fn cmd_pull(
         }
         let pass = archive::passphrase_from_env()?;
         archive::extract(&input, &staging, &pass)?;
+        mark_pulled(&staging, &format!("archive {}", input.display()))?;
         println!("imported snapshot from {}", input.display());
     } else {
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
@@ -514,10 +537,12 @@ fn cmd_pull(
         match &at {
             Some(commit) => {
                 git::pull_at(&remote, commit, &staging, from.as_deref(), &own_id)?;
+                mark_pulled(&staging, &format!("{remote} at {commit}"))?;
                 println!("pulled snapshot at {commit} from {remote}");
             }
             None => {
                 git::pull(&remote, &staging, from.as_deref(), &own_id)?;
+                mark_pulled(&staging, &remote)?;
                 println!("pulled snapshot from {remote}");
             }
         }
@@ -691,9 +716,51 @@ fn cmd_import(file: &std::path::Path) -> Result<()> {
     let pass = archive::passphrase_from_env()?;
     let staging = paths::staging_dir()?;
     archive::extract(file, &staging, &pass)?;
+    mark_pulled(&staging, &format!("archive {}", file.display()))?;
     println!(
         "imported snapshot to {} — run `ccsync restore` to apply",
         staging.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pulled_marker_is_cleared_by_the_next_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), "{}").unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let staging = tmp.path().join("staging");
+        let build = |dry_run| {
+            snapshot::build(
+                &claude,
+                &staging,
+                &Config::default(),
+                &SnapshotOptions {
+                    dry_run,
+                    allow_secrets: false,
+                    claude_json: None,
+                    profiles_root: None,
+                },
+            )
+            .unwrap()
+        };
+        build(false);
+
+        mark_pulled(&staging, "file:///remote at abc123").unwrap();
+        assert_eq!(
+            pulled_from(&staging).as_deref(),
+            Some("file:///remote at abc123")
+        );
+        // A dry run (`status`) leaves staging, and so the marker, alone.
+        build(true);
+        assert!(pulled_from(&staging).is_some());
+        build(false);
+        assert_eq!(pulled_from(&staging), None);
+    }
 }
