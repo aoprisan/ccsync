@@ -34,9 +34,15 @@ hard problems it solves — and the invariants you must not break — are:
    first checks every staged file against the manifest's sha256 (both
    directions) plus path safety. Keep any new restore/extract path behind
    these checks.
-5. **Hooks are code.** An incoming `settings.json` can install hook commands;
-   restore and profile switch must surface new ones and fail closed when
-   non-interactive (`confirm_hooks`).
+5. **Hooks are code.** An incoming `settings.json` can install hook commands
+   — and so can `statusLine.command`, the `*Helper`/`aws*` keys and `env`
+   (`restore::hook_commands_in` collects all of them), plus new stdio MCP
+   servers (`mcp::server_commands`); restore, profile switch/rollback and
+   layer apply must surface new ones and fail closed when non-interactive
+   (`confirm_hooks`).
+6. **Never write through a symlink, never lose one.** Restore skips
+   destinations under a symlink (`symlink_on_path`); backups and profile
+   copies recreate links rather than following or dropping them.
 
 ## Commands
 
@@ -130,14 +136,21 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
   push); pushes align the cache to the remote tip with `reset --hard` (history
   is disposable, last writer wins per subtree). Also serves `history`
   (`log`), `machines`, `pull --at` (reset → copy → re-align), and
-  `remote_manifest` for `diff --remote`. **`archive.rs`** — `tar.gz` + `age`
+  `remote_manifest` for `diff --remote`. Read paths fetch strictly (a failed
+  fetch is an error, never a stale cache); a remote URL change re-clones.
+  `pull`/`import` drop a `.ccsync-pulled` marker in staging that `push`
+  refuses; the next real snapshot clears it. **`archive.rs`** — `tar.gz` + `age`
   encryption, passphrase from `CCSYNC_PASSPHRASE` (no plaintext mode);
   extraction is per-entry and refuses unsafe paths/links.
 - **`layer.rs`** — read-only shared layers (`[[layers]]` config): `pull`
   clones/updates under `<config>/ccsync/layers/`, `apply` copies only the
   declared components into `~/.claude` after credential/secret/hook vetting —
   a layer repo is untrusted input.
-- **`service.rs`** — `daemon` (foreground loop) + `service install/uninstall/
+- **`lock.rs`** — `flock` helper. Every public `git.rs` entry point holds
+  the repo-cache lock once (they never call each other — keep it that way or
+  it self-deadlocks); the pidfile claim uses it too.
+- **`service.rs`** — `daemon` (foreground loop; stages into its own
+  `daemon-staging` dir so a tick never clobbers a pulled snapshot) + `service install/uninstall/
   start/stop/status`. `install` writes a systemd user unit / launchd agent
   (both source `<config>/ccsync/service.env` for secrets); `start` runs
   detached with an atomically-claimed pidfile, and stop/status verify the PID

@@ -139,8 +139,16 @@ fn run() -> Result<()> {
             }
         }
         Command::Install => install::install(),
-        Command::Tui => tui::run(&config),
-        Command::Daemon => service::run_daemon(&config),
+        Command::Tui => {
+            pin_machine_id(&config_path, &config);
+            tui::run(&config)
+        }
+        Command::Daemon => {
+            if config.service.enabled {
+                pin_machine_id(&config_path, &config);
+            }
+            service::run_daemon(&config)
+        }
         Command::Service { action } => match action {
             cli::ServiceAction::Install => service::install(&config),
             cli::ServiceAction::Uninstall => service::uninstall(),
@@ -467,6 +475,24 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
     Ok(())
 }
 
+/// Persist the machine identity the first time anything publishes to the
+/// repo (CLI push, TUI, daemon), so a later hostname change (common on macOS
+/// with DHCP) doesn't fork this machine's history under a new subtree.
+/// Saved from a freshly-loaded config: `config` has machine overrides folded
+/// in and must never be written back. Returns the effective id.
+fn pin_machine_id(config_path: &std::path::Path, config: &Config) -> String {
+    let machine_id = config.effective_machine_id();
+    if config.machine_id.is_none() {
+        if let Ok(mut fresh) = Config::load(config_path) {
+            fresh.machine_id = Some(machine_id.clone());
+            if fresh.save(config_path).is_ok() {
+                eprintln!("recorded machine_id = {machine_id:?} in the config");
+            }
+        }
+    }
+    machine_id
+}
+
 fn cmd_push(
     config_path: &std::path::Path,
     config: Config,
@@ -481,19 +507,7 @@ fn cmd_push(
         archive::create(&staging, &out, &pass)?;
         println!("wrote encrypted archive to {}", out.display());
     } else {
-        // Persist the machine identity on first push so a later hostname
-        // change doesn't fork this machine's history under a new subtree.
-        // Saved from a freshly-loaded config: `config` has machine overrides
-        // folded in and must never be written back.
-        let machine_id = config.effective_machine_id();
-        if config.machine_id.is_none() {
-            if let Ok(mut fresh) = Config::load(config_path) {
-                fresh.machine_id = Some(machine_id.clone());
-                if fresh.save(config_path).is_ok() {
-                    println!("recorded machine_id = {machine_id:?} in the config");
-                }
-            }
-        }
+        let machine_id = pin_machine_id(config_path, &config);
         let remote = git::resolve_remote(remote.as_deref(), config.remote.as_deref())?;
         if let Some(from) = pulled_from(&staging) {
             anyhow::bail!(
