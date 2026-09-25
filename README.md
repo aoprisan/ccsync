@@ -157,7 +157,11 @@ How a switch works:
    its store, so edits made while it was active are never lost;
 2. if the target profile's `settings.json` would install hook commands you
    don't already have, they are printed and must be confirmed (hooks are
-   arbitrary shell commands — `--yes` to skip);
+   arbitrary shell commands — `--yes` to skip). The same goes for `env`
+   variables, a `statusLine` command, credential helpers and user-scope MCP
+   servers that a pull/restore brought into the profile's store: differences
+   you set up on this machine (captured back from your live state, or accepted
+   at an earlier switch) don't prompt, synced ones do;
 3. the affected live components are backed up to a timestamped
    `~/.claude.ccsync-profile-backup-<ts>` directory;
 4. the target profile's components are swapped in wholesale and its user-scope
@@ -167,7 +171,8 @@ How a switch works:
 Profile stores live under `<config>/ccsync/profiles/<name>/` and — with the
 default `sync = true` — ride along inside snapshots, so `backup` on one
 machine and `pull` + `restore` on another moves your profiles too (the
-active-profile pointer stays machine-local).
+active-profile pointer and the record of what you've vetted per profile stay
+machine-local).
 
 ```toml
 [profiles]
@@ -321,6 +326,12 @@ On `restore`, ccsync rewrites these using the snapshot manifest's recorded
 Longer (more specific) source prefixes win. Pass `--no-remap` to restore
 transcripts verbatim on a same-path machine.
 
+The dash encoding is ambiguous: `-Users-alice-2-proj` could be
+`/Users/alice-2/proj` or `/Users/alice/2/proj`. Snapshots record the real path
+of every session directory they can resolve, plus any sibling of the home
+directory whose name extends it with a dash (`/Users/alice-2` next to
+`/Users/alice`); remapping leaves those alone unless a mapping names them.
+
 ## Safety
 
 - **Credentials never leave the machine** — `.credentials.json` (and a stray
@@ -342,7 +353,8 @@ transcripts verbatim on a same-path machine.
   code on this machine; bundled MCP servers are launched as commands too. New
   or changed ones are printed and must be confirmed; non-interactive runs fail
   closed (`--yes` to accept, `confirm_hooks = false` to disable the check).
-  Profile switch and `profile rollback` gate new hook commands.
+  Profile switch and `profile rollback` gate new hook commands, and any other
+  command-running setting a sync brought into the target profile.
 - **Archives are always encrypted** with [age](https://age-encryption.org/)
   using `CCSYNC_PASSPHRASE`; there is no plaintext mode.
 - **`restore` is reversible** — it backs up the existing `~/.claude` to a

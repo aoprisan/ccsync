@@ -190,6 +190,7 @@ fn build_inner(
     let host = hostname();
     let home = paths::home_dir()?.to_string_lossy().to_string();
     let mut manifest = Manifest::new(host, home);
+    manifest.source_home_siblings = dashed_siblings(Path::new(&manifest.source_home));
 
     let data_root = staging.join("data");
     if !opts.dry_run {
@@ -213,7 +214,8 @@ fn build_inner(
 
     // Bundle the profile store under the reserved `ccsync-profiles/` name so
     // profiles ride along in snapshots; restore routes it back into the local
-    // store. The machine-local `active.json` pointer never travels.
+    // store. The machine-local files (`active.json`, `trusted.json`) never
+    // travel.
     if config.profiles.sync {
         if let Some(profiles_root) = opts.profiles_root.as_deref() {
             if profiles_root.is_dir() {
@@ -225,8 +227,11 @@ fn build_inner(
                     &mut planned,
                     &mut symlinks,
                 )?;
-                let active = format!("{}/active.json", crate::profile::PROFILES_COMPONENT);
-                planned.retain(|p| p.rel != active);
+                let local: Vec<String> = crate::profile::LOCAL_FILES
+                    .iter()
+                    .map(|f| format!("{}/{f}", crate::profile::PROFILES_COMPONENT))
+                    .collect();
+                planned.retain(|p| !local.contains(&p.rel));
             }
         }
     }
@@ -289,6 +294,32 @@ fn build_inner(
         manifest.write_to(staging)?;
     }
     Ok(manifest)
+}
+
+/// Existing directories beside `home` named `<home name>-...`: exactly the
+/// paths whose dash-encoding collides with a path under `home` (see
+/// [`Manifest::source_home_siblings`]).
+fn dashed_siblings(home: &Path) -> Vec<String> {
+    let (Some(parent), Some(name)) = (home.parent(), home.file_name().and_then(|n| n.to_str()))
+    else {
+        return Vec::new();
+    };
+    let prefix = format!("{name}-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+                && e.path().is_dir()
+        })
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+    out.sort();
+    out
 }
 
 /// Map encoded project-directory names to the real working directories listed
@@ -567,6 +598,53 @@ pub fn require_staged(staging: &Path) -> Result<PathBuf> {
     Ok(data)
 }
 
+/// Replace `staging` with a snapshot built by `fill` into a fresh sibling
+/// dir, swapping it in only once `fill` succeeded and left a manifest behind.
+/// A failed pull/import (network error, corrupt or hostile input) therefore
+/// leaves the existing staged snapshot untouched instead of half-copied or
+/// wiped.
+pub fn replace_staging(staging: &Path, fill: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let parent = match staging.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    fs::create_dir_all(&parent)?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".ccsync-incoming-")
+        .tempdir_in(&parent)
+        .with_context(|| format!("creating temp dir in {}", parent.display()))?;
+    fill(tmp.path())?;
+    if !tmp.path().join(crate::manifest::MANIFEST_NAME).is_file() {
+        anyhow::bail!(
+            "no {} in the incoming snapshot; not a ccsync snapshot",
+            crate::manifest::MANIFEST_NAME
+        );
+    }
+
+    // Swap: move the old staging aside, move the new one in, then drop the
+    // old. If the second rename fails, put the old staging back.
+    let old = parent.join(format!(".ccsync-staging-old-{}", std::process::id()));
+    let had_old = staging.exists();
+    if had_old {
+        if old.exists() {
+            fs::remove_dir_all(&old).ok();
+        }
+        fs::rename(staging, &old).with_context(|| format!("moving aside {}", staging.display()))?;
+    }
+    let fresh = tmp.keep();
+    if let Err(e) = fs::rename(&fresh, staging) {
+        if had_old {
+            fs::rename(&old, staging).ok();
+        }
+        fs::remove_dir_all(&fresh).ok();
+        return Err(e).with_context(|| format!("installing {}", staging.display()));
+    }
+    if had_old {
+        fs::remove_dir_all(&old).ok();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +652,74 @@ mod tests {
     fn write(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn dashed_siblings_lists_only_colliding_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("alice");
+        for d in ["alice", "alice-2", "alice-work", "alice2", "bob"] {
+            fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        write(&tmp.path().join("alice-file"), "not a dir");
+        let got = dashed_siblings(&home);
+        let want: Vec<String> = ["alice-2", "alice-work"]
+            .iter()
+            .map(|d| tmp.path().join(d).to_string_lossy().to_string())
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn replace_staging_keeps_old_snapshot_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write(&staging.join("manifest.json"), "old");
+        write(&staging.join("data/settings.json"), "old");
+
+        // A fill that errors midway leaves staging as it was.
+        let err = replace_staging(&staging, |fresh| {
+            write(&fresh.join("manifest.json"), "new");
+            anyhow::bail!("network went away")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("network went away"));
+        assert_eq!(
+            fs::read_to_string(staging.join("data/settings.json")).unwrap(),
+            "old"
+        );
+
+        // So does one that produces no manifest.
+        replace_staging(&staging, |fresh| {
+            write(&fresh.join("data/settings.json"), "new");
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(
+            fs::read_to_string(staging.join("manifest.json")).unwrap(),
+            "old"
+        );
+
+        // Success swaps in the new tree whole: stale files do not survive.
+        write(&staging.join("data/stale.md"), "stale");
+        replace_staging(&staging, |fresh| {
+            write(&fresh.join("manifest.json"), "new");
+            write(&fresh.join("data/settings.json"), "new");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(staging.join("data/settings.json")).unwrap(),
+            "new"
+        );
+        assert!(!staging.join("data/stale.md").exists());
+        // No temp or aside dirs are left next to staging.
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "staging")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

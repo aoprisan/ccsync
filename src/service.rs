@@ -145,9 +145,13 @@ fn warn_about_secrets(service: &ServiceConfig) {
 /// against network-online.target if something else pulls it in. The optional
 /// (`-` prefixed) EnvironmentFile carries secrets like `CCSYNC_PASSPHRASE`
 /// that a user unit does not inherit from any shell.
+///
+/// Both paths are escaped for the unit-file syntax (see [`systemd_quote`] and
+/// [`systemd_escape_specifiers`]), so a binary under e.g.
+/// `/opt/My Tools/100%/ccsync` still runs exactly that file.
 #[cfg(target_os = "linux")]
-pub fn systemd_unit(exec_path: &Path, env_file: &Path) -> String {
-    format!(
+pub fn systemd_unit(exec_path: &Path, env_file: &Path) -> Result<String> {
+    Ok(format!(
         "[Unit]\n\
          Description=ccsync background backup of ~/.claude\n\
          Wants=network-online.target\n\
@@ -162,9 +166,51 @@ pub fn systemd_unit(exec_path: &Path, env_file: &Path) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exec = exec_path.display(),
-        env = env_file.display()
-    )
+        exec = systemd_quote(&unit_path_str(exec_path)?),
+        env = systemd_escape_specifiers(&unit_path_str(env_file)?),
+    ))
+}
+
+/// A path as text for a generated service file. Non-UTF-8 paths and control
+/// characters (a newline would end the directive and start a new one) have no
+/// safe spelling there, so they are refused rather than mangled.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn unit_path_str(path: &Path) -> Result<String> {
+    let s = path
+        .to_str()
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+    if s.chars().any(char::is_control) {
+        anyhow::bail!(
+            "{s:?} contains a control character; it cannot be written into a service file"
+        );
+    }
+    Ok(s.to_string())
+}
+
+/// Double `%` so systemd does not expand it as a unit specifier.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn systemd_escape_specifiers(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
+/// Quote one `ExecStart=` word: systemd splits on whitespace, honors
+/// C-style escapes inside double quotes, and expands `%` specifiers and `$`
+/// variables anywhere on the line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn systemd_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(target_os = "linux")]
@@ -180,7 +226,7 @@ pub fn install(config: &Config) -> Result<()> {
     if let Some(parent) = unit_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&unit_path, systemd_unit(&exe, &paths::service_env_file()?))
+    std::fs::write(&unit_path, systemd_unit(&exe, &paths::service_env_file()?)?)
         .with_context(|| format!("writing {}", unit_path.display()))?;
     println!("wrote systemd unit to {}", unit_path.display());
 
@@ -251,18 +297,36 @@ fn report_unit_status() -> Result<()> {
 /// `CCSYNC_PASSPHRASE`) before exec'ing the daemon. ThrottleInterval keeps a
 /// crash-looping daemon from restarting on launchd's 10s floor.
 #[cfg(target_os = "macos")]
-pub fn launchd_plist(exec_path: &Path) -> String {
-    let home = dirs::home_dir()
-        .map(|h| h.display().to_string())
-        .unwrap_or_default();
-    let env_file = paths::service_env_file()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let shell_cmd = format!(
-        "if [ -f '{env_file}' ]; then set -a; . '{env_file}'; set +a; fi; exec '{exec}' daemon",
-        exec = exec_path.display()
-    );
-    format!(
+pub fn launchd_plist(exec_path: &Path) -> Result<String> {
+    let home = dirs::home_dir().context("locating the home directory")?;
+    render_launchd_plist(exec_path, &paths::service_env_file()?, &home)
+}
+
+/// The plist body behind [`launchd_plist`], with every location passed in so
+/// it is testable on any platform.
+///
+/// The paths never appear inside the `sh -c` script: they ride as positional
+/// arguments (`$1`, `$2`), so no path can break out of the shell quoting, and
+/// every string is XML-escaped so none can break out of the plist.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn render_launchd_plist(exec_path: &Path, env_file: &Path, home: &Path) -> Result<String> {
+    const SCRIPT: &str = r#"if [ -f "$1" ]; then set -a; . "$1"; set +a; fi; exec "$2" daemon"#;
+    let log = home.join("Library").join("Logs").join("ccsync.log");
+    let args = [
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        SCRIPT.to_string(),
+        // `$0` for the script: the name it reports errors under.
+        "ccsync-launchd".to_string(),
+        unit_path_str(env_file)?,
+        unit_path_str(exec_path)?,
+    ];
+    let args: String = args
+        .iter()
+        .map(|a| format!("\t\t<string>{}</string>\n", xml_escape(a)))
+        .collect();
+    let log = xml_escape(&unit_path_str(&log)?);
+    Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
          \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -270,16 +334,32 @@ pub fn launchd_plist(exec_path: &Path) -> String {
          <dict>\n\
          \t<key>Label</key>\n\t<string>com.ccsync.daemon</string>\n\
          \t<key>ProgramArguments</key>\n\t<array>\n\
-         \t\t<string>/bin/sh</string>\n\t\t<string>-c</string>\n\
-         \t\t<string>{shell_cmd}</string>\n\t</array>\n\
+         {args}\
+         \t</array>\n\
          \t<key>RunAtLoad</key>\n\t<true/>\n\
          \t<key>KeepAlive</key>\n\t<true/>\n\
          \t<key>ThrottleInterval</key>\n\t<integer>60</integer>\n\
-         \t<key>StandardOutPath</key>\n\t<string>{home}/Library/Logs/ccsync.log</string>\n\
-         \t<key>StandardErrorPath</key>\n\t<string>{home}/Library/Logs/ccsync.log</string>\n\
+         \t<key>StandardOutPath</key>\n\t<string>{log}</string>\n\
+         \t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n\
          </dict>\n\
          </plist>\n",
-    )
+    ))
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
@@ -298,7 +378,7 @@ pub fn install(config: &Config) -> Result<()> {
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&plist_path, launchd_plist(&exe))
+    std::fs::write(&plist_path, launchd_plist(&exe)?)
         .with_context(|| format!("writing {}", plist_path.display()))?;
     println!("wrote launchd agent to {}", plist_path.display());
 
@@ -697,14 +777,36 @@ mod tests {
         let unit = systemd_unit(
             Path::new("/usr/local/bin/ccsync"),
             Path::new("/home/u/.config/ccsync/service.env"),
-        );
-        assert!(unit.contains("ExecStart=/usr/local/bin/ccsync daemon"));
+        )
+        .unwrap();
+        assert!(unit.contains("ExecStart=\"/usr/local/bin/ccsync\" daemon"));
         assert!(unit.contains("WantedBy=default.target"));
         // After= alone does not pull the target in; Wants= is required.
         assert!(unit.contains("Wants=network-online.target"));
         assert!(unit.contains("After=network-online.target"));
         // Optional env file so a missing one is not a start failure.
         assert!(unit.contains("EnvironmentFile=-/home/u/.config/ccsync/service.env"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_unit_escapes_unusual_paths() {
+        let unit = systemd_unit(
+            Path::new("/opt/My Tools/100%/$HOME/a\\b\"c/ccsync"),
+            Path::new("/home/u/50% off/service.env"),
+        )
+        .unwrap();
+        assert!(
+            unit.contains("ExecStart=\"/opt/My Tools/100%%/$$HOME/a\\\\b\\\"c/ccsync\" daemon\n")
+        );
+        assert!(unit.contains("EnvironmentFile=-/home/u/50%% off/service.env\n"));
+        // A newline would inject a new directive; it is refused outright.
+        let err = systemd_unit(
+            Path::new("/opt/x\nExecStartPre=/bin/evil/ccsync"),
+            Path::new("/e"),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("control character"));
     }
 
     #[cfg(unix)]
@@ -759,13 +861,50 @@ mod tests {
         assert!(pid_is_ccsync(std::process::id() as i32));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn launchd_plist_runs_daemon() {
-        let plist = launchd_plist(Path::new("/usr/local/bin/ccsync"));
+        let plist = render_launchd_plist(
+            Path::new("/usr/local/bin/ccsync"),
+            Path::new("/Users/u/Library/Application Support/ccsync/service.env"),
+            Path::new("/Users/u"),
+        )
+        .unwrap();
         assert!(plist.contains("<string>/usr/local/bin/ccsync</string>"));
-        assert!(plist.contains("<string>daemon</string>"));
+        assert!(plist.contains("exec &quot;$2&quot; daemon</string>"));
         assert!(plist.contains("com.ccsync.daemon"));
+        assert!(plist.contains("<string>/Users/u/Library/Logs/ccsync.log</string>"));
+    }
+
+    #[test]
+    fn launchd_plist_keeps_hostile_paths_inert() {
+        let exe = "/Users/u/it's <odd> & \"quoted\"/$(touch pwned)/ccsync";
+        let plist = render_launchd_plist(
+            Path::new(exe),
+            Path::new("/Users/u/env'file"),
+            Path::new("/Users/a&b"),
+        )
+        .unwrap();
+        // XML-escaped, and passed as its own argument rather than spliced
+        // into the shell script.
+        assert!(plist.contains(
+            "<string>/Users/u/it&apos;s &lt;odd&gt; &amp; &quot;quoted&quot;/$(touch pwned)/ccsync</string>"
+        ));
+        assert!(plist.contains("<string>/Users/u/env&apos;file</string>"));
+        assert!(plist.contains("<string>/Users/a&amp;b/Library/Logs/ccsync.log</string>"));
+        assert!(!plist.contains("touch pwned)/ccsync&apos;"));
+        // A newline would still be one argument, but refuse it for symmetry
+        // with the systemd unit.
+        assert!(
+            render_launchd_plist(Path::new("/a\nb/ccsync"), Path::new("/e"), Path::new("/h"))
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_uses_real_locations() {
+        let plist = launchd_plist(Path::new("/usr/local/bin/ccsync")).unwrap();
+        assert!(plist.contains("<string>/usr/local/bin/ccsync</string>"));
     }
 
     #[test]

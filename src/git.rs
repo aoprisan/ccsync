@@ -473,18 +473,18 @@ pub(crate) fn pull_at_with_cache(
     result
 }
 
-/// Materialize the snapshot in `subtree` into a fresh `staging`.
+/// Materialize the snapshot in `subtree` into `staging`. It is copied beside
+/// staging first and swapped in whole, so a failed copy never leaves staging
+/// wiped or half-filled.
 fn copy_snapshot(subtree: &Path, staging: &Path) -> Result<()> {
-    if staging.exists() {
-        std::fs::remove_dir_all(staging).ok();
-    }
-    std::fs::create_dir_all(staging)?;
-    copy_tree(&subtree.join(MANIFEST_NAME), &staging.join(MANIFEST_NAME))?;
-    let repo_data = subtree.join("data");
-    if repo_data.exists() {
-        copy_tree(&repo_data, &staging.join("data"))?;
-    }
-    Ok(())
+    crate::snapshot::replace_staging(staging, |fresh| {
+        copy_tree(&subtree.join(MANIFEST_NAME), &fresh.join(MANIFEST_NAME))?;
+        let repo_data = subtree.join("data");
+        if repo_data.exists() {
+            copy_tree(&repo_data, &fresh.join("data"))?;
+        }
+        Ok(())
+    })
 }
 
 /// Refresh the local cache from `remote` (cloning it if needed) without

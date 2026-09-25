@@ -141,7 +141,12 @@ pub fn run(
             .tempdir_in(staging.parent().unwrap_or(staging))
             .context("creating remap apply-set dir")?;
         copy_dir(&data_root, tmp.path()).context("copying staged data to apply set")?;
-        remap::apply(tmp.path(), &mappings, &manifest.project_roots)?;
+        remap::apply(
+            tmp.path(),
+            &mappings,
+            &manifest.project_roots,
+            &manifest.source_home_siblings,
+        )?;
         let root = tmp.path().to_path_buf();
         _apply_tmp = Some(tmp);
         root
@@ -264,9 +269,13 @@ pub fn apply_tree(src_root: &Path, dest_dir: &Path, opts: &ApplyOptions) -> Resu
             let inner = rel
                 .strip_prefix(crate::profile::PROFILES_COMPONENT)
                 .expect("rel starts with the profiles component");
-            // The active-profile journal is machine-local; snapshots never
-            // carry it, so one that does is not trusted to overwrite ours.
-            if inner == Path::new("active.json") {
+            // The active-profile journal and the vetted-executables record
+            // are machine-local; snapshots never carry them, so one that does
+            // is not trusted to overwrite ours.
+            if crate::profile::LOCAL_FILES
+                .iter()
+                .any(|f| inner == Path::new(f))
+            {
                 continue;
             }
             (profiles_root, inner, true)
@@ -340,8 +349,9 @@ const COMMAND_SETTINGS: &[&str] = &[
 
 /// Every string under a `command` key inside the `hooks` value of a
 /// settings.json, or empty when the file/key is absent or unparseable. Profile
-/// switching gates on this narrower set: profiles legitimately differ in `env`
-/// and friends, and it re-diffs on every switch with no memory of approvals.
+/// switching always gates on new entries of this set, and on the wider
+/// [`executable_settings_in`] set only where a sync changed a profile's store
+/// (profiles legitimately differ in `env` and friends; see `profile`).
 pub(crate) fn hook_commands_in(settings: &Path) -> Result<std::collections::BTreeSet<String>> {
     Ok(match read_settings(settings)? {
         Some(doc) => {
@@ -866,6 +876,7 @@ mod tests {
         );
         // Machine-local pointer must not travel.
         write(&profiles_a.join("active.json"), r#"{"name":"work"}"#);
+        write(&profiles_a.join("trusted.json"), r#"{"work":["env: A=1"]}"#);
 
         let staging = tmp.path().join("staging");
         let cfg = Config::default();
@@ -889,6 +900,10 @@ mod tests {
             .files
             .iter()
             .any(|f| f.rel_path == "ccsync-profiles/active.json"));
+        assert!(!m
+            .files
+            .iter()
+            .any(|f| f.rel_path == "ccsync-profiles/trusted.json"));
 
         // Machine B: restore routes the store into its local profiles dir,
         // not into ~/.claude.
@@ -912,6 +927,7 @@ mod tests {
         );
         assert!(profiles_b.join("work/profile.toml").exists());
         assert!(!profiles_b.join("active.json").exists());
+        assert!(!profiles_b.join("trusted.json").exists());
     }
 
     #[test]
@@ -1167,6 +1183,10 @@ mod tests {
             &src.join("ccsync-profiles/active.json"),
             r#"{"name":"evil"}"#,
         );
+        write(
+            &src.join("ccsync-profiles/trusted.json"),
+            r#"{"work":["statusLine: evil"]}"#,
+        );
         write(&src.join("ccsync-profiles/work/profile.toml"), "");
         write(&src.join("settings.json"), "{}");
         let dest = tmp.path().join("claude");
@@ -1185,6 +1205,7 @@ mod tests {
             fs::read_to_string(profiles.join("active.json")).unwrap(),
             r#"{"name":"work"}"#
         );
+        assert!(!profiles.join("trusted.json").exists());
         assert!(profiles.join("work/profile.toml").exists());
         assert!(written.contains(&"settings.json".to_string()));
         assert!(!written.iter().any(|w| w.ends_with(".credentials.json")));
