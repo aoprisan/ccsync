@@ -49,7 +49,7 @@ pub fn build_mappings(
         });
     }
     // Longest source prefix first.
-    mappings.sort_by(|a, b| b.from.len().cmp(&a.from.len()));
+    mappings.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     mappings
 }
 
@@ -177,7 +177,7 @@ fn encoded_mappings(
         .collect();
     // Stable, so for equal encodings the known path's entry (which already
     // applied the raw mappings) comes first.
-    out.sort_by(|a, b| b.from.len().cmp(&a.from.len()));
+    out.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     out
 }
 
