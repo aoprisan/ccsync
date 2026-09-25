@@ -1,9 +1,22 @@
 [package]
-name = "ccsync"
+# `ccsync` is taken on crates.io by an unrelated project; the package is
+# published as `claude-sync`, but the installed command stays `ccsync` (the
+# daemon's process identity check relies on that name).
+name = "claude-sync"
 version = "0.1.0"
 edition = "2021"
 description = "Sync and back up Claude Code settings, sessions, and memory across machines"
 license = "MIT"
+repository = "https://github.com/aoprisan/ccsync"
+homepage = "https://github.com/aoprisan/ccsync"
+readme = "README.md"
+keywords = ["claude", "claude-code", "sync", "backup", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/", "CLAUDE.md", "install.sh"]
+
+[[bin]]
+name = "ccsync"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
