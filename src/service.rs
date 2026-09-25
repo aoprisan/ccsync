@@ -443,17 +443,29 @@ enum PidfileClaim {
 /// Atomically claim the pidfile: `create_new` is the lock, so two concurrent
 /// `service start` invocations cannot both proceed. A pidfile naming a dead
 /// or non-ccsync process is stale and gets cleared (one retry).
+///
+/// The whole check-clear-create sequence runs under an exclusive `flock` on a
+/// sibling `.lock` file (so one start can't delete another's fresh claim as
+/// "stale"), and the claim is written with our own PID right away (so it
+/// never reads as an empty, stale file before the child's PID replaces it).
 fn claim_pidfile(path: &Path) -> Result<PidfileClaim> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let _lock = lock_exclusive(&path.with_extension("pid.lock"))?;
     for _ in 0..2 {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
         {
-            Ok(_) => return Ok(PidfileClaim::Claimed),
+            Ok(mut f) => {
+                f.write_all(std::process::id().to_string().as_bytes())
+                    .with_context(|| format!("writing {}", path.display()))?;
+                return Ok(PidfileClaim::Claimed);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let pid = std::fs::read_to_string(path)
                     .ok()
@@ -490,6 +502,34 @@ fn report_detached_status() {
         Some(pid) => println!("detached daemon: not running (stale pidfile, pid {pid})"),
         None => println!("detached daemon: not running"),
     }
+}
+
+/// Hold an exclusive advisory lock on `path` until the returned file drops.
+#[cfg(unix)]
+fn lock_exclusive(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("locking {}", path.display()));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 /// Start the daemon detached in the background (nohup-style): redirect output to
@@ -705,6 +745,12 @@ mod tests {
             PidfileClaim::Claimed
         ));
         assert!(path.exists());
+        // The claim already names a live ccsync process (us), so a racing
+        // start sees a running daemon instead of an empty "stale" file.
+        assert!(matches!(
+            claim_pidfile(&path).unwrap(),
+            PidfileClaim::Running(_)
+        ));
 
         // A pidfile naming a dead process is stale: cleared and re-claimed.
         std::fs::write(&path, "2147483646").unwrap();
