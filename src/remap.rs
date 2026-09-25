@@ -214,7 +214,7 @@ fn replace_bounded(
         } else {
             mappings.iter().find(|m| {
                 rest.starts_with(m.from.as_str())
-                    && rest[m.from.len()..].chars().next().map_or(true, &boundary)
+                    && rest[m.from.len()..].chars().next().is_none_or(&boundary)
             })
         };
         if let Some(m) = hit {
