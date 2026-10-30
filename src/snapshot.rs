@@ -296,15 +296,19 @@ fn build_inner(
     Ok(manifest)
 }
 
-/// Existing directories beside `home` named `<home name>-...`: exactly the
-/// paths whose dash-encoding collides with a path under `home` (see
-/// [`Manifest::source_home_siblings`]).
+/// Existing directories beside `home` whose encoded name extends the home's
+/// with a dash — `alice-2`, `alice.old`, `alice_work` beside `alice` (every
+/// non-alphanumeric character encodes to `-`): exactly the paths whose
+/// encoding collides with a path under `home` (see
+/// [`Manifest::source_home_siblings`]). A sibling encoding *equal* to the
+/// home's (`jean_luc` beside `jean.luc`) is indistinguishable from it and is
+/// left out, so it can't shield the home's own mapping.
 fn dashed_siblings(home: &Path) -> Vec<String> {
     let (Some(parent), Some(name)) = (home.parent(), home.file_name().and_then(|n| n.to_str()))
     else {
         return Vec::new();
     };
-    let prefix = format!("{name}-");
+    let prefix = format!("{}-", paths::encode_prefix(name));
     let Ok(entries) = fs::read_dir(parent) else {
         return Vec::new();
     };
@@ -313,7 +317,7 @@ fn dashed_siblings(home: &Path) -> Vec<String> {
         .filter(|e| {
             e.file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with(&prefix))
+                .is_some_and(|n| paths::encode_prefix(n).starts_with(&prefix))
                 && e.path().is_dir()
         })
         .map(|e| e.path().to_string_lossy().to_string())
@@ -337,8 +341,17 @@ fn known_project_paths(claude_json: Option<&Path>) -> std::collections::BTreeMap
         return known;
     };
     if let Some(projects) = doc.get("projects").and_then(|p| p.as_object()) {
+        // The encoding is many-to-one (`/a/b_c` and `/a/b-c` share a name).
+        // On a collision prefer a path that still exists, else the first key.
         for key in projects.keys() {
-            known.insert(paths::encode_path(Path::new(key)), key.clone());
+            let encoded = paths::encode_path(Path::new(key));
+            let replace = match known.get(&encoded) {
+                None => true,
+                Some(prev) => !Path::new(prev).is_dir() && Path::new(key).is_dir(),
+            };
+            if replace {
+                known.insert(encoded, key.clone());
+            }
         }
     }
     known
@@ -658,16 +671,49 @@ mod tests {
     fn dashed_siblings_lists_only_colliding_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("alice");
-        for d in ["alice", "alice-2", "alice-work", "alice2", "bob"] {
+        for d in [
+            "alice",
+            "alice-2",
+            "alice-work",
+            "alice.old",
+            "alice_x",
+            "alice2",
+            "bob",
+        ] {
             fs::create_dir_all(tmp.path().join(d)).unwrap();
         }
         write(&tmp.path().join("alice-file"), "not a dir");
         let got = dashed_siblings(&home);
-        let want: Vec<String> = ["alice-2", "alice-work"]
+        // `.` and `_` encode to `-` too, so those siblings collide as well.
+        let want: Vec<String> = ["alice-2", "alice-work", "alice.old", "alice_x"]
             .iter()
             .map(|d| tmp.path().join(d).to_string_lossy().to_string())
             .collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn known_project_paths_use_claude_codes_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("my_app");
+        fs::create_dir_all(&live).unwrap();
+        let live = live.to_string_lossy().to_string();
+        // `my.app` (gone) and `my_app` (on disk) share one encoded name; the
+        // existing directory wins regardless of key order.
+        let gone = tmp.path().join("my.app").to_string_lossy().to_string();
+        let cj = tmp.path().join(".claude.json");
+        write(
+            &cj,
+            &serde_json::json!({ "projects": { gone.clone(): {}, live.clone(): {} } }).to_string(),
+        );
+        let known = known_project_paths(Some(&cj));
+        let encoded = paths::encode_path(Path::new(&live));
+        assert!(
+            !encoded.contains('_') && !encoded.contains('.'),
+            "{encoded}"
+        );
+        assert_eq!(known.get(&encoded), Some(&live));
+        assert_eq!(known.len(), 1);
     }
 
     #[test]

@@ -20,15 +20,18 @@ hard problems it solves — and the invariants you must not break — are:
    matches to `[REDACTED:ccsync]` *in the staged copy only* — never mutate the
    user's source files.
 3. **Path remapping.** Session dirs under `projects/` are named after the
-   absolute cwd (`/` → `-`), and transcripts embed that path. Restoring on a
-   machine with a different home/checkout requires rewriting those paths or the
-   session picker won't find them. The dash-encoding is lossy (dashes in real
-   dir names), so `manifest.project_roots` — resolved at snapshot time from
+   absolute cwd — Claude Code maps *every* non-`[A-Za-z0-9]` char to `-` and
+   truncates names over 200 chars with a `-<hash>` suffix
+   (`paths::encode_path` mirrors it exactly; use `encode_prefix` for prefixes)
+   — and transcripts embed that path. Restoring on a machine with a different
+   home/checkout requires rewriting those paths or the session picker won't
+   find them. The encoding is many-to-one (`-`, `.`, `_`, `/` all collide), so
+   `manifest.project_roots` — resolved at snapshot time from
    `~/.claude.json`'s `projects` keys and the live filesystem — is the
    authoritative decode table; never re-derive paths with `decode_path` when a
    manifest is available. Content rewrites must stay boundary-aware
    (`remap::replace_bounded`) so `/Users/alice2` survives an
-   `/Users/alice` remap. Dashed siblings (`/Users/alice-2`) are only
+   `/Users/alice` remap. Dashed siblings (`/Users/alice-2`, `alice.old`) are only
    distinguishable in encoded form via known paths: resolved roots plus
    `manifest.source_home_siblings` get whole-path entries in
    `remap::encoded_mappings`, sorted ahead of the shorter home prefix.
