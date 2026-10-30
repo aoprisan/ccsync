@@ -147,6 +147,26 @@ pub fn apply(
     Ok(())
 }
 
+/// Rewrite path prefixes in another coding agent's session files under
+/// `tool_root` (a snapshot's `ccsync-<tool>/` tree): its `*.jsonl` transcripts
+/// and history, and the YAML session metadata Copilot keeps beside them.
+/// Unlike Claude Code these tools don't encode paths into directory names, so
+/// only raw, boundary-aware content rewrites apply. Absent root is a no-op.
+pub fn rewrite_sessions(tool_root: &Path, mappings: &[Mapping]) -> Result<()> {
+    if mappings.is_empty() || !tool_root.is_dir() {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(tool_root) {
+        let entry = entry?;
+        let ext = entry.path().extension().and_then(|e| e.to_str());
+        if entry.file_type().is_file() && matches!(ext, Some("jsonl" | "yaml" | "yml")) {
+            rewrite_file(entry.path(), mappings, &[])
+                .with_context(|| format!("remapping {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// The dash-encoded counterpart of `mappings`, longest `from` first. Every
 /// known source path (resolved project roots and the home's dashed siblings)
 /// gets an entry of its own: re-encoded through the raw mappings when one
@@ -161,18 +181,28 @@ fn encoded_mappings(
         .iter()
         .filter(|r| paths::decode_path(&r.encoded).to_string_lossy() != r.decoded_path)
         .map(|r| r.decoded_path.as_str());
-    let known = resolved_roots.chain(home_siblings.iter().map(String::as_str));
+    // A project root is a whole dir name, so it takes the full encoding
+    // (including truncation); siblings and mappings are prefixes and take the
+    // uncapped character mapping.
+    let known = resolved_roots
+        .map(|p| (p, paths::encode_path as fn(&Path) -> String))
+        .chain(home_siblings.iter().map(|p| {
+            (
+                p.as_str(),
+                (|p: &Path| paths::encode_prefix(&p.to_string_lossy())) as fn(&Path) -> String,
+            )
+        }));
     let mut out: Vec<Mapping> = known
-        .map(|path| {
-            let from = paths::encode_path(Path::new(path));
+        .map(|(path, encode)| {
+            let from = encode(Path::new(path));
             let to = remap_str(path, mappings)
-                .map(|p| paths::encode_path(Path::new(&p)))
+                .map(|p| encode(Path::new(&p)))
                 .unwrap_or_else(|| from.clone());
             Mapping { from, to }
         })
         .chain(mappings.iter().map(|m| Mapping {
-            from: paths::encode_path(Path::new(&m.from)),
-            to: paths::encode_path(Path::new(&m.to)),
+            from: paths::encode_prefix(&m.from),
+            to: paths::encode_prefix(&m.to),
         }))
         .collect();
     // Stable, so for equal encodings the known path's entry (which already
@@ -347,6 +377,43 @@ mod tests {
         assert!(content.contains("\"cwd\":\"/home/bob/proj\""));
         assert!(content.contains("/home/bob/proj/src/main.rs"));
         assert!(!content.contains("/Users/alice"));
+    }
+
+    #[test]
+    fn renames_to_claude_codes_encoding_for_non_alphanumeric_paths() {
+        // Claude Code encodes every non-alphanumeric char as `-`, so
+        // `/Users/alice/my_app` lives in `-Users-alice-my-app` and, under the
+        // new home `/home/jean.luc`, must land in `-home-jean-luc-my-app`.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(
+            &data.join("projects/-Users-alice-my-app/s.jsonl"),
+            "{\"cwd\":\"/Users/alice/my_app\",\"dir\":\"-Users-alice-my-app\"}\n",
+        );
+        // An unresolved root (naive decode) under the same home.
+        write(
+            &data.join("projects/-Users-alice-other/s.jsonl"),
+            "{\"cwd\":\"/Users/alice/other\"}\n",
+        );
+        let manifest = Manifest::new("h".into(), "/Users/alice".into());
+        let mappings = build_mappings(&manifest, "/home/jean.luc", &Default::default());
+        let roots = vec![ProjectRoot {
+            encoded: "-Users-alice-my-app".into(),
+            decoded_path: "/Users/alice/my_app".into(),
+        }];
+        apply(&data, &mappings, &roots, &[]).unwrap();
+
+        let projects = data.join("projects");
+        let content = fs::read_to_string(projects.join("-home-jean-luc-my-app/s.jsonl")).unwrap();
+        assert!(
+            content.contains("\"cwd\":\"/home/jean.luc/my_app\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("\"dir\":\"-home-jean-luc-my-app\""),
+            "{content}"
+        );
+        assert!(projects.join("-home-jean-luc-other/s.jsonl").exists());
     }
 
     #[test]

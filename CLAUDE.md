@@ -10,7 +10,9 @@ hard problems it solves — and the invariants you must not break — are:
 
 1. **Credentials never leave the machine.** `.credentials.json` is a *hard
    block* in the capture path (`redact::is_credential_file`), independent of
-   config, and also enforced when copying into profile stores. `~/.claude.json`
+   config, and also enforced when copying into profile stores. Other tools'
+   credential files (`tools::Tool::credential_files`: Codex `auth.json`,
+   Copilot `config.json`) are hard-blocked the same way, both directions. `~/.claude.json`
    is never synced wholesale (OAuth tokens, trust decisions); only its
    `mcpServers` are extracted.
 2. **Best-effort secret scanning.** Text configs are regex-scanned before
@@ -20,15 +22,18 @@ hard problems it solves — and the invariants you must not break — are:
    matches to `[REDACTED:ccsync]` *in the staged copy only* — never mutate the
    user's source files.
 3. **Path remapping.** Session dirs under `projects/` are named after the
-   absolute cwd (`/` → `-`), and transcripts embed that path. Restoring on a
-   machine with a different home/checkout requires rewriting those paths or the
-   session picker won't find them. The dash-encoding is lossy (dashes in real
-   dir names), so `manifest.project_roots` — resolved at snapshot time from
+   absolute cwd — Claude Code maps *every* non-`[A-Za-z0-9]` char to `-` and
+   truncates names over 200 chars with a `-<hash>` suffix
+   (`paths::encode_path` mirrors it exactly; use `encode_prefix` for prefixes)
+   — and transcripts embed that path. Restoring on a machine with a different
+   home/checkout requires rewriting those paths or the session picker won't
+   find them. The encoding is many-to-one (`-`, `.`, `_`, `/` all collide), so
+   `manifest.project_roots` — resolved at snapshot time from
    `~/.claude.json`'s `projects` keys and the live filesystem — is the
    authoritative decode table; never re-derive paths with `decode_path` when a
    manifest is available. Content rewrites must stay boundary-aware
    (`remap::replace_bounded`) so `/Users/alice2` survives an
-   `/Users/alice` remap. Dashed siblings (`/Users/alice-2`) are only
+   `/Users/alice` remap. Dashed siblings (`/Users/alice-2`, `alice.old`) are only
    distinguishable in encoded form via known paths: resolved roots plus
    `manifest.source_home_siblings` get whole-path entries in
    `remap::encoded_mappings`, sorted ahead of the shorter home prefix.
@@ -42,6 +47,9 @@ hard problems it solves — and the invariants you must not break — are:
    (`restore::executable_settings_in`), plus new stdio MCP servers
    (`mcp::new_server_commands`, diffed against the simulated merge so unioned
    args don't re-prompt). Restore and layer apply gate on that full set.
+   Restore also gates other tools' executables (`tools::new_executables`:
+   Codex `notify`/MCP/approval+sandbox modes/hooks/exec rules, Copilot
+   hooks/MCP/LSP and `hooks/` files).
    Profile switch/rollback always gate new hooks (`hook_commands_in`), and
    gate the rest of the set (plus the store's stdio MCP servers) only for
    entries missing from the machine-local `profiles/trusted.json` — what this
@@ -168,6 +176,13 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
   detached with an atomically-claimed pidfile, and stop/status verify the PID
   is really a ccsync process before trusting it. Pure orchestration over
   `snapshot`/`git`/`archive` — keep transport logic out of here.
+- **`tools.rs`** — opt-in Codex CLI (`$CODEX_HOME`) and Copilot CLI
+  (`$COPILOT_HOME`) support. Each home is captured under a reserved
+  `ccsync-codex/` / `ccsync-copilot/` component (like `ccsync-profiles/`) and
+  routed back by `apply_tree`. Per-tool defaults, credential blocks, the
+  staged-copy strip of Codex's `[projects]` trust table (`staged_bytes`),
+  TOML merge for `config.toml`, the executables gate (`new_executables`,
+  diffed against the simulated merge) and per-file backups live here.
 - **`tui.rs`** / **`theme.rs`** / **`backups.rs`** — ratatui interactive UI for
   reviewing/browsing/pushing backups.
 

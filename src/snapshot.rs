@@ -35,6 +35,10 @@ pub struct SnapshotOptions {
     /// Profile store to bundle under `ccsync-profiles/` in the snapshot, when
     /// `config.profiles.sync` is set. `None` skips profile bundling.
     pub profiles_root: Option<PathBuf>,
+    /// Other coding agents' homes to bundle under their reserved components
+    /// (`ccsync-codex/`, ...); only enabled tools are listed by
+    /// [`SnapshotOptions::new`]. Empty skips them.
+    pub tools: Vec<crate::tools::ToolHome>,
 }
 
 impl SnapshotOptions {
@@ -57,6 +61,7 @@ impl SnapshotOptions {
             allow_secrets,
             claude_json,
             profiles_root,
+            tools: crate::tools::homes(config, true),
         }
     }
 }
@@ -123,7 +128,15 @@ fn plan_includes(
         if !src.exists() {
             continue;
         }
-        plan_path(&src, claude_dir, "", config, planned, symlinks)?;
+        plan_path(
+            &src,
+            claude_dir,
+            "",
+            &|rel| config.is_excluded(rel),
+            &|_| false,
+            planned,
+            symlinks,
+        )?;
     }
     Ok(())
 }
@@ -157,6 +170,11 @@ struct PlannedFile {
     abs: PathBuf,
     rel: String,
     size: u64,
+    /// Gets the transcript secret policy (redact) instead of the config one.
+    transcript: bool,
+    /// For a file of another tool's home: the tool and its home-relative path
+    /// (staged bytes may be transformed, see `tools::staged_bytes`).
+    tool: Option<(crate::tools::Tool, String)>,
 }
 
 /// Build a snapshot of `claude_dir` into `staging`. Returns the manifest.
@@ -223,7 +241,10 @@ fn build_inner(
                     profiles_root,
                     profiles_root,
                     crate::profile::PROFILES_COMPONENT,
-                    config,
+                    &|rel| {
+                        config.is_excluded(&format!("{}/{rel}", crate::profile::PROFILES_COMPONENT))
+                    },
+                    &|_| false,
                     &mut planned,
                     &mut symlinks,
                 )?;
@@ -234,6 +255,10 @@ fn build_inner(
                 planned.retain(|p| !local.contains(&p.rel));
             }
         }
+    }
+
+    for home in &opts.tools {
+        plan_tool(home, config, &mut planned, &mut symlinks)?;
     }
 
     let total_bytes: u64 = planned.iter().map(|p| p.size).sum();
@@ -296,15 +321,19 @@ fn build_inner(
     Ok(manifest)
 }
 
-/// Existing directories beside `home` named `<home name>-...`: exactly the
-/// paths whose dash-encoding collides with a path under `home` (see
-/// [`Manifest::source_home_siblings`]).
+/// Existing directories beside `home` whose encoded name extends the home's
+/// with a dash — `alice-2`, `alice.old`, `alice_work` beside `alice` (every
+/// non-alphanumeric character encodes to `-`): exactly the paths whose
+/// encoding collides with a path under `home` (see
+/// [`Manifest::source_home_siblings`]). A sibling encoding *equal* to the
+/// home's (`jean_luc` beside `jean.luc`) is indistinguishable from it and is
+/// left out, so it can't shield the home's own mapping.
 fn dashed_siblings(home: &Path) -> Vec<String> {
     let (Some(parent), Some(name)) = (home.parent(), home.file_name().and_then(|n| n.to_str()))
     else {
         return Vec::new();
     };
-    let prefix = format!("{name}-");
+    let prefix = format!("{}-", paths::encode_prefix(name));
     let Ok(entries) = fs::read_dir(parent) else {
         return Vec::new();
     };
@@ -313,7 +342,7 @@ fn dashed_siblings(home: &Path) -> Vec<String> {
         .filter(|e| {
             e.file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with(&prefix))
+                .is_some_and(|n| paths::encode_prefix(n).starts_with(&prefix))
                 && e.path().is_dir()
         })
         .map(|e| e.path().to_string_lossy().to_string())
@@ -337,8 +366,17 @@ fn known_project_paths(claude_json: Option<&Path>) -> std::collections::BTreeMap
         return known;
     };
     if let Some(projects) = doc.get("projects").and_then(|p| p.as_object()) {
+        // The encoding is many-to-one (`/a/b_c` and `/a/b-c` share a name).
+        // On a collision prefer a path that still exists, else the first key.
         for key in projects.keys() {
-            known.insert(paths::encode_path(Path::new(key)), key.clone());
+            let encoded = paths::encode_path(Path::new(key));
+            let replace = match known.get(&encoded) {
+                None => true,
+                Some(prev) => !Path::new(prev).is_dir() && Path::new(key).is_dir(),
+            };
+            if replace {
+                known.insert(encoded, key.clone());
+            }
         }
     }
     known
@@ -391,11 +429,65 @@ fn capture_mcp_servers(
 /// `ccsync-profiles` for the bundled profile store). The credential
 /// hard-block aborts the whole snapshot here, before any bytes are read.
 /// Symlinks are never followed; non-excluded ones are recorded in `symlinks`.
+/// Plan the configured entries of another coding agent's home under its
+/// reserved component. Its credential files are hard-blocked whatever the
+/// config says; session entries follow `include_sessions` and get the
+/// transcript secret policy for every scanned text file (a session's YAML
+/// metadata discusses the same things its JSONL does).
+fn plan_tool(
+    home: &crate::tools::ToolHome,
+    config: &Config,
+    planned: &mut Vec<PlannedFile>,
+    symlinks: &mut Vec<String>,
+) -> Result<()> {
+    let tc = config.tool(home.tool);
+    if !tc.enabled || !home.dir.is_dir() {
+        return Ok(());
+    }
+    let include = tc.include_for(home.tool);
+    for entry in &include {
+        validate_include(entry)?;
+    }
+    let component = home.tool.component();
+    for entry in &include {
+        let entry = entry.trim_end_matches('/');
+        if home.tool.is_session_path(entry) && !config.include_sessions {
+            continue;
+        }
+        let src = home.dir.join(entry);
+        if fs::symlink_metadata(&src).is_err() {
+            continue;
+        }
+        let start = planned.len();
+        plan_path(
+            &src,
+            &home.dir,
+            component,
+            &|rel| tc.is_excluded(home.tool, rel),
+            &|rel| home.tool.is_credential(rel),
+            planned,
+            symlinks,
+        )?;
+        for pf in &mut planned[start..] {
+            let inner = pf.rel[component.len() + 1..].to_string();
+            pf.transcript =
+                pf.transcript || (home.tool.is_session_path(&inner) && is_scanned_text(&pf.abs));
+            pf.tool = Some((home.tool, inner));
+        }
+    }
+    Ok(())
+}
+
+/// Plan every file under `src` (relative to `base`, recorded under
+/// `rel_prefix`). `excluded` and `blocked` see the `base`-relative path:
+/// excluded files are skipped, blocked ones (a tool's credential files) abort
+/// the snapshot like `.credentials.json` does.
 fn plan_path(
     src: &Path,
     base: &Path,
     rel_prefix: &str,
-    config: &Config,
+    excluded: &dyn Fn(&str) -> bool,
+    blocked: &dyn Fn(&str) -> bool,
     out: &mut Vec<PlannedFile>,
     symlinks: &mut Vec<String>,
 ) -> Result<()> {
@@ -421,13 +513,15 @@ fn plan_path(
                 base.display()
             )
         })?;
-        let mut rel = stripped.to_string_lossy().replace('\\', "/");
-        if !rel_prefix.is_empty() {
-            rel = format!("{rel_prefix}/{rel}");
-        }
+        let inner = stripped.to_string_lossy().replace('\\', "/");
+        let rel = if rel_prefix.is_empty() {
+            inner.clone()
+        } else {
+            format!("{rel_prefix}/{inner}")
+        };
 
         if file_type.is_symlink() {
-            if !config.is_excluded(&rel) {
+            if !excluded(&inner) {
                 symlinks.push(rel);
             }
             continue;
@@ -439,11 +533,11 @@ fn plan_path(
             .unwrap_or_default();
 
         // Hard block: credentials never leave the machine.
-        if redact::is_credential_file(&file_name) {
+        if redact::is_credential_file(&file_name) || blocked(&inner) {
             return Err(CcError::CredentialBlocked(rel).into());
         }
 
-        if config.is_excluded(&rel) {
+        if excluded(&inner) {
             continue;
         }
 
@@ -452,6 +546,8 @@ fn plan_path(
             abs: abs.to_path_buf(),
             rel,
             size,
+            transcript: is_transcript(abs),
+            tool: None,
         });
     }
     Ok(())
@@ -471,12 +567,17 @@ fn capture_file(
     let rel = &pf.rel;
 
     let mut bytes = fs::read(abs).with_context(|| format!("reading {}", abs.display()))?;
+    if let Some((tool, inner)) = &pf.tool {
+        if let Some(staged) = crate::tools::staged_bytes(*tool, inner, &bytes) {
+            bytes = staged;
+        }
+    }
 
     // Secret handling unless explicitly allowed. Scanning goes through
     // `from_utf8_lossy` so a stray invalid byte cannot smuggle an otherwise
     // ASCII secret past the scan.
     if !opts.allow_secrets {
-        if is_transcript(abs) {
+        if pf.transcript {
             match config.transcript_secrets {
                 TranscriptSecrets::Ignore => {}
                 TranscriptSecrets::Redact => {
@@ -658,16 +759,49 @@ mod tests {
     fn dashed_siblings_lists_only_colliding_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("alice");
-        for d in ["alice", "alice-2", "alice-work", "alice2", "bob"] {
+        for d in [
+            "alice",
+            "alice-2",
+            "alice-work",
+            "alice.old",
+            "alice_x",
+            "alice2",
+            "bob",
+        ] {
             fs::create_dir_all(tmp.path().join(d)).unwrap();
         }
         write(&tmp.path().join("alice-file"), "not a dir");
         let got = dashed_siblings(&home);
-        let want: Vec<String> = ["alice-2", "alice-work"]
+        // `.` and `_` encode to `-` too, so those siblings collide as well.
+        let want: Vec<String> = ["alice-2", "alice-work", "alice.old", "alice_x"]
             .iter()
             .map(|d| tmp.path().join(d).to_string_lossy().to_string())
             .collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn known_project_paths_use_claude_codes_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("my_app");
+        fs::create_dir_all(&live).unwrap();
+        let live = live.to_string_lossy().to_string();
+        // `my.app` (gone) and `my_app` (on disk) share one encoded name; the
+        // existing directory wins regardless of key order.
+        let gone = tmp.path().join("my.app").to_string_lossy().to_string();
+        let cj = tmp.path().join(".claude.json");
+        write(
+            &cj,
+            &serde_json::json!({ "projects": { gone.clone(): {}, live.clone(): {} } }).to_string(),
+        );
+        let known = known_project_paths(Some(&cj));
+        let encoded = paths::encode_path(Path::new(&live));
+        assert!(
+            !encoded.contains('_') && !encoded.contains('.'),
+            "{encoded}"
+        );
+        assert_eq!(known.get(&encoded), Some(&live));
+        assert_eq!(known.len(), 1);
     }
 
     #[test]
@@ -741,6 +875,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -773,6 +908,7 @@ mod tests {
             allow_secrets: true,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("credential"));
@@ -793,6 +929,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("secret"));
@@ -803,6 +940,7 @@ mod tests {
             allow_secrets: true,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         assert!(build(&claude, &staging, &cfg, &opts).is_ok());
     }
@@ -822,6 +960,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -879,6 +1018,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let err = build(&claude, &staging, &cfg, &opts).unwrap_err();
         assert!(err.to_string().contains("secret"), "got: {err:#}");
@@ -915,6 +1055,7 @@ mod tests {
             allow_secrets: false,
             claude_json: Some(claude_json),
             profiles_root: None,
+            tools: Vec::new(),
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -962,6 +1103,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let sink = CountingSink {
             files: Cell::new(0),
@@ -999,6 +1141,7 @@ mod tests {
             allow_secrets: false,
             claude_json: Some(claude_json),
             profiles_root: None,
+            tools: Vec::new(),
         };
         let m = build(&claude, &staging, &cfg, &opts).unwrap();
         assert!(!m.files.iter().any(|f| f.rel_path == crate::mcp::MCP_FILE));
@@ -1010,7 +1153,169 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         }
+    }
+
+    fn tool_opts(tool: crate::tools::Tool, dir: &Path) -> SnapshotOptions {
+        SnapshotOptions {
+            tools: vec![crate::tools::ToolHome {
+                tool,
+                dir: dir.to_path_buf(),
+            }],
+            ..plain_opts()
+        }
+    }
+
+    #[test]
+    fn captures_codex_home_without_credentials_or_trust() {
+        use crate::tools::Tool;
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        let codex = tmp.path().join(".codex");
+        write(&codex.join("auth.json"), r#"{"OPENAI_API_KEY":"x"}"#);
+        write(
+            &codex.join("config.toml"),
+            "model = \"o3\"\n[projects.\"/Users/a/p\"]\ntrust_level = \"trusted\"\n",
+        );
+        write(&codex.join("AGENTS.md"), "be terse");
+        write(&codex.join("prompts/fix.md"), "fix it");
+        write(
+            &codex.join("sessions/2026/01/02/rollout-1.jsonl"),
+            "{\"cwd\":\"/Users/a/p\",\"t\":\"sk-abcdefghijklmnopqrstuvwxyz\"}\n",
+        );
+        write(&codex.join("state_5.sqlite"), "db");
+        write(&codex.join("log/codex-tui.log"), "log");
+        let staging = tmp.path().join("staging");
+
+        // Disabled (the default): nothing from the tool is captured.
+        let m = build(
+            &claude,
+            &staging,
+            &Config::default(),
+            &tool_opts(Tool::Codex, &codex),
+        )
+        .unwrap();
+        assert!(m
+            .files
+            .iter()
+            .all(|f| !f.rel_path.starts_with("ccsync-codex")));
+
+        let mut cfg = Config::default();
+        cfg.codex.enabled = true;
+        let m = build(&claude, &staging, &cfg, &tool_opts(Tool::Codex, &codex)).unwrap();
+        let mut rels: Vec<&str> = m.files.iter().map(|f| f.rel_path.as_str()).collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            [
+                "ccsync-codex/AGENTS.md",
+                "ccsync-codex/config.toml",
+                "ccsync-codex/prompts/fix.md",
+                "ccsync-codex/sessions/2026/01/02/rollout-1.jsonl",
+            ]
+        );
+        let data = staging.join("data/ccsync-codex");
+        let conf = fs::read_to_string(data.join("config.toml")).unwrap();
+        assert!(
+            conf.contains("o3") && !conf.contains("trust_level"),
+            "{conf}"
+        );
+        let sess = fs::read_to_string(data.join("sessions/2026/01/02/rollout-1.jsonl")).unwrap();
+        assert!(sess.contains(crate::redact::REDACTION_MARKER), "{sess}");
+        assert_eq!(m.redacted_spans, 1);
+        // The source is untouched.
+        assert!(fs::read_to_string(codex.join("config.toml"))
+            .unwrap()
+            .contains("trust_level"));
+
+        // Sessions follow include_sessions.
+        cfg.include_sessions = false;
+        let m = build(&claude, &staging, &cfg, &tool_opts(Tool::Codex, &codex)).unwrap();
+        assert!(m.files.iter().all(|f| !f.rel_path.contains("sessions/")));
+    }
+
+    #[test]
+    fn hard_blocks_tool_credentials_even_when_included() {
+        use crate::tools::Tool;
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        let copilot = tmp.path().join(".copilot");
+        write(&copilot.join("config.json"), r#"{"logged_in_users":[]}"#);
+        let mut cfg = Config::default();
+        cfg.copilot.enabled = true;
+        cfg.copilot.include = Some(vec!["config.json".into()]);
+        cfg.copilot.exclude = Some(Vec::new());
+        let err = build(
+            &claude,
+            &tmp.path().join("s"),
+            &cfg,
+            &tool_opts(Tool::Copilot, &copilot),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<CcError>(),
+                Some(CcError::CredentialBlocked(_))
+            ),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn captures_copilot_home_and_redacts_session_metadata() {
+        use crate::tools::Tool;
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        let copilot = tmp.path().join(".copilot");
+        write(&copilot.join("config.json"), r#"{"auth":"t"}"#);
+        write(&copilot.join("permissions-config.json"), "{}");
+        write(&copilot.join("settings.json"), r#"{"model":"x"}"#);
+        write(&copilot.join("mcp-config.json"), r#"{"mcpServers":{}}"#);
+        write(&copilot.join("agents/rev.agent.md"), "review");
+        write(&copilot.join("pkg/universal/app.js"), "cache");
+        // Session YAML discussing a secret is redacted, not an abort.
+        write(
+            &copilot.join("session-state/abc/workspace.yaml"),
+            "cwd: /Users/a/p\nsummary: token ghp_0123456789abcdefghij0123\n",
+        );
+        let mut cfg = Config::default();
+        cfg.copilot.enabled = true;
+        let staging = tmp.path().join("staging");
+        let m = build(&claude, &staging, &cfg, &tool_opts(Tool::Copilot, &copilot)).unwrap();
+        let mut rels: Vec<&str> = m.files.iter().map(|f| f.rel_path.as_str()).collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            [
+                "ccsync-copilot/agents/rev.agent.md",
+                "ccsync-copilot/mcp-config.json",
+                "ccsync-copilot/session-state/abc/workspace.yaml",
+                "ccsync-copilot/settings.json",
+            ]
+        );
+        let yaml = fs::read_to_string(
+            staging.join("data/ccsync-copilot/session-state/abc/workspace.yaml"),
+        )
+        .unwrap();
+        assert!(yaml.contains(crate::redact::REDACTION_MARKER), "{yaml}");
+
+        // A secret in a tool's config file still aborts.
+        write(
+            &copilot.join("mcp-config.json"),
+            r#"{"k":"sk-abcdefghijklmnopqrstuvwxyz"}"#,
+        );
+        let err = build(&claude, &staging, &cfg, &tool_opts(Tool::Copilot, &copilot)).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<CcError>(),
+                Some(CcError::SecretDetected { .. })
+            ),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1132,6 +1437,7 @@ mod tests {
                 allow_secrets: false,
                 claude_json: None,
                 profiles_root: None,
+                tools: Vec::new(),
             },
         )
         .unwrap();
