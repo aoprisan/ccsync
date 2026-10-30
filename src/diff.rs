@@ -215,6 +215,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         snapshot::build(&claude, &staging, &cfg, &opts).unwrap();
 
@@ -246,6 +247,7 @@ mod tests {
             allow_secrets: false,
             claude_json: None,
             profiles_root: Some(profiles.clone()),
+            tools: Vec::new(),
         };
         let staged = snapshot::build(&claude, &staging, &cfg, &opts(false)).unwrap();
         assert!(staged
@@ -277,6 +279,7 @@ mod tests {
             allow_secrets: true,
             claude_json: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         snapshot::build(&claude, &staging, &cfg, &opts).unwrap();
 

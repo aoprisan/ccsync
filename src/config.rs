@@ -64,6 +64,63 @@ pub struct Config {
     /// Skipped when empty so `[[layers]]` can be appended by hand.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<LayerConfig>,
+    /// OpenAI Codex CLI state (`$CODEX_HOME`, default `~/.codex`). Opt-in.
+    pub codex: ToolConfig,
+    /// GitHub Copilot CLI state (`$COPILOT_HOME`, default `~/.copilot`).
+    /// Opt-in.
+    pub copilot: ToolConfig,
+}
+
+/// Capture settings for another coding agent's home (see `tools`). Absent
+/// `include`/`exclude` mean the tool's built-in defaults
+/// (`Tool::default_include` / `default_exclude`); setting one replaces that
+/// default list. The tool's credential files are blocked regardless.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolConfig {
+    /// Capture this tool's home into snapshots. Off by default so upgrading
+    /// never changes what an existing backup carries.
+    pub enabled: bool,
+    /// Top-level entries of the tool's home to capture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+    /// Home-relative paths (or prefixes) never captured. `*` matches within
+    /// one path component (`*.sqlite`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+}
+
+impl ToolConfig {
+    /// The effective include list for `tool`.
+    pub fn include_for(&self, tool: crate::tools::Tool) -> Vec<String> {
+        match &self.include {
+            Some(list) => list.clone(),
+            None => tool
+                .default_include()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
+    /// True when the home-relative `rel` is excluded for `tool`: equal to an
+    /// exclude entry or below it, component-wise, with `*` globs.
+    pub fn is_excluded(&self, tool: crate::tools::Tool, rel: &str) -> bool {
+        let rel = rel.replace('\\', "/");
+        let rel_parts: Vec<&str> = rel.split('/').collect();
+        let matches = |ex: &str| {
+            let parts: Vec<&str> = ex.trim_end_matches('/').split('/').collect();
+            parts.len() <= rel_parts.len()
+                && parts
+                    .iter()
+                    .zip(&rel_parts)
+                    .all(|(p, r)| crate::tools::glob_component(p, r))
+        };
+        match &self.exclude {
+            Some(list) => list.iter().any(|ex| matches(ex)),
+            None => tool.default_exclude().iter().any(|ex| matches(ex)),
+        }
+    }
 }
 
 /// One `[[layers]]` entry: a git repo whose declared top-level components are
@@ -248,6 +305,8 @@ impl Default for Config {
             profiles: ProfilesConfig::default(),
             machines: BTreeMap::new(),
             layers: Vec::new(),
+            codex: ToolConfig::default(),
+            copilot: ToolConfig::default(),
         }
     }
 }
@@ -323,6 +382,14 @@ impl Config {
 
     /// True if `rel` (a path relative to `~/.claude`) is excluded by any
     /// configured exclude prefix.
+    /// Capture settings for `tool`.
+    pub fn tool(&self, tool: crate::tools::Tool) -> &ToolConfig {
+        match tool {
+            crate::tools::Tool::Codex => &self.codex,
+            crate::tools::Tool::Copilot => &self.copilot,
+        }
+    }
+
     pub fn is_excluded(&self, rel: &str) -> bool {
         let rel = rel.replace('\\', "/");
         self.exclude.iter().any(|ex| {
@@ -344,6 +411,25 @@ mod tests {
         assert!(c.is_excluded("session-env/abc/x"));
         assert!(!c.is_excluded("settings.json"));
         assert!(!c.is_excluded("projects/-home-user-x/sess.jsonl"));
+    }
+
+    #[test]
+    fn tools_are_opt_in_and_partial_tables_keep_defaults() {
+        use crate::tools::Tool;
+        // A config written before tool support loads with both tools off.
+        let old: Config = toml::from_str("include_sessions = true\n").unwrap();
+        assert!(!old.codex.enabled && !old.copilot.enabled);
+        // `enabled = true` alone keeps the built-in include/exclude lists.
+        let c: Config = toml::from_str("[codex]\nenabled = true\n").unwrap();
+        assert!(c.codex.enabled);
+        assert!(c
+            .codex
+            .include_for(Tool::Codex)
+            .contains(&"config.toml".to_string()));
+        assert!(c.codex.is_excluded(Tool::Codex, "auth.json"));
+        // Round-trips through save without inventing explicit lists.
+        let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert!(back.codex.enabled && back.codex.include.is_none());
     }
 
     #[test]

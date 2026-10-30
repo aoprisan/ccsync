@@ -10,7 +10,9 @@ hard problems it solves — and the invariants you must not break — are:
 
 1. **Credentials never leave the machine.** `.credentials.json` is a *hard
    block* in the capture path (`redact::is_credential_file`), independent of
-   config, and also enforced when copying into profile stores. `~/.claude.json`
+   config, and also enforced when copying into profile stores. Other tools'
+   credential files (`tools::Tool::credential_files`: Codex `auth.json`,
+   Copilot `config.json`) are hard-blocked the same way, both directions. `~/.claude.json`
    is never synced wholesale (OAuth tokens, trust decisions); only its
    `mcpServers` are extracted.
 2. **Best-effort secret scanning.** Text configs are regex-scanned before
@@ -45,6 +47,9 @@ hard problems it solves — and the invariants you must not break — are:
    (`restore::executable_settings_in`), plus new stdio MCP servers
    (`mcp::new_server_commands`, diffed against the simulated merge so unioned
    args don't re-prompt). Restore and layer apply gate on that full set.
+   Restore also gates other tools' executables (`tools::new_executables`:
+   Codex `notify`/MCP/approval+sandbox modes/hooks/exec rules, Copilot
+   hooks/MCP/LSP and `hooks/` files).
    Profile switch/rollback always gate new hooks (`hook_commands_in`), and
    gate the rest of the set (plus the store's stdio MCP servers) only for
    entries missing from the machine-local `profiles/trusted.json` — what this
@@ -171,6 +176,13 @@ snapshot ──> (git push | archive create) ──> [transport] ──> (git pu
   detached with an atomically-claimed pidfile, and stop/status verify the PID
   is really a ccsync process before trusting it. Pure orchestration over
   `snapshot`/`git`/`archive` — keep transport logic out of here.
+- **`tools.rs`** — opt-in Codex CLI (`$CODEX_HOME`) and Copilot CLI
+  (`$COPILOT_HOME`) support. Each home is captured under a reserved
+  `ccsync-codex/` / `ccsync-copilot/` component (like `ccsync-profiles/`) and
+  routed back by `apply_tree`. Per-tool defaults, credential blocks, the
+  staged-copy strip of Codex's `[projects]` trust table (`staged_bytes`),
+  TOML merge for `config.toml`, the executables gate (`new_executables`,
+  diffed against the simulated merge) and per-file backups live here.
 - **`tui.rs`** / **`theme.rs`** / **`backups.rs`** — ratatui interactive UI for
   reviewing/browsing/pushing backups.
 

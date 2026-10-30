@@ -155,6 +155,7 @@ pub fn apply(
             merge: MergeMode::Merge,
             components: Some(&layer.components),
             profiles_root: None,
+            tools: &[],
         },
     )
 }

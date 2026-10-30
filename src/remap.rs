@@ -147,6 +147,26 @@ pub fn apply(
     Ok(())
 }
 
+/// Rewrite path prefixes in another coding agent's session files under
+/// `tool_root` (a snapshot's `ccsync-<tool>/` tree): its `*.jsonl` transcripts
+/// and history, and the YAML session metadata Copilot keeps beside them.
+/// Unlike Claude Code these tools don't encode paths into directory names, so
+/// only raw, boundary-aware content rewrites apply. Absent root is a no-op.
+pub fn rewrite_sessions(tool_root: &Path, mappings: &[Mapping]) -> Result<()> {
+    if mappings.is_empty() || !tool_root.is_dir() {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(tool_root) {
+        let entry = entry?;
+        let ext = entry.path().extension().and_then(|e| e.to_str());
+        if entry.file_type().is_file() && matches!(ext, Some("jsonl" | "yaml" | "yml")) {
+            rewrite_file(entry.path(), mappings, &[])
+                .with_context(|| format!("remapping {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// The dash-encoded counterpart of `mappings`, longest `from` first. Every
 /// known source path (resolved project roots and the home's dashed siblings)
 /// gets an entry of its own: re-encoded through the raw mappings when one

@@ -37,6 +37,15 @@ pub fn home_dir() -> Result<PathBuf, CcError> {
     dirs::home_dir().ok_or(CcError::ClaudeDirNotFound)
 }
 
+/// Home of another coding agent: its env var (`CODEX_HOME`, `COPILOT_HOME`)
+/// when set and non-empty, else `~/<default dir>`.
+pub fn tool_home(tool: crate::tools::Tool) -> Result<PathBuf, CcError> {
+    match std::env::var_os(tool.home_env()) {
+        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+        _ => Ok(home_dir()?.join(tool.default_dir_name())),
+    }
+}
+
 /// Locate Claude Code's `~/.claude.json`, the file that holds MCP server
 /// definitions (among other machine-local state).
 ///

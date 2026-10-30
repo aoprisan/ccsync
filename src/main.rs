@@ -25,6 +25,7 @@ mod restore;
 mod service;
 mod snapshot;
 mod theme;
+mod tools;
 mod tui;
 
 use std::io::IsTerminal;
@@ -412,11 +413,20 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
         snapshot::build(&claude, &staging, config, &opts)?
     };
 
-    let total: u64 = m.files.iter().map(|f| f.size).sum();
+    // Other tools' files are reported per tool below.
+    let claude_files: Vec<_> = m
+        .files
+        .iter()
+        .filter(|f| {
+            let top = f.rel_path.split('/').next().unwrap_or_default();
+            tools::Tool::from_component(top).is_none()
+        })
+        .collect();
+    let total: u64 = claude_files.iter().map(|f| f.size).sum();
     println!(
         "{} {} files ({}) from {}",
         if dry_run { "would capture" } else { "captured" },
-        m.files.len(),
+        claude_files.len(),
         human_size(total),
         claude.display()
     );
@@ -451,6 +461,35 @@ fn cmd_snapshot(config: &Config, dry_run: bool, allow_secrets: bool) -> Result<(
             unclassified.join(", ")
         );
         println!("    add them to `include` or `exclude` in the config to silence this");
+    }
+    for home in tools::homes(config, false) {
+        let tc = config.tool(home.tool);
+        let name = home.tool.name();
+        if !tc.enabled {
+            if home.dir.is_dir() {
+                println!(
+                    "  note: {name} state found at {} but not synced; enable with `[{name}] enabled = true`",
+                    home.dir.display()
+                );
+            }
+            continue;
+        }
+        let n = m
+            .files
+            .iter()
+            .filter(|f| f.rel_path.split('/').next() == Some(home.tool.component()))
+            .count();
+        println!("  {n} {name} file(s) from {}", home.dir.display());
+        let unclassified = tools::unclassified_top_level(&home, tc);
+        if !unclassified.is_empty() {
+            println!(
+                "  warning: {name} entries not classified by include/exclude (never synced): {}",
+                unclassified.join(", ")
+            );
+            println!(
+                "    add them to `[{name}] include` or `exclude` in the config to silence this"
+            );
+        }
     }
     let symlinks = snapshot::skipped_symlinks(&claude, config)?;
     if !symlinks.is_empty() {
@@ -646,6 +685,9 @@ fn cmd_restore(
         } else {
             None
         },
+        // Route whatever tool trees the snapshot carries, enabled here or not:
+        // `[codex] enabled` governs capture; `--only` narrows a restore.
+        tools: tools::homes(config, false),
     };
     let report = restore::run(&claude, &staging, config, &opts)?;
 
@@ -665,12 +707,34 @@ fn cmd_restore(
     if let Some(backup) = &report.claude_json_backup {
         println!("backed up existing ~/.claude.json to {}", backup.display());
     }
+    for backup in &report.tool_backups {
+        println!("backed up replaced files to {}", backup.display());
+    }
+    let tool_files = |tool: tools::Tool| {
+        report
+            .files_written
+            .iter()
+            .filter(|f| f.split('/').next() == Some(tool.component()))
+            .count()
+    };
+    let tool_total: usize = tools::Tool::ALL.into_iter().map(tool_files).sum();
     println!(
         "{} {} files to {}",
         if dry_run { "would restore" } else { "restored" },
-        report.files_written.len(),
+        report.files_written.len() - tool_total,
         claude.display()
     );
+    for home in &opts.tools {
+        let n = tool_files(home.tool);
+        if n > 0 {
+            println!(
+                "{} {n} {} file(s) to {}",
+                if dry_run { "would restore" } else { "restored" },
+                home.tool.name(),
+                home.dir.display()
+            );
+        }
+    }
     if report.mcp_servers_restored > 0 {
         println!(
             "{} {} local MCP server(s) into ~/.claude.json",
@@ -769,6 +833,7 @@ mod tests {
                     allow_secrets: false,
                     claude_json: None,
                     profiles_root: None,
+                    tools: Vec::new(),
                 },
             )
             .unwrap()

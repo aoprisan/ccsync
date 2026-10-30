@@ -47,6 +47,10 @@ pub struct RestoreOptions {
     /// Local profile store to route the snapshot's bundled `ccsync-profiles/`
     /// tree into. `None` drops bundled profiles instead of restoring them.
     pub profiles_root: Option<PathBuf>,
+    /// Local homes of other coding agents. A snapshot's `ccsync-codex/` /
+    /// `ccsync-copilot/` tree is routed into the matching home; one without a
+    /// home listed here is skipped.
+    pub tools: Vec<crate::tools::ToolHome>,
 }
 
 #[derive(Debug)]
@@ -58,6 +62,9 @@ pub struct RestoreReport {
     pub mcp_servers_restored: usize,
     /// Backup copy of `~/.claude.json` taken before merging MCP servers in.
     pub claude_json_backup: Option<PathBuf>,
+    /// Per-tool backups of the files the restore replaced in another coding
+    /// agent's home.
+    pub tool_backups: Vec<PathBuf>,
 }
 
 /// Apply the staged snapshot to `claude_dir`.
@@ -108,6 +115,15 @@ pub fn run(
                 overwrite,
             )?);
         }
+        // Other coding agents' hooks, MCP/LSP servers, exec rules, ...
+        for (home, src) in tool_trees(&data_root, &opts.tools, components) {
+            new_hooks.extend(crate::tools::new_executables(
+                home.tool,
+                &src,
+                &home.dir,
+                opts.merge == MergeMode::Overwrite,
+            )?);
+        }
         if !new_hooks.is_empty() {
             confirm_hook_install(&new_hooks)?;
         }
@@ -128,6 +144,19 @@ pub fn run(
         None
     };
 
+    // Other tools' homes hold large session trees and live databases, so only
+    // the files this restore replaces are backed up.
+    let mut tool_backups = Vec::new();
+    if !opts.dry_run {
+        for (home, src) in tool_trees(&data_root, &opts.tools, components) {
+            if let Some(backup) = crate::tools::backup_overwrites(&src, &home.dir)
+                .with_context(|| format!("backing up {}", home.dir.display()))?
+            {
+                tool_backups.push(backup);
+            }
+        }
+    }
+
     // Remap operates on a temporary copy of the staged data (the "apply set")
     // so staging itself is never mutated: a pulled snapshot stays reusable for
     // repeated or later restores. The temp dir lives next to staging so the
@@ -147,6 +176,9 @@ pub fn run(
             &manifest.project_roots,
             &manifest.source_home_siblings,
         )?;
+        for tool in crate::tools::Tool::ALL {
+            remap::rewrite_sessions(&tmp.path().join(tool.component()), &mappings)?;
+        }
         let root = tmp.path().to_path_buf();
         _apply_tmp = Some(tmp);
         root
@@ -163,6 +195,7 @@ pub fn run(
             merge: opts.merge,
             components,
             profiles_root: opts.profiles_root.as_deref(),
+            tools: &opts.tools,
         },
     )?;
 
@@ -202,7 +235,23 @@ pub fn run(
         mappings,
         mcp_servers_restored,
         claude_json_backup,
+        tool_backups,
     })
+}
+
+/// The tool trees of a staged snapshot that are in scope and have a local
+/// home to land in, as `(home, staged tree)` pairs.
+fn tool_trees<'a>(
+    data_root: &Path,
+    homes: &'a [crate::tools::ToolHome],
+    components: Option<&[String]>,
+) -> Vec<(&'a crate::tools::ToolHome, PathBuf)> {
+    homes
+        .iter()
+        .filter(|h| in_scope(components, h.tool.component()))
+        .map(|h| (h, data_root.join(h.tool.component())))
+        .filter(|(_, src)| src.is_dir())
+        .collect()
 }
 
 /// Options for [`apply_tree`], the component-aware copy core shared by full
@@ -216,13 +265,20 @@ pub struct ApplyOptions<'a> {
     /// Where the reserved `ccsync-profiles/` component is routed (the local
     /// profile store, not `~/.claude`). `None` skips it.
     pub profiles_root: Option<&'a Path>,
+    /// Where the reserved per-tool components (`ccsync-codex/`, ...) are
+    /// routed. A tool without a home here is skipped.
+    pub tools: &'a [crate::tools::ToolHome],
 }
 
 /// True when `name` (a top-level component) is selected by `components`.
 pub fn in_scope(components: Option<&[String]>, name: &str) -> bool {
     match components {
         None => true,
-        Some(list) => list.iter().any(|c| c.trim_end_matches('/') == name),
+        // A tool's component can also be named by the tool (`--only codex`).
+        Some(list) => list.iter().any(|c| {
+            let c = c.trim_end_matches('/');
+            c == name || crate::tools::Tool::from_alias(c).is_some_and(|t| t.component() == name)
+        }),
     }
 }
 
@@ -279,6 +335,20 @@ pub fn apply_tree(src_root: &Path, dest_dir: &Path, opts: &ApplyOptions) -> Resu
                 continue;
             }
             (profiles_root, inner, true)
+        } else if let Some(tool) = crate::tools::Tool::from_component(top) {
+            let Some(home) = opts.tools.iter().find(|h| h.tool == tool) else {
+                continue;
+            };
+            let inner = rel
+                .strip_prefix(tool.component())
+                .expect("rel starts with the tool component");
+            // Inbound credential block: a snapshot must never replace this
+            // machine's login for the tool either.
+            if tool.is_credential(&inner.to_string_lossy().replace('\\', "/")) {
+                eprintln!("warning: refusing to restore credential file {rel_str}");
+                continue;
+            }
+            (home.dir.as_path(), inner, false)
         } else {
             (dest_dir, rel, false)
         };
@@ -306,8 +376,16 @@ pub fn apply_tree(src_root: &Path, dest_dir: &Path, opts: &ApplyOptions) -> Resu
             && opts.merge == MergeMode::Merge
             && rel_str.ends_with(".json")
             && dest.exists();
+        // Codex's config.toml merges like settings.json does, so local keys
+        // (notably the stripped `[projects]` trust table) survive.
+        let is_tool_toml = opts.merge == MergeMode::Merge
+            && crate::tools::Tool::from_component(top).is_some()
+            && rel_str.ends_with(".toml")
+            && dest.exists();
         if is_json_config {
             merge_json_file(entry.path(), &dest)?;
+        } else if is_tool_toml {
+            crate::tools::merge_toml_file(entry.path(), &dest)?;
         } else {
             fs::copy(entry.path(), &dest).with_context(|| format!("writing {}", dest.display()))?;
         }
@@ -514,7 +592,7 @@ fn merge_json_file(incoming: &Path, existing: &Path) -> Result<()> {
     Ok(())
 }
 
-fn merge_value(base: &mut serde_json::Value, incoming: serde_json::Value) {
+pub(crate) fn merge_value(base: &mut serde_json::Value, incoming: serde_json::Value) {
     use serde_json::Value;
     match (base, incoming) {
         (Value::Object(b), Value::Object(i)) => {
@@ -601,7 +679,7 @@ fn symlink_on_path(root: &Path, rel: &Path) -> Option<PathBuf> {
 /// A fresh `<name>.ccsync-backup-<timestamp>` sibling of `path` that does not
 /// exist yet. Two restores within the same second must not share a backup:
 /// the second would overwrite the pre-restore originals with restored ones.
-fn backup_path(path: &Path, default_name: &str) -> PathBuf {
+pub(crate) fn backup_path(path: &Path, default_name: &str) -> PathBuf {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -652,6 +730,120 @@ mod tests {
     }
 
     #[test]
+    fn restores_tool_trees_into_their_homes() {
+        use crate::tools::{Tool, ToolHome};
+        let tmp = tempfile::tempdir().unwrap();
+        let src_claude = tmp.path().join("src-claude");
+        fs::create_dir_all(&src_claude).unwrap();
+        let src_codex = tmp.path().join("src-codex");
+        write(&src_codex.join("AGENTS.md"), "incoming");
+        write(
+            &src_codex.join("config.toml"),
+            "model = \"gpt-5\"\nnotify = [\"notify-send\"]\n[projects.\"/Users/alice/p\"]\ntrust_level = \"trusted\"\n",
+        );
+        write(
+            &src_codex.join("sessions/2026/01/02/rollout-1.jsonl"),
+            "{\"cwd\":\"/Users/alice/p\"}\n",
+        );
+        let mut cfg = Config::default();
+        cfg.codex.enabled = true;
+        let staging = tmp.path().join("staging");
+        let mut manifest = snapshot::build(
+            &src_claude,
+            &staging,
+            &cfg,
+            &SnapshotOptions {
+                dry_run: false,
+                allow_secrets: false,
+                claude_json: None,
+                profiles_root: None,
+                tools: vec![ToolHome {
+                    tool: Tool::Codex,
+                    dir: src_codex.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        manifest.source_home = "/Users/alice".to_string();
+        manifest.write_to(&staging).unwrap();
+
+        // Target: an existing Codex home with local trust and a credential.
+        let fake_home = tmp.path().join("home-bob");
+        let dst_codex = fake_home.join(".codex");
+        write(&dst_codex.join("AGENTS.md"), "local");
+        write(&dst_codex.join("auth.json"), "LOCAL-LOGIN");
+        write(
+            &dst_codex.join("config.toml"),
+            "model = \"o3\"\n[projects.\"/home/bob/q\"]\ntrust_level = \"trusted\"\n",
+        );
+        // A hand-edited snapshot smuggling a credential is refused inbound.
+        let data = staging.join("data");
+        write(&data.join("ccsync-codex/auth.json"), "STOLEN");
+        let mut m = Manifest::read_from(&staging).unwrap();
+        m.files.push(crate::manifest::FileEntry {
+            rel_path: "ccsync-codex/auth.json".into(),
+            sha256: snapshot::hex(&<sha2::Sha256 as sha2::Digest>::digest(b"STOLEN")),
+            size: 6,
+        });
+        m.write_to(&staging).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        let dst_claude = tmp.path().join("dst-claude");
+        let opts = |confirm_hooks| RestoreOptions {
+            dry_run: false,
+            remap: true,
+            merge: MergeMode::Merge,
+            claude_json: None,
+            confirm_hooks,
+            components: Some(vec!["codex".into()]),
+            profiles_root: None,
+            tools: vec![ToolHome {
+                tool: Tool::Codex,
+                dir: dst_codex.clone(),
+            }],
+        };
+        // The incoming `notify` command is gated (fails closed: no terminal).
+        let err = run(&dst_claude, &staging, &cfg, &opts(true)).unwrap_err();
+        assert!(format!("{err:#}").contains("non-interactively"), "{err:#}");
+        assert_eq!(
+            fs::read_to_string(dst_codex.join("AGENTS.md")).unwrap(),
+            "local"
+        );
+
+        let report = run(&dst_claude, &staging, &cfg, &opts(false)).unwrap();
+        assert_eq!(
+            fs::read_to_string(dst_codex.join("AGENTS.md")).unwrap(),
+            "incoming"
+        );
+        assert_eq!(
+            fs::read_to_string(dst_codex.join("auth.json")).unwrap(),
+            "LOCAL-LOGIN"
+        );
+        // config.toml merged: incoming model, local trust kept, none imported.
+        let conf: toml::Table = fs::read_to_string(dst_codex.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(conf["model"].as_str(), Some("gpt-5"));
+        assert!(conf["projects"].get("/home/bob/q").is_some());
+        assert_eq!(conf["projects"].as_table().unwrap().len(), 1);
+        // Session content remapped to this machine's home.
+        let sess =
+            fs::read_to_string(dst_codex.join("sessions/2026/01/02/rollout-1.jsonl")).unwrap();
+        assert!(
+            sess.contains(&format!("{}/p", fake_home.display())),
+            "{sess}"
+        );
+        // Replaced files were backed up; nothing was written to ~/.claude.
+        assert_eq!(report.tool_backups.len(), 1);
+        assert_eq!(
+            fs::read_to_string(report.tool_backups[0].join("AGENTS.md")).unwrap(),
+            "local"
+        );
+        assert!(!dst_claude.join("AGENTS.md").exists());
+    }
+
+    #[test]
     fn restore_backs_up_remaps_and_writes() {
         let tmp = tempfile::tempdir().unwrap();
         // Source machine claude dir.
@@ -674,6 +866,7 @@ mod tests {
                 allow_secrets: false,
                 claude_json: None,
                 profiles_root: None,
+                tools: Vec::new(),
             },
         )
         .unwrap();
@@ -697,6 +890,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let report = run(&dst_claude, &staging, &cfg, &opts).unwrap();
 
@@ -749,6 +943,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let dst1 = tmp.path().join("claude-1");
         run(&dst1, &staging, &Config::default(), &opts).unwrap();
@@ -805,6 +1000,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -837,6 +1033,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let claude = tmp.path().join("claude");
 
@@ -889,6 +1086,7 @@ mod tests {
                 allow_secrets: false,
                 claude_json: None,
                 profiles_root: Some(profiles_a),
+                tools: Vec::new(),
             },
         )
         .unwrap();
@@ -917,6 +1115,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: Some(profiles_b.clone()),
+            tools: Vec::new(),
         };
         run(&claude_b, &staging, &cfg, &opts).unwrap();
         assert!(claude_b.join("settings.json").exists());
@@ -961,6 +1160,7 @@ mod tests {
             confirm_hooks: false,
             components: Some(vec!["skills".into()]),
             profiles_root: None,
+            tools: Vec::new(),
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -987,6 +1187,7 @@ mod tests {
             confirm_hooks: false,
             components: Some(vec![crate::mcp::MCP_FILE.into()]),
             profiles_root: None,
+            tools: Vec::new(),
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
         assert_eq!(report.mcp_servers_restored, 1);
@@ -1020,6 +1221,7 @@ mod tests {
             confirm_hooks: true,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let err = run(&claude, &staging, &Config::default(), &opts).unwrap_err();
         assert!(err.to_string().contains("hooks"), "got: {err:#}");
@@ -1038,6 +1240,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
         let local: serde_json::Value =
@@ -1055,6 +1258,7 @@ mod tests {
             confirm_hooks: true,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
     }
@@ -1088,6 +1292,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -1138,6 +1343,7 @@ mod tests {
             confirm_hooks: false,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         let report = run(&claude, &staging, &Config::default(), &opts).unwrap();
 
@@ -1165,6 +1371,7 @@ mod tests {
                 merge: MergeMode::Overwrite,
                 components: None,
                 profiles_root,
+                tools: &[],
             },
         )
         .unwrap()
@@ -1332,6 +1539,7 @@ mod tests {
             confirm_hooks,
             components: None,
             profiles_root: None,
+            tools: Vec::new(),
         };
         // Tests run without a terminal on stdin, so the gate fails closed.
         let err = run(&dst, &staging, &Config::default(), &opts(true)).unwrap_err();

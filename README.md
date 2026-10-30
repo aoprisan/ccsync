@@ -309,6 +309,56 @@ Each tick builds a sanitized snapshot and publishes it to `destination`:
 - On Linux, `systemctl --user` needs a user session bus; on a headless box you
   may need `loginctl enable-linger $USER` first.
 
+## Codex and Copilot CLI
+
+ccsync can carry the state of two other coding agents in the same snapshot,
+with the same guarantees as `~/.claude`: OpenAI's **Codex CLI**
+(`$CODEX_HOME`, default `~/.codex`) and GitHub's **Copilot CLI**
+(`$COPILOT_HOME`, default `~/.copilot`). Both are **opt-in** — upgrading
+never changes what an existing backup carries; `ccsync status` notes a tool
+whose state it finds but doesn't sync:
+
+```toml
+[codex]
+enabled = true
+
+[copilot]
+enabled = true
+```
+
+| | Codex (`~/.codex`) | Copilot (`~/.copilot`) |
+|---|---|---|
+| **Synced** | `config.toml`, `AGENTS.md`, `AGENTS.override.md`, `prompts/`, `skills/`, `agents/`, `rules/`, `hooks.json` | `settings.json`, `mcp-config.json`, `lsp-config.json`, `copilot-instructions.md`, `instructions/`, `agents/`, `skills/`, `hooks/` |
+| **Sessions** (gated by `include_sessions`) | `sessions/`, `archived_sessions/`, `history.jsonl` | `session-state/`, `history-session-state/` |
+| **Never synced** | `auth.json` (hard-blocked), logs, `*.sqlite` databases, `shell_snapshots/`, plugin cache, sandbox state | `config.json` (auth/app state, hard-blocked), `permissions-config.json`, `command-history-state.json`, `logs/`, `pkg/` |
+
+- **Credentials** (`auth.json`, Copilot's `config.json`) are blocked in both
+  directions regardless of `include`/`exclude`, like `.credentials.json`.
+- **Trust stays local.** Codex's per-path `[projects."<path>"]` trust table is
+  stripped from the staged `config.toml` (your file is untouched), and on
+  restore `config.toml` is deep-merged — like `settings.json` — so the target's
+  own trust entries and settings survive. Copilot's saved permissions are not
+  synced.
+- **Commands are gated.** A restore prompts before installing anything that
+  makes the tool run code or loosens what it may do: Codex `notify`, MCP
+  servers, `approval_policy`/`sandbox_mode`, `shell_environment_policy.set`,
+  `hooks.json` commands and new exec-policy rule lines; Copilot hooks, MCP and
+  LSP servers, and any new or changed file under `hooks/`. Non-interactive
+  runs fail closed (`--yes` accepts).
+- **Secrets**: config files are scanned and abort like `settings.json`;
+  session transcripts and session metadata get the `transcript_secrets`
+  policy.
+- **Paths** inside session files are remapped like Claude Code transcripts
+  (these tools don't encode paths into directory names).
+- **Restore** routes each tree to its home (created if missing). Only the
+  files a restore replaces are backed up, to `~/.codex.ccsync-backup-<ts>/`
+  (resp. `~/.copilot...`), since tool homes hold large session trees and live
+  databases. Restore one tool with `ccsync restore --only codex`.
+
+Override the lists per tool with `include` / `exclude` (`*` matches within a
+path component); the credential block applies regardless. Entries found in a
+tool's home that neither list classifies are reported by `ccsync status`.
+
 ## How path remapping works
 
 Claude Code names each project's session directory after the absolute working
